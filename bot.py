@@ -395,41 +395,132 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     storage.add_group_message(chat.id, chat.title or str(chat.id), user_name, text)
 
 
-def _push_tasks(chat_id: int, chat_title: str, tasks: list[dict], list_id_for: callable) -> int:
-    """Общая часть: создаёт в ClickUp каждую задачу из tasks, для которой list_id_for(t)
-    вернул непустой список. Возвращает число реально созданных задач."""
+def _create_and_log_task(
+    chat_id: int, chat_title: str, project_key: str, title: str, description: str, priority
+) -> str | None:
+    """Создаёт одну задачу в ClickUp-списке project_key и логирует её в pushed_tasks
+    (нужно и для отладки, и для отчёта по /tasksX — см. _send_project_report).
+    Возвращает id созданной задачи в ClickUp, либо None при неудаче (список не
+    настроен или ClickUp отказал)."""
+    list_id = config.CLICKUP_LIST_IDS.get(project_key)
+    if not list_id:
+        return None
+    try:
+        result = clickup_client.create_task(list_id, name=title, description=description or "", priority=priority)
+        task_id = str(result.get("id", ""))
+        storage.log_pushed_task(chat_id, chat_title, task_id, title, project_key)
+        return task_id
+    except Exception:
+        logger.exception("Не удалось создать задачу в ClickUp: %s", title)
+        return None
+
+
+def _push_tasks(chat_id: int, chat_title: str, tasks: list[dict], project_for: callable) -> int:
+    """Общая часть: создаёт в ClickUp каждую задачу из tasks под проектом project_for(t).
+    Возвращает число реально созданных задач."""
     created = 0
     for t in tasks:
         title = (t.get("title") or "").strip()
         if not title:
             continue
-        list_id = list_id_for(t)
-        if not list_id:
+        project_key = project_for(t)
+        if not project_key:
             continue
-        try:
-            result = clickup_client.create_task(
-                list_id,
-                name=title,
-                description=t.get("description", ""),
-                priority=t.get("priority"),
-            )
-            storage.log_pushed_task(chat_id, chat_title, str(result.get("id", "")), title)
+        if _create_and_log_task(chat_id, chat_title, project_key, title, t.get("description", ""), t.get("priority")):
             created += 1
-        except Exception:
-            logger.exception("Не удалось создать задачу в ClickUp: %s", title)
     return created
 
 
-async def _flush_chat_to_clickup(chat_id: int, chat_title: str, project_key: str | None) -> int:
+async def _ask_classification_question(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_title: str, classification_id: int, task_title: str
+) -> None:
+    """Задаёт в "смешанном" чате уточняющий вопрос по задаче, которую Claude не смог
+    однозначно классифицировать (см. _flush_chat_to_clickup). Ответ (reply на это
+    сообщение) ловит handle_group_message → _resolve_classification_reply."""
+    text = (
+        f"Не поняла, к какому проекту отнести задачу: «{task_title}»\n"
+        f"Это Atlas, Altyn или BestSwift? Ответь (reply) на это сообщение названием проекта.\n"
+        f"Если никто не подскажет — через некоторое время сама положу в «Разобрать»."
+    )
+    try:
+        sent = await context.bot.send_message(chat_id=chat_id, text=text)
+        storage.set_classification_question_message_id(classification_id, sent.message_id)
+    except Exception:
+        logger.exception(
+            "Не удалось задать уточняющий вопрос по классификации #%s в чате %s (%s)",
+            classification_id, chat_id, chat_title,
+        )
+
+
+async def _resolve_classification_reply(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, classification: dict, reply_text: str
+) -> None:
+    """Кто-то в группе ответил (reply) на уточняющий вопрос про проект задачи.
+    Отвечают Atlas/Altyn/BestSwift — кладём туда; отвечают что-то другое (или
+    непонятное) — сразу в "Разобрать", ждать дальше уже не имеет смысла, раз ответ
+    уже пришёл."""
+    classification_id = classification["id"]
+    project_key = _detect_project_keyword(reply_text) or "unsorted"
+    label = config.CLICKUP_PROJECTS[project_key]["label"]
+
+    task_id = _create_and_log_task(
+        classification["chat_id"],
+        classification["chat_title"],
+        project_key,
+        classification["task_title"],
+        classification["task_description"],
+        classification["task_priority"],
+    )
+    storage.resolve_classification(classification_id, project_key)
+
+    if task_id:
+        await update.message.reply_text(f"Поняла, добавила «{classification['task_title']}» в «{label}» 👍")
+    else:
+        await update.message.reply_text(
+            f"Поняла (проект «{label}»), но не смогла создать задачу в ClickUp — возможно, список ещё не настроен."
+        )
+
+
+async def _sweep_stale_classifications(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Классификации, на которые никто не ответил дольше
+    CLICKUP_CLASSIFICATION_TIMEOUT_MINUTES, — принудительно кладём в "Разобрать", чтобы
+    задача не зависла в подвешенном состоянии навсегда."""
+    cutoff = time.time() - config.CLICKUP_CLASSIFICATION_TIMEOUT_MINUTES * 60
+    for c in storage.get_unresolved_classifications_older_than(cutoff):
+        label = config.CLICKUP_PROJECTS["unsorted"]["label"]
+        task_id = _create_and_log_task(
+            c["chat_id"], c["chat_title"], "unsorted", c["task_title"], c["task_description"], c["task_priority"]
+        )
+        storage.resolve_classification(c["id"], "unsorted")
+        if task_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=c["chat_id"],
+                    text=f"Не дождалась ответа — положила «{c['task_title']}» в «{label}» 👍",
+                )
+            except Exception:
+                logger.exception(
+                    "Не удалось уведомить чат %s о таймауте классификации #%s", c["chat_id"], c["id"]
+                )
+
+
+async def _flush_chat_to_clickup(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_title: str, project_key: str | None
+) -> int:
     """Извлекает задачи из накопленных сообщений одного чата и пушит их в ClickUp.
-    Возвращает число созданных задач. Буфер помечается прочитанным только после
-    успешного извлечения и отправки задач — если извлечение упало (ошибка Claude API,
-    таймаут, рейт-лимит), буфер остаётся непрочитанным и будет повторно обработан
-    на следующей выгрузке.
+    Возвращает число созданных задач.
+
+    Буфер помечается прочитанным ТОЛЬКО если вызов Claude отработал (успешно или с
+    пустым результатом) — если сам вызов извлечения упал (сеть, лимиты, кончился
+    баланс на Anthropic API и т.п.), сообщения остаются непрочитанными и попробуем
+    ещё раз на следующей выгрузке, а не теряем их молча. А вот если сам ClickUp
+    отказал при создании конкретной задачи (см. _push_tasks) — это уже не повод
+    держать буфер вечно, тут по-прежнему помечаем прочитанным.
 
     project_key задан → чат закреплён за одним проектом, все задачи туда, без
     классификации. project_key is None → "смешанный" чат без привязки: каждая задача
-    классифицируется отдельно (Atlas/Алтын/BestSwift/Разобрать)."""
+    классифицируется отдельно (Atlas/Алтын/BestSwift); неоднозначные не падают молча
+    в "Разобрать", а сначала переспрашиваются в чате (см. _ask_classification_question)."""
     rows = storage.get_unflushed(chat_id)
     if not rows:
         return 0
@@ -443,24 +534,68 @@ async def _flush_chat_to_clickup(chat_id: int, chat_title: str, project_key: str
         try:
             tasks = task_extractor.extract_tasks(chat_title, rows)
         except Exception:
-            logger.exception("Ошибка извлечения задач для чата %s (%s)", chat_id, chat_title)
+            logger.exception(
+                "Ошибка извлечения задач для чата %s (%s) — оставляю буфер непрочитанным, попробую ещё раз",
+                chat_id, chat_title,
+            )
             return 0
-        created = _push_tasks(chat_id, chat_title, tasks, lambda _t: list_id)
+        created = _push_tasks(chat_id, chat_title, tasks, lambda _t: project_key)
     else:
         try:
             tasks = task_extractor.extract_tasks_classified(chat_title, rows)
         except Exception:
-            logger.exception("Ошибка извлечения/классификации задач для чата %s (%s)", chat_id, chat_title)
+            logger.exception(
+                "Ошибка извлечения/классификации задач для чата %s (%s) — оставляю буфер непрочитанным, попробую ещё раз",
+                chat_id, chat_title,
+            )
             return 0
 
-        def _list_for(t: dict) -> str | None:
-            key = t.get("project") if t.get("project") in config.CLICKUP_LIST_IDS else "unsorted"
-            return config.CLICKUP_LIST_IDS.get(key)
+        clear_tasks = [t for t in tasks if t.get("project") in ("atlas", "altyn", "bestswift")]
+        ambiguous_tasks = [t for t in tasks if t not in clear_tasks]
 
-        created = _push_tasks(chat_id, chat_title, tasks, _list_for)
+        created = _push_tasks(chat_id, chat_title, clear_tasks, lambda t: t.get("project"))
+
+        for t in ambiguous_tasks:
+            title = (t.get("title") or "").strip()
+            if not title:
+                continue
+            classification_id = storage.add_pending_classification(
+                chat_id, chat_title, title, t.get("description", ""), t.get("priority")
+            )
+            await _ask_classification_question(context, chat_id, chat_title, classification_id, title)
 
     storage.mark_flushed(chat_id)
     return created
+
+
+async def _send_project_report(context: ContextTypes.DEFAULT_TYPE, project_key: str) -> None:
+    """Шлёт владелице в личку полный пронумерованный список всех задач проекта (по
+    всем чатам, в порядке создания) — вызывается после команды /tasksX. В сам групповой
+    чат, где вызвали команду, полный список не идёт — там только короткое "готово"."""
+    if config.OWNER_USER_ID is None:
+        return
+    label = config.CLICKUP_PROJECTS[project_key]["label"]
+    tasks = storage.get_pushed_tasks_by_project(project_key)
+
+    if not tasks:
+        try:
+            await context.bot.send_message(
+                chat_id=config.OWNER_USER_ID, text=f"По проекту «{label}» в ClickUp пока пусто."
+            )
+        except Exception:
+            logger.exception("Не удалось отправить пустой отчёт по проекту %s владелице", project_key)
+        return
+
+    lines = [f"Задачи по проекту «{label}» ({len(tasks)}):", ""]
+    for i, t in enumerate(tasks, start=1):
+        lines.append(f"{i}. {t['title']} — {t['chat_title']}")
+    report = "\n".join(lines)
+
+    try:
+        for chunk in _split_for_telegram(report):
+            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
+    except Exception:
+        logger.exception("Не удалось отправить отчёт по проекту %s владелице", project_key)
 
 
 def _make_tasks_command_handler(project_key: str):
@@ -468,7 +603,9 @@ def _make_tasks_command_handler(project_key: str):
     Вызов команды в чате: (1) немедленно выгружает накопленные задачи чата в список
     этого проекта, (2) закрепляет проект за чатом, чтобы дальше периодическая
     автовыгрузка (см. periodic_flush_job) сама знала, куда слать задачи из этого чата,
-    без повторного вызова команды каждый раз."""
+    без повторного вызова команды каждый раз, (3) шлёт владелице в личку полный
+    пронумерованный список всех задач этого проекта (см. _send_project_report) — в
+    сам групповой чат полный список не публикуется."""
     label = config.CLICKUP_PROJECTS[project_key]["label"]
 
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -487,11 +624,12 @@ def _make_tasks_command_handler(project_key: str):
 
         storage.set_chat_project(chat.id, project_key)
         await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
-        created = await _flush_chat_to_clickup(chat.id, chat.title or str(chat.id), project_key)
+        created = await _flush_chat_to_clickup(context, chat.id, chat.title or str(chat.id), project_key)
         if created:
             await update.message.reply_text(f"Готово, добавила {created} задач(и) в ClickUp ({label}) 👍")
         else:
             await update.message.reply_text(f"Новых задач в переписке с прошлого раза не нашла (проект «{label}»).")
+        await _send_project_report(context, project_key)
 
     return handler
 
@@ -500,17 +638,20 @@ async def periodic_flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Фоновая выгрузка задач по расписанию (CLICKUP_FLUSH_INTERVAL_MINUTES), без
     ручной команды — для ВСЕХ чатов с непрочитанными сообщениями. Для чатов,
     закреплённых за проектом, задачи идут в его список; для "смешанных" чатов без
-    привязки — классифицируются по отдельности (см. _flush_chat_to_clickup)."""
+    привязки — классифицируются по отдельности (см. _flush_chat_to_clickup). Заодно
+    подчищает зависшие без ответа уточнения по классификации (см.
+    _sweep_stale_classifications)."""
     if not config.CLICKUP_ENABLED:
         return
     for chat_id, chat_title in storage.get_chats_with_pending():
         project_key = storage.get_chat_project(chat_id)
-        created = await _flush_chat_to_clickup(chat_id, chat_title, project_key)
+        created = await _flush_chat_to_clickup(context, chat_id, chat_title, project_key)
         if created:
             logger.info(
                 "Авто-выгрузка: чат «%s» (%s), проект %s → %d задач в ClickUp",
                 chat_title, chat_id, project_key or "не закреплён (классификация)", created,
             )
+    await _sweep_stale_classifications(context)
 
 
 def build_application() -> Application:
@@ -522,6 +663,8 @@ def build_application() -> Application:
     for project_key, project in config.CLICKUP_PROJECTS.items():
         if project["command"]:
             app.add_handler(CommandHandler(project["command"], _make_tasks_command_handler(project_key)))
+    # Кнопки "Отправить"/"Не отправлять" под черновиком правки к эскалации.
+    app.add_handler(CallbackQueryHandler(handle_escalation_callback, pattern=r"^esc_(confirm|cancel):"))
     # Личка — обычный разговор с персоной Marina Twin.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     # Группы — тихий сбор переписки, без ответов.
