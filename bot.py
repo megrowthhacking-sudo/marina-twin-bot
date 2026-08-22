@@ -281,9 +281,10 @@ def _push_tasks(chat_id: int, chat_title: str, tasks: list[dict], list_id_for: c
 
 async def _flush_chat_to_clickup(chat_id: int, chat_title: str, project_key: str | None) -> int:
     """Извлекает задачи из накопленных сообщений одного чата и пушит их в ClickUp.
-    Возвращает число созданных задач. Буфер помечается прочитанным в любом случае —
-    иначе при постоянной ошибке ClickUp одни и те же старые сообщения будут
-    пересчитываться на каждой выгрузке.
+    Возвращает число созданных задач. Буфер помечается прочитанным только после
+    успешного извлечения и отправки задач — если извлечение упало (ошибка Claude API,
+    таймаут, рейт-лимит), буфер остаётся непрочитанным и будет повторно обработан
+    на следующей выгрузке.
 
     project_key задан → чат закреплён за одним проектом, все задачи туда, без
     классификации. project_key is None → "смешанный" чат без привязки: каждая задача
@@ -302,7 +303,6 @@ async def _flush_chat_to_clickup(chat_id: int, chat_title: str, project_key: str
             tasks = task_extractor.extract_tasks(chat_title, rows)
         except Exception:
             logger.exception("Ошибка извлечения задач для чата %s (%s)", chat_id, chat_title)
-            storage.mark_flushed(chat_id)
             return 0
         created = _push_tasks(chat_id, chat_title, tasks, lambda _t: list_id)
     else:
@@ -310,7 +310,6 @@ async def _flush_chat_to_clickup(chat_id: int, chat_title: str, project_key: str
             tasks = task_extractor.extract_tasks_classified(chat_title, rows)
         except Exception:
             logger.exception("Ошибка извлечения/классификации задач для чата %s (%s)", chat_id, chat_title)
-            storage.mark_flushed(chat_id)
             return 0
 
         def _list_for(t: dict) -> str | None:
