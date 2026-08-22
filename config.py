@@ -63,6 +63,11 @@ CLICKUP_LIST_IDS = {
 # Как часто автоматически выгружать накопленные задачи (минуты) — для всех чатов
 # с непрочитанными сообщениями, не только закреплённых за проектом.
 CLICKUP_FLUSH_INTERVAL_MINUTES = int(os.environ.get("CLICKUP_FLUSH_INTERVAL_MINUTES", "120"))
+
+# Сколько минут ждать ответа на уточняющий вопрос "Atlas, Altyn или BestSwift?" в
+# "смешанном" чате (см. _ask_classification_question в bot.py), прежде чем сдаться и
+# сама положить задачу в "Разобрать". По умолчанию сутки.
+CLICKUP_CLASSIFICATION_TIMEOUT_MINUTES = int(os.environ.get("CLICKUP_CLASSIFICATION_TIMEOUT_MINUTES", "1440"))
 # Интеграция с ClickUp включена, если задан токен и хотя бы один список проекта.
 CLICKUP_ENABLED = bool(CLICKUP_API_TOKEN and CLICKUP_LIST_IDS)
 
