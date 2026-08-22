@@ -46,7 +46,8 @@ def _connect() -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_group_messages_chat_flushed ON group_messages(chat_id, flushed)")
-    # Журнал того, что реально улетело в ClickUp — для отладки и чтобы не гадать задним числом.
+    # Журнал того, что реально улетело в ClickUp — для отладки, отчётов по /tasksX
+    # (см. get_pushed_tasks_by_project) и чтобы не гадать задним числом.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS pushed_tasks (
@@ -59,6 +60,11 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    # project ("atlas"/"altyn"/"bestswift"/"unsorted") — в какой список ClickUp реально
+    # ушла задача; нужно для отчёта по /tasksX (список всех задач проекта). Старые строки
+    # (до этой миграции) останутся с project = NULL и не попадут в отчёты — это ок,
+    # это лишь исторический пробел.
+    _ensure_columns(conn, "pushed_tasks", {"project": "TEXT"})
     # За каким проектом (ключ из config.CLICKUP_PROJECTS: "atlas"/"altyn"/"bestswift")
     # закреплён групповой чат. Проставляется автоматически либо когда кто-то в чате пишет
     # "эта группа про задачи <проект>", либо при вызове команды /tasksatlas /tasksaltyn
@@ -88,8 +94,59 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    # Поддержка правок/дополнений к уже отправленному ответу (см. bot.py,
+    # _propose_escalation_correction): Марина тегает (reply) в личке исходное
+    # пересланное сообщение с вопросом — dm_question_message_id как раз и нужен, чтобы
+    # понять, к какой эскалации относится её reply, даже если та уже resolved.
+    # last_answer/last_posted_text — то, что реально ушло в группу в прошлый раз (нужно
+    # показывать как контекст в следующей правке). draft_raw/draft_posted — черновик
+    # правки, ждущий подтверждения (кнопки "Отправить"/"Не отправлять") — можно
+    # присылать новые правки поверх ещё не подтверждённой, последняя всегда побеждает.
+    _ensure_columns(
+        conn,
+        "pending_escalations",
+        {
+            "dm_question_message_id": "INTEGER",
+            "last_answer": "TEXT",
+            "last_posted_text": "TEXT",
+            "draft_raw": "TEXT",
+            "draft_posted": "TEXT",
+        },
+    )
+    # Задачи из "смешанных" (непривязанных к проекту) чатов, для которых Claude не смог
+    # по контексту понять, к какому проекту они относятся ("unsorted" в classify-ответе).
+    # Вместо того чтобы молча класть их в "Разобрать", бот спрашивает прямо в чате —
+    # question_message_id это message_id того вопроса, чтобы позже сматчить reply на
+    # него (см. handle_group_message в bot.py). Если никто не ответит —
+    # periodic_flush_job по таймауту (CLICKUP_CLASSIFICATION_TIMEOUT_MINUTES) сам
+    # положит задачу в "Разобрать".
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_classifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            chat_title TEXT,
+            task_title TEXT NOT NULL,
+            task_description TEXT,
+            task_priority TEXT,
+            question_message_id INTEGER,
+            created_at REAL NOT NULL,
+            resolved INTEGER NOT NULL DEFAULT 0,
+            resolved_project TEXT
+        )
+        """
+    )
     conn.commit()
     return conn
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict) -> None:
+    """Простая миграция "на лету": добавляет недостающие колонки в уже существующую
+    (на проде) таблицу, не трогая существующие данные."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, coltype in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {coltype}")
 
 
 _conn = _connect()
@@ -170,12 +227,23 @@ def get_chats_with_pending() -> list[tuple[int, str]]:
     return [(r[0], r[1] or str(r[0])) for r in rows]
 
 
-def log_pushed_task(chat_id: int, chat_title: str, clickup_task_id: str, title: str) -> None:
+def log_pushed_task(chat_id: int, chat_title: str, clickup_task_id: str, title: str, project: str | None = None) -> None:
     _conn.execute(
-        "INSERT INTO pushed_tasks (chat_id, chat_title, clickup_task_id, title, created_at) VALUES (?, ?, ?, ?, ?)",
-        (chat_id, chat_title, clickup_task_id, title, time.time()),
+        "INSERT INTO pushed_tasks (chat_id, chat_title, clickup_task_id, title, project, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, chat_title, clickup_task_id, title, project, time.time()),
     )
     _conn.commit()
+
+
+def get_pushed_tasks_by_project(project: str) -> list[dict]:
+    """Все когда-либо созданные ботом задачи по одному проекту (из всех чатов),
+    в порядке создания — для отчёта по команде /tasksX (см. _send_project_report в
+    bot.py)."""
+    rows = _conn.execute(
+        "SELECT title, chat_title, created_at FROM pushed_tasks WHERE project = ? ORDER BY created_at ASC",
+        (project,),
+    ).fetchall()
+    return [{"title": r[0], "chat_title": r[1], "created_at": r[2]} for r in rows]
 
 
 # --- Привязка чата к проекту ClickUp (atlas / altyn / bestswift) ---
@@ -228,6 +296,135 @@ def get_oldest_pending_escalation() -> tuple[int, int, str, str, str] | None:
 def resolve_pending_escalation(escalation_id: int) -> None:
     _conn.execute("UPDATE pending_escalations SET resolved = 1 WHERE id = ?", (escalation_id,))
     _conn.commit()
+
+
+_ESCALATION_COLUMNS = (
+    "id", "group_chat_id", "group_title", "asker_name", "question", "resolved",
+    "dm_question_message_id", "last_answer", "last_posted_text", "draft_raw", "draft_posted",
+)
+
+
+def get_escalation(escalation_id: int) -> dict | None:
+    """Полная запись эскалации по id — включая историю последнего ответа и
+    незавершённый черновик правки, если есть."""
+    row = _conn.execute(
+        f"SELECT {', '.join(_ESCALATION_COLUMNS)} FROM pending_escalations WHERE id = ?",
+        (escalation_id,),
+    ).fetchone()
+    return dict(zip(_ESCALATION_COLUMNS, row)) if row else None
+
+
+def get_escalation_by_dm_message_id(message_id: int) -> dict | None:
+    """Находит эскалацию по message_id пересланного вопроса в личке владелицы — так
+    понимаем, что reply на это сообщение относится именно к этому вопросу, даже если
+    он уже resolved (правка/дополнение к уже отправленному ответу)."""
+    row = _conn.execute(
+        "SELECT id FROM pending_escalations WHERE dm_question_message_id = ?",
+        (message_id,),
+    ).fetchone()
+    return get_escalation(row[0]) if row else None
+
+
+def set_escalation_dm_message_id(escalation_id: int, message_id: int) -> None:
+    _conn.execute(
+        "UPDATE pending_escalations SET dm_question_message_id = ? WHERE id = ?",
+        (message_id, escalation_id),
+    )
+    _conn.commit()
+
+
+def update_escalation_after_answer(escalation_id: int, raw_answer: str, posted_text: str) -> None:
+    """Фиксирует ответ (первый или очередная правка) как resolved + запоминает, что
+    реально ушло в группу — это станет "предыдущим ответом" для следующей правки."""
+    _conn.execute(
+        "UPDATE pending_escalations SET resolved = 1, last_answer = ?, last_posted_text = ? WHERE id = ?",
+        (raw_answer, posted_text, escalation_id),
+    )
+    _conn.commit()
+
+
+def set_escalation_draft(escalation_id: int, raw_text: str, posted_text: str) -> None:
+    _conn.execute(
+        "UPDATE pending_escalations SET draft_raw = ?, draft_posted = ? WHERE id = ?",
+        (raw_text, posted_text, escalation_id),
+    )
+    _conn.commit()
+
+
+def clear_escalation_draft(escalation_id: int) -> None:
+    _conn.execute(
+        "UPDATE pending_escalations SET draft_raw = NULL, draft_posted = NULL WHERE id = ?",
+        (escalation_id,),
+    )
+    _conn.commit()
+
+
+# --- Уточнение проекта для неоднозначных задач в "смешанных" чатах ---
+
+_CLASSIFICATION_COLUMNS = (
+    "id", "chat_id", "chat_title", "task_title", "task_description", "task_priority",
+    "question_message_id", "created_at", "resolved", "resolved_project",
+)
+
+
+def add_pending_classification(
+    chat_id: int, chat_title: str, task_title: str, task_description: str, task_priority: str | None
+) -> int:
+    cur = _conn.execute(
+        """
+        INSERT INTO pending_classifications
+        (chat_id, chat_title, task_title, task_description, task_priority, created_at, resolved)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+        """,
+        (chat_id, chat_title, task_title, task_description, task_priority, time.time()),
+    )
+    _conn.commit()
+    return cur.lastrowid
+
+
+def set_classification_question_message_id(classification_id: int, message_id: int) -> None:
+    _conn.execute(
+        "UPDATE pending_classifications SET question_message_id = ? WHERE id = ?",
+        (message_id, classification_id),
+    )
+    _conn.commit()
+
+
+def get_classification_by_question_message_id(chat_id: int, message_id: int) -> dict | None:
+    """Находит неотвеченную классификацию по (chat_id, message_id) уточняющего вопроса.
+    ВАЖНО: message_id уникален только в пределах одного чата в Telegram — в отличие от
+    эскалаций (те все в одной личке с владелицей), уточняющие вопросы разлетаются по
+    разным группам, так что chat_id обязателен, иначе можно случайно смэтчить чужой чат."""
+    row = _conn.execute(
+        f"""
+        SELECT {', '.join(_CLASSIFICATION_COLUMNS)} FROM pending_classifications
+        WHERE chat_id = ? AND question_message_id = ? AND resolved = 0
+        """,
+        (chat_id, message_id),
+    ).fetchone()
+    return dict(zip(_CLASSIFICATION_COLUMNS, row)) if row else None
+
+
+def resolve_classification(classification_id: int, project: str) -> None:
+    _conn.execute(
+        "UPDATE pending_classifications SET resolved = 1, resolved_project = ? WHERE id = ?",
+        (project, classification_id),
+    )
+    _conn.commit()
+
+
+def get_unresolved_classifications_older_than(cutoff_ts: float) -> list[dict]:
+    """Для таймаута (см. periodic_flush_job): классификации, на которые никто не
+    ответил дольше CLICKUP_CLASSIFICATION_TIMEOUT_MINUTES — их пора принудительно
+    положить в "Разобрать"."""
+    rows = _conn.execute(
+        f"""
+        SELECT {', '.join(_CLASSIFICATION_COLUMNS)} FROM pending_classifications
+        WHERE resolved = 0 AND created_at < ?
+        """,
+        (cutoff_ts,),
+    ).fetchall()
+    return [dict(zip(_CLASSIFICATION_COLUMNS, r)) for r in rows]
 
 
 def get_chats_with_pending_and_project() -> list[tuple[int, str, str]]:
