@@ -339,7 +339,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     (2) к ней явно обращаются (@упоминание, reply на её сообщение, имя "Марина") —
         отвечает "сейчас вернусь" и пересылает вопрос владелице в личку (см. handle_message).
     Иначе сообщение просто уходит в буфер — задачи из него достаются командой
-    /tasksatlas /tasksaltyn /tasksbs, либо автоматически по расписанию
+    /tasksatlas /tasksaltyn /tasksbs /tasksmisc, либо автоматически по расписанию
     (см. periodic_flush_job) для уже привязанных к проекту чатов, либо (для чатов без
     привязки) классифицируются по проекту индивидуально при автовыгрузке."""
     chat = update.effective_chat
@@ -599,7 +599,7 @@ async def _send_project_report(context: ContextTypes.DEFAULT_TYPE, project_key: 
 
 
 def _make_tasks_command_handler(project_key: str):
-    """Команды /tasksatlas /tasksaltyn /tasksbs — каждая для своего проекта.
+    """Команды /tasksatlas /tasksaltyn /tasksbs /tasksmisc — каждая для своего проекта.
     Вызов команды в чате: (1) немедленно выгружает накопленные задачи чата в список
     этого проекта, (2) закрепляет проект за чатом, чтобы дальше периодическая
     автовыгрузка (см. periodic_flush_job) сама знала, куда слать задачи из этого чата,
@@ -658,8 +658,9 @@ def build_application() -> Application:
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("reset", handle_reset))
-    # По команде на проект: /tasksatlas /tasksaltyn /tasksbs ("unsorted"/Разобрать — без
-    # команды, это только автоматический фолбэк для классификации в "смешанных" чатах).
+    # По команде на проект: /tasksatlas /tasksaltyn /tasksbs /tasksmisc. "unsorted"/Разобрать
+    # теперь тоже привязывается явной командой (/tasksmisc), но по-прежнему остаётся
+    # автоматическим фолбэком для классификации задач в "смешанных" чатах.
     for project_key, project in config.CLICKUP_PROJECTS.items():
         if project["command"]:
             app.add_handler(CommandHandler(project["command"], _make_tasks_command_handler(project_key)))
