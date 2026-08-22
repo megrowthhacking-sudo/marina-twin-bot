@@ -125,3 +125,5 @@ cp .env.example .env   # и заполнить
 **Railway.** Обычно единицы долларов в месяц на фоновый процесс такого размера — основные расходы будут в Anthropic API, не в хостинге.
 
 **ClickUp.** Создание задач через API бесплатно в рамках вашего тарифа ClickUp (лимиты — по вашему плану ClickUp, не связаны с этим ботом).
+
+# Auto-deploy test comment — this PR confirms write access is working.
