@@ -42,3 +42,37 @@ def rephrase_answer(group_title: str, asker_name: str, question: str, raw_answer
     )
     text = "\n".join(block.text for block in response.content if block.type == "text").strip()
     return text or raw_answer
+
+
+_CORRECTION_SYSTEM_PROMPT = """Ты помогаешь Марине дополнять или поправлять уже отправленный в групповой
+чат ответ коллеге.
+
+Тебе дают вопрос коллеги, уже отправленный в чат ответ Марины и её черновую правку/дополнение к нему
+(может быть коротким, неформальным, с опечатками — это нормально).
+
+Перефразируй ТОЛЬКО правку/дополнение в связное, дружелюбное сообщение от лица Марины — как будто она
+сама дописывает уточнение в чат прямо сейчас. Не повторяй то, что уже было в предыдущем ответе, не
+пересказывай его — только новую часть. Сохраняй все факты из черновика, ничего не добавляй от себя и
+не выдумывай деталей, которых там не было. Если черновик уже сам по себе хорошо сформулирован — просто
+слегка пригладь стиль.
+
+Ответь только текстом самого уточнения, без пояснений, без кавычек вокруг и без подписи."""
+
+
+def rephrase_correction(
+    group_title: str, asker_name: str, question: str, previous_answer: str, raw_correction: str
+) -> str:
+    user_content = (
+        f"Групповой чат: «{group_title}»\n"
+        f"Вопрос от {asker_name}: {question}\n\n"
+        f"Уже отправленный в чат ответ: {previous_answer}\n\n"
+        f"Черновая правка/дополнение Марины: {raw_correction}"
+    )
+    response = client.messages.create(
+        model=config.MODEL_NAME,
+        max_tokens=1024,
+        system=_CORRECTION_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_content}],
+    )
+    text = "\n".join(block.text for block in response.content if block.type == "text").strip()
+    return text or raw_correction
