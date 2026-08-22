@@ -88,8 +88,36 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    # Поддержка правок/дополнений к уже отправленному ответу (см. bot.py,
+    # _propose_escalation_correction): Марина тегает (reply) в личке исходное
+    # пересланное сообщение с вопросом — dm_question_message_id как раз и нужен, чтобы
+    # понять, к какой эскалации относится её reply, даже если та уже resolved.
+    # last_answer/last_posted_text — то, что реально ушло в группу в прошлый раз (нужно
+    # показывать как контекст в следующей правке). draft_raw/draft_posted — черновик
+    # правки, ждущий подтверждения (кнопки "Отправить"/"Не отправлять") — можно
+    # присылать новые правки поверх ещё не подтверждённой, последняя всегда побеждает.
+    _ensure_columns(
+        conn,
+        "pending_escalations",
+        {
+            "dm_question_message_id": "INTEGER",
+            "last_answer": "TEXT",
+            "last_posted_text": "TEXT",
+            "draft_raw": "TEXT",
+            "draft_posted": "TEXT",
+        },
+    )
     conn.commit()
     return conn
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict) -> None:
+    """Простая миграция "на лету": добавляет недостающие колонки в уже существующую
+    (на проде) таблицу, не трогая существующие данные."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, coltype in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {coltype}")
 
 
 _conn = _connect()
@@ -227,6 +255,67 @@ def get_oldest_pending_escalation() -> tuple[int, int, str, str, str] | None:
 
 def resolve_pending_escalation(escalation_id: int) -> None:
     _conn.execute("UPDATE pending_escalations SET resolved = 1 WHERE id = ?", (escalation_id,))
+    _conn.commit()
+
+
+_ESCALATION_COLUMNS = (
+    "id", "group_chat_id", "group_title", "asker_name", "question", "resolved",
+    "dm_question_message_id", "last_answer", "last_posted_text", "draft_raw", "draft_posted",
+)
+
+
+def get_escalation(escalation_id: int) -> dict | None:
+    """Полная запись эскалации по id — включая историю последнего ответа и
+    незавершённый черновик правки, если есть."""
+    row = _conn.execute(
+        f"SELECT {', '.join(_ESCALATION_COLUMNS)} FROM pending_escalations WHERE id = ?",
+        (escalation_id,),
+    ).fetchone()
+    return dict(zip(_ESCALATION_COLUMNS, row)) if row else None
+
+
+def get_escalation_by_dm_message_id(message_id: int) -> dict | None:
+    """Находит эскалацию по message_id пересланного вопроса в личке владелицы — так
+    понимаем, что reply на это сообщение относится именно к этому вопросу, даже если
+    он уже resolved (правка/дополнение к уже отправленному ответу)."""
+    row = _conn.execute(
+        "SELECT id FROM pending_escalations WHERE dm_question_message_id = ?",
+        (message_id,),
+    ).fetchone()
+    return get_escalation(row[0]) if row else None
+
+
+def set_escalation_dm_message_id(escalation_id: int, message_id: int) -> None:
+    _conn.execute(
+        "UPDATE pending_escalations SET dm_question_message_id = ? WHERE id = ?",
+        (message_id, escalation_id),
+    )
+    _conn.commit()
+
+
+def update_escalation_after_answer(escalation_id: int, raw_answer: str, posted_text: str) -> None:
+    """Фиксирует ответ (первый или очередная правка) как resolved + запоминает, что
+    реально ушло в группу — это станет "предыдущим ответом" для следующей правки."""
+    _conn.execute(
+        "UPDATE pending_escalations SET resolved = 1, last_answer = ?, last_posted_text = ? WHERE id = ?",
+        (raw_answer, posted_text, escalation_id),
+    )
+    _conn.commit()
+
+
+def set_escalation_draft(escalation_id: int, raw_text: str, posted_text: str) -> None:
+    _conn.execute(
+        "UPDATE pending_escalations SET draft_raw = ?, draft_posted = ? WHERE id = ?",
+        (raw_text, posted_text, escalation_id),
+    )
+    _conn.commit()
+
+
+def clear_escalation_draft(escalation_id: int) -> None:
+    _conn.execute(
+        "UPDATE pending_escalations SET draft_raw = NULL, draft_posted = NULL WHERE id = ?",
+        (escalation_id,),
+    )
     _conn.commit()
 
 
