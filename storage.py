@@ -59,6 +59,35 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    # За каким проектом (ключ из config.CLICKUP_PROJECTS: "atlas"/"altyn"/"bestswift")
+    # закреплён групповой чат. Проставляется автоматически либо когда кто-то в чате пишет
+    # "эта группа про задачи <проект>", либо при вызове команды /tasksatlas /tasksaltyn
+    # /tasksbs — дальше периодическая автовыгрузка уже знает, в какой список ClickUp
+    # слать задачи из этого чата.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_projects (
+            chat_id INTEGER PRIMARY KEY,
+            project TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    # Вопросы из групп, адресованные "Марине" (упоминание/имя/reply на её сообщение),
+    # ожидающие ответа владелицы в личке. См. эскалацию в bot.py.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_escalations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_chat_id INTEGER NOT NULL,
+            group_title TEXT,
+            asker_name TEXT,
+            question TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            resolved INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -147,3 +176,71 @@ def log_pushed_task(chat_id: int, chat_title: str, clickup_task_id: str, title: 
         (chat_id, chat_title, clickup_task_id, title, time.time()),
     )
     _conn.commit()
+
+
+# --- Привязка чата к проекту ClickUp (atlas / altyn / bestswift) ---
+
+def get_chat_project(chat_id: int) -> str | None:
+    row = _conn.execute("SELECT project FROM chat_projects WHERE chat_id = ?", (chat_id,)).fetchone()
+    return row[0] if row else None
+
+
+def set_chat_project(chat_id: int, project: str) -> None:
+    _conn.execute(
+        """
+        INSERT INTO chat_projects (chat_id, project, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET project = excluded.project, updated_at = excluded.updated_at
+        """,
+        (chat_id, project, time.time()),
+    )
+    _conn.commit()
+
+
+# --- Отложенные вопросы из групп ("эскалация" к владелице в личку) ---
+
+def add_pending_escalation(group_chat_id: int, group_title: str, asker_name: str, question: str) -> int:
+    cur = _conn.execute(
+        """
+        INSERT INTO pending_escalations (group_chat_id, group_title, asker_name, question, created_at, resolved)
+        VALUES (?, ?, ?, ?, ?, 0)
+        """,
+        (group_chat_id, group_title, asker_name, question, time.time()),
+    )
+    _conn.commit()
+    return cur.lastrowid
+
+
+def get_oldest_pending_escalation() -> tuple[int, int, str, str, str] | None:
+    """Возвращает (id, group_chat_id, group_title, asker_name, question) самого старого
+    неотвеченного вопроса, или None, если очередь пуста."""
+    row = _conn.execute(
+        """
+        SELECT id, group_chat_id, group_title, asker_name, question
+        FROM pending_escalations
+        WHERE resolved = 0
+        ORDER BY created_at ASC
+        LIMIT 1
+        """
+    ).fetchone()
+    return tuple(row) if row else None
+
+
+def resolve_pending_escalation(escalation_id: int) -> None:
+    _conn.execute("UPDATE pending_escalations SET resolved = 1 WHERE id = ?", (escalation_id,))
+    _conn.commit()
+
+
+def get_chats_with_pending_and_project() -> list[tuple[int, str, str]]:
+    """Список (chat_id, chat_title, project) — только чаты, у которых есть и невыгруженные
+    сообщения, и уже известный проект (назначается командой /tasks<project>). Чаты без
+    привязанного проекта периодическая автовыгрузка пропускает — ей некуда слать задачи."""
+    rows = _conn.execute(
+        """
+        SELECT gm.chat_id, MAX(gm.chat_title), cp.project
+        FROM group_messages gm
+        JOIN chat_projects cp ON cp.chat_id = gm.chat_id
+        WHERE gm.flushed = 0
+        GROUP BY gm.chat_id
+        """
+    ).fetchall()
+    return [(r[0], r[1] or str(r[0]), r[2]) for r in rows]

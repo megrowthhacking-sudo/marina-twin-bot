@@ -25,31 +25,32 @@ def _headers() -> dict:
     }
 
 
-def create_task(name: str, description: str = "", priority: str | None = None) -> dict:
-    """Создаёт задачу в списке config.CLICKUP_LIST_ID. Бросает исключение при ошибке —
-    вызывающий код (bot.py) сам решает, как это залогировать и не уронить остальную выгрузку."""
-    if not config.CLICKUP_ENABLED:
-        raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN или CLICKUP_LIST_ID)")
+def create_task(list_id: str, name: str, description: str = "", priority: str | None = None) -> dict:
+    """Создаёт задачу в указанном списке ClickUp (list_id — конкретный проектный список,
+    см. config.CLICKUP_LIST_IDS). Бросает исключение при ошибке — вызывающий код (bot.py)
+    сам решает, как это залогировать и не уронить остальную выгрузку."""
+    if not config.CLICKUP_API_TOKEN:
+        raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
 
     payload: dict = {"name": name[:255], "description": description[:8000]}
     priority_num = PRIORITY_MAP.get((priority or "").lower())
     if priority_num:
         payload["priority"] = priority_num
 
-    url = f"{BASE_URL}/list/{config.CLICKUP_LIST_ID}/task"
+    url = f"{BASE_URL}/list/{list_id}/task"
     resp = requests.post(url, headers=_headers(), json=payload, timeout=20)
     resp.raise_for_status()
     return resp.json()
 
 
-def test_connection() -> tuple[bool, str]:
-    """Простая проверка токена/списка — дергает список, ничего не создавая.
+def test_connection(list_id: str) -> tuple[bool, str]:
+    """Простая проверка токена/списка — дергает конкретный список, ничего не создавая.
     Удобно для ручной диагностики после деплоя (см. DEPLOY.md)."""
-    if not config.CLICKUP_ENABLED:
-        return False, "CLICKUP_API_TOKEN или CLICKUP_LIST_ID не заданы"
+    if not config.CLICKUP_API_TOKEN:
+        return False, "CLICKUP_API_TOKEN не задан"
     try:
         resp = requests.get(
-            f"{BASE_URL}/list/{config.CLICKUP_LIST_ID}",
+            f"{BASE_URL}/list/{list_id}",
             headers=_headers(),
             timeout=15,
         )
