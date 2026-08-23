@@ -72,6 +72,15 @@ CLICKUP_CLASSIFICATION_TIMEOUT_MINUTES = int(os.environ.get("CLICKUP_CLASSIFICAT
 # Интеграция с ClickUp включена, если задан токен и хотя бы один список проекта.
 CLICKUP_ENABLED = bool(CLICKUP_API_TOKEN and CLICKUP_LIST_IDS)
 
+# Таймзона бота (используется для расписания ежедневного дайджеста и т.п.).
+# Формат — имя из базы IANA/tzdata, например "Europe/Moscow".
+MARINATWIN_TIMEZONE = os.environ.get("MARINATWIN_TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow"
+
+# Время (час и минута, по MARINATWIN_TIMEZONE), в которое владелице автоматически
+# отправляется ежедневный дайджест по всем проектам (см. daily_digest_job в bot.py).
+DAILY_DIGEST_HOUR = int(os.environ.get("DAILY_DIGEST_HOUR", "9"))
+DAILY_DIGEST_MINUTE = int(os.environ.get("DAILY_DIGEST_MINUTE", "0"))
+
 # Telegram user_id владелицы (Марины) — только ей пересылаются вопросы из групп,
 # адресованные "Марине" (см. эскалацию в bot.py). Если не задан явно, но задан ровно
 # один MARINATWIN_ALLOWED_USER_IDS — используем его. Иначе эскалация выключена.
