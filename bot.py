@@ -11,6 +11,8 @@ import logging
 import random
 import re
 import time
+from datetime import time as digest_time
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -568,31 +570,52 @@ async def _flush_chat_to_clickup(
     return created
 
 
+_URGENT_PRIORITIES = {"urgent", "high"}
+
+def _is_urgent(task: dict) -> bool:
+    return (task.get("priority") or "").lower() in _URGENT_PRIORITIES
+
+def _format_task_lines(tasks: list[dict]) -> list[str]:
+    """Форматирует список задач ClickUp в пронумерованные строки отчёта, отмечая
+    срочные/высокоприоритетные задачи значком 🔴."""
+    lines = []
+    for i, t in enumerate(tasks, start=1):
+        marker = "🔴 " if _is_urgent(t) else ""
+        lines.append(f"{i}. {marker}{t['name']}")
+    return lines
+
+async def _fetch_project_tasks(project_key: str) -> list[dict] | None:
+    """Общий помощник: тянет живые открытые задачи проекта прямо из ClickUp (см.
+    clickup_client.get_open_tasks) — источник истины для всех отчётов (/tasksX,
+    /urgent, утренний дайджест). Возвращает None при ошибке сети/API — не поднимает
+    исключение дальше, вызывающий код сам решает, как об этом сообщить."""
+    list_id = config.CLICKUP_LIST_IDS.get(project_key)
+    if not list_id:
+        return []
+    try:
+        return clickup_client.get_open_tasks(list_id)
+    except Exception:
+        logger.exception("Не удалось получить задачи проекта %s из ClickUp", project_key)
+        return None
+
 async def _send_project_report(context: ContextTypes.DEFAULT_TYPE, project_key: str) -> None:
-    """Шлёт владелице в личку полный пронумерованный список всех задач проекта (по
-    всем чатам, в порядке создания) — вызывается после команды /tasksX. В сам групповой
-    чат, где вызвали команду, полный список не идёт — там только короткое "готово"."""
+    """Шлёт владелице в личку полный пронумерованный список ОТКРЫТЫХ задач проекта —
+    тянет их живьём из ClickUp (не из локального журнала когда-либо созданных ботом
+    задач), так отчёт отражает актуальное состояние, включая то, что закрыли или
+    поменяли напрямую в ClickUp. Срочные задачи (priority urgent/high) помечены 🔴.
+    Вызывается и после команды /tasksX, и утренним дайджестом (см. daily_digest_job)."""
     if config.OWNER_USER_ID is None:
         return
     label = config.CLICKUP_PROJECTS[project_key]["label"]
-    tasks = storage.get_pushed_tasks_by_project(project_key)
-
-    if not tasks:
-        try:
-            await context.bot.send_message(
-                chat_id=config.OWNER_USER_ID, text=f"По проекту «{label}» в ClickUp пока пусто."
-            )
-        except Exception:
-            logger.exception("Не удалось отправить пустой отчёт по проекту %s владелице", project_key)
-        return
-
-    lines = [f"Задачи по проекту «{label}» ({len(tasks)}):", ""]
-    for i, t in enumerate(tasks, start=1):
-        lines.append(f"{i}. {t['title']} — {t['chat_title']}")
-    report = "\n".join(lines)
-
+    tasks = await _fetch_project_tasks(project_key)
+    if tasks is None:
+        text = f"Не смогла получить задачи «{label}» из ClickUp — попробую в следующий раз."
+    elif not tasks:
+        text = f"📋 «{label}» — открытых задач сейчас нет."
+    else:
+        text = "\n".join([f"📋 «{label}» — открытые задачи ({len(tasks)}):"] + _format_task_lines(tasks))
     try:
-        for chunk in _split_for_telegram(report):
+        for chunk in _split_for_telegram(text):
             await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
     except Exception:
         logger.exception("Не удалось отправить отчёт по проекту %s владелице", project_key)
