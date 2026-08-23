@@ -11,6 +11,8 @@ import logging
 import random
 import re
 import time
+from datetime import time as digest_time
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -568,34 +570,111 @@ async def _flush_chat_to_clickup(
     return created
 
 
+_URGENT_PRIORITIES = {"urgent", "high"}
+
+
+def _is_urgent(task: dict) -> bool:
+    return (task.get("priority") or "") in _URGENT_PRIORITIES
+
+
+def _format_task_lines(tasks: list[dict]) -> list[str]:
+    """Форматирует список задач ClickUp (см. clickup_client.get_open_tasks) в пронумерованные
+    строки отчёта, отмечая срочные/высокоприоритетные задачи значком 🔴."""
+    lines = []
+    for i, t in enumerate(tasks, start=1):
+        marker = "🔴 " if _is_urgent(t) else ""
+        lines.append(f"{i}. {marker}{t['name']}")
+    return lines
+
+
+async def _fetch_project_tasks(project_key: str) -> list[dict] | None:
+    """Общий помощник: тянет живые открытые задачи проекта прямо из ClickUp (см.
+    clickup_client.get_open_tasks) — источник истины для всех отчётов (/tasksX,
+    /urgent, утренний дайджест). Возвращает None при ошибке сети/API — не поднимает
+    исключение дальше, вызывающий код сам решает, как об этом сообщить."""
+    list_id = config.CLICKUP_LIST_IDS.get(project_key)
+    if not list_id:
+        return []
+    try:
+        return clickup_client.get_open_tasks(list_id)
+    except Exception:
+        logger.exception("Не удалось получить задачи проекта %s из ClickUp", project_key)
+        return None
+
+
 async def _send_project_report(context: ContextTypes.DEFAULT_TYPE, project_key: str) -> None:
-    """Шлёт владелице в личку полный пронумерованный список всех задач проекта (по
-    всем чатам, в порядке создания) — вызывается после команды /tasksX. В сам групповой
-    чат, где вызвали команду, полный список не идёт — там только короткое "готово"."""
+    """Шлёт владелице в личку полный пронумерованный список ОТКРЫТЫХ задач проекта —
+    тянет их живьём из ClickUp (не из локального журнала когда-либо созданных ботом
+    задач), так отчёт отражает актуальное состояние, включая то, что закрыли или
+    поменяли напрямую в ClickUp. Срочные задачи (priority urgent/high) помечены 🔴.
+    Вызывается и после команды /tasksX, и утренним дайджестом (см. daily_digest_job)."""
     if config.OWNER_USER_ID is None:
         return
     label = config.CLICKUP_PROJECTS[project_key]["label"]
-    tasks = storage.get_pushed_tasks_by_project(project_key)
-
-    if not tasks:
-        try:
-            await context.bot.send_message(
-                chat_id=config.OWNER_USER_ID, text=f"По проекту «{label}» в ClickUp пока пусто."
-            )
-        except Exception:
-            logger.exception("Не удалось отправить пустой отчёт по проекту %s владелице", project_key)
-        return
-
-    lines = [f"Задачи по проекту «{label}» ({len(tasks)}):", ""]
-    for i, t in enumerate(tasks, start=1):
-        lines.append(f"{i}. {t['title']} — {t['chat_title']}")
-    report = "\n".join(lines)
-
+    tasks = await _fetch_project_tasks(project_key)
+    if tasks is None:
+        text = f"Не смогла получить задачи «{label}» из ClickUp — попробую в следующий раз."
+    elif not tasks:
+        text = f"📋 «{label}» — открытых задач сейчас нет."
+    else:
+        text = "\n".join([f"📋 «{label}» — открытые задачи ({len(tasks)}):"] + _format_task_lines(tasks))
     try:
-        for chunk in _split_for_telegram(report):
+        for chunk in _split_for_telegram(text):
             await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
     except Exception:
         logger.exception("Не удалось отправить отчёт по проекту %s владелице", project_key)
+
+
+async def _send_urgent_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/urgent — по каждому проекту тянет живые задачи из ClickUp, оставляет только
+    срочные (priority urgent/high) и собирает одним сообщением с разделом на каждый
+    проект (см. _split_for_telegram — режется на несколько сообщений, если не
+    помещается в лимит Telegram)."""
+    if config.OWNER_USER_ID is None:
+        return
+    sections = []
+    for project_key, project in config.CLICKUP_PROJECTS.items():
+        label = project["label"]
+        tasks = await _fetch_project_tasks(project_key)
+        if tasks is None:
+            sections.append(f"«{label}»: не смогла получить задачи из ClickUp.")
+            continue
+        urgent = [t for t in tasks if _is_urgent(t)]
+        if not urgent:
+            sections.append(f"«{label}»: срочных задач нет.")
+        else:
+            sections.append("\n".join([f"🔴 «{label}» — срочные ({len(urgent)}):"] + _format_task_lines(urgent)))
+    text = "\n\n".join(sections)
+    try:
+        for chunk in _split_for_telegram(text):
+            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
+    except Exception:
+        logger.exception("Не удалось отправить сводку срочных задач владелице")
+
+
+async def handle_urgent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/urgent — только в личке, только для владелицы: сразу присылает сводку срочных
+    задач по всем проектам (см. _send_urgent_report)."""
+    chat = update.effective_chat
+    if chat.type != "private":
+        await update.message.reply_text("Эта команда работает только в личке.")
+        return
+    if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+        await update.message.reply_text("Эта команда только для владелицы.")
+        return
+    await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+    await _send_urgent_report(context)
+
+
+async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Утренний дайджест (время/часовой пояс — DAILY_DIGEST_HOUR/DAILY_DIGEST_MINUTE/
+    MARINATWIN_TIMEZONE в config.py): по каждому проекту шлёт владелице отдельным
+    сообщением полный список открытых задач, живьём из ClickUp, срочные помечены 🔴
+    (см. _send_project_report)."""
+    if not config.CLICKUP_ENABLED or config.OWNER_USER_ID is None:
+        return
+    for project_key in config.CLICKUP_PROJECTS:
+        await _send_project_report(context, project_key)
 
 
 def _make_tasks_command_handler(project_key: str):
@@ -658,6 +737,9 @@ def build_application() -> Application:
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("reset", handle_reset))
+    # /urgent — только в личке, только владелице: живая сводка срочных задач по всем
+    # проектам сразу (см. handle_urgent_command / _send_urgent_report).
+    app.add_handler(CommandHandler("urgent", handle_urgent_command))
     # По команде на проект: /tasksatlas /tasksaltyn /tasksbs /tasksmisc. "unsorted"/Разобрать
     # теперь тоже привязывается явной командой (/tasksmisc), но по-прежнему остаётся
     # автоматическим фолбэком для классификации задач в "смешанных" чатах.
@@ -674,9 +756,23 @@ def build_application() -> Application:
     if config.CLICKUP_ENABLED:
         interval = config.CLICKUP_FLUSH_INTERVAL_MINUTES * 60
         app.job_queue.run_repeating(periodic_flush_job, interval=interval, first=interval)
+        digest_msg = ""
+        if config.OWNER_USER_ID is not None:
+            app.job_queue.run_daily(
+                daily_digest_job,
+                time=digest_time(
+                    hour=config.DAILY_DIGEST_HOUR,
+                    minute=config.DAILY_DIGEST_MINUTE,
+                    tzinfo=ZoneInfo(config.MARINATWIN_TIMEZONE),
+                ),
+            )
+            digest_msg = (
+                f", утренний дайджест в {config.DAILY_DIGEST_HOUR:02d}:{config.DAILY_DIGEST_MINUTE:02d} "
+                f"({config.MARINATWIN_TIMEZONE})"
+            )
         logger.info(
-            "ClickUp-интеграция включена (проекты: %s), автовыгрузка каждые %d мин.",
-            ", ".join(config.CLICKUP_LIST_IDS), config.CLICKUP_FLUSH_INTERVAL_MINUTES,
+            "ClickUp-интеграция включена (проекты: %s), автовыгрузка каждые %d мин%s.",
+            ", ".join(config.CLICKUP_LIST_IDS), config.CLICKUP_FLUSH_INTERVAL_MINUTES, digest_msg,
         )
     else:
         logger.info(
