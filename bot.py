@@ -811,6 +811,48 @@ async def handle_urgent_command(update: Update, context: ContextTypes.DEFAULT_TY
     await _send_urgent_report(context)
 
 
+async def _send_tasksall_report(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """/tasksall — по каждому проекту (в порядке config.CLICKUP_PROJECTS) тянет живые
+    открытые задачи из ClickUp и собирает единый отчёт с разделом на каждый проект,
+    нумерация задач своя в каждом разделе (1-N), срочные помечены 🔴 (см.
+    _format_task_lines). Возвращает готовый текст — разбивку под лимит Telegram и
+    отправку делает вызывающий код (см. handle_tasksall_command)."""
+    sections = []
+    for project_key, project in config.CLICKUP_PROJECTS.items():
+        label = project["label"]
+        list_id = config.CLICKUP_LIST_IDS.get(project_key)
+        if not list_id:
+            sections.append(f"📋 «{label}»: не настроено.")
+            continue
+        tasks = await _fetch_project_tasks(project_key)
+        if tasks is None:
+            sections.append(f"📋 «{label}»: не смогла получить задачи из ClickUp.")
+        elif not tasks:
+            sections.append(f"📋 «{label}»: нет задач.")
+        else:
+            sections.append(
+                "\n".join([f"📋 «{label}» — открытые задачи ({len(tasks)}):"] + _format_task_lines(tasks))
+            )
+    return "\n\n".join(sections)
+
+
+async def handle_tasksall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/tasksall — только в личке, только для владелицы: присылает открытые задачи
+    сразу по всем четырём проектам одним отчётом, с разделом на каждый проект (см.
+    _build_tasksall_report)."""
+    chat = update.effective_chat
+    if chat.type != "private":
+        await update.message.reply_text("Эта команда работает только в личке.")
+        return
+    if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+        await update.message.reply_text("Эта команда только для владелицы.")
+        return
+    await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+    text = await _send_tasksall_report(context)
+    for chunk in _split_for_telegram(text):
+        await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
+
+
 async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Утренний дайджест (время/часовой пояс — DAILY_DIGEST_HOUR/DAILY_DIGEST_MINUTE/
     MARINATWIN_TIMEZONE в config.py): по каждому проекту шлёт владелице отдельным
@@ -885,6 +927,9 @@ def build_application() -> Application:
     # /urgent — только в личке, только владелице: живая сводка срочных задач по всем
     # проектам сразу (см. handle_urgent_command / _send_urgent_report).
     app.add_handler(CommandHandler("urgent", handle_urgent_command))
+    # /tasksall — только в личке, только владелице: живой отчёт по открытым задачам
+    # сразу всех четырёх проектов одним сообщением (см. handle_tasksall_command).
+    app.add_handler(CommandHandler("tasksall", handle_tasksall_command))
     # По команде на проект: /tasksatlas /tasksaltyn /tasksbs /tasksmisc. "unsorted"/Разобрать
     # теперь тоже привязывается явной командой (/tasksmisc), но по-прежнему остаётся
     # автоматическим фолбэком для классификации задач в "смешанных" чатах.
