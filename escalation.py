@@ -42,3 +42,55 @@ def rephrase_answer(group_title: str, asker_name: str, question: str, raw_answer
     )
     text = "\n".join(block.text for block in response.content if block.type == "text").strip()
     return text or raw_answer
+
+
+_INITIAL_DRAFT_SYSTEM_PROMPT = """Ты помогаешь Марине быстро отвечать коллегам в рабочих групповых чатах.
+Тебе дают вопрос коллеги из группового чата, адресованный Марине. Составь короткий,
+дружелюбный черновик ответа от её лица, в деловом, но живом тоне — как будто она сама
+печатает в чат прямо сейчас.
+ВАЖНО: ты не знаешь актуального состояния дел (задач в ClickUp, деталей проекта,
+договорённостей) — не выдумывай факты, даты, цифры или решения, которых нет в вопросе.
+Если вопрос требует конкретной информации, которой у тебя нет, честно предложи
+нейтральный ответ-заглушку (например, что она уточнит и вернётся), а не выдумывай
+детали. Никогда не утверждай, что уже что-то сделано (закрыла задачу, переименовала,
+отправила файл и т.п.) — ты не выполняешь реальных действий, только предлагаешь текст.
+Марина сама решит, отправлять этот черновик, попросить другой вариант или ответить
+по-своему.
+Ответь только текстом чернового сообщения для чата, без пояснений, без кавычек вокруг и
+без подписи."""
+def draft_initial_answer(group_title: str, asker_name: str, question: str) -> str:
+ user_content = f"Групповой чат: «{group_title}»\nВопрос от {asker_name}: {question}"
+ response = client.messages.create(
+ model=config.MODEL_NAME,
+ max_tokens=1024,
+ system=_INITIAL_DRAFT_SYSTEM_PROMPT,
+ messages=[{"role": "user", "content": user_content}],
+ )
+ return "\n".join(block.text for block in response.content if block.type == "text").strip()
+_CORRECTION_SYSTEM_PROMPT = """Ты помогаешь Марине быстро отвечать коллегам в рабочих групповых чатах.
+Тебе дают вопрос коллеги из группового чата, ответ, который Марина уже отправляла туда
+ранее, и её новую правку или дополнение (может быть коротким, неформальным, с
+опечатками — это нормально, это просто её быстрый черновик в личных сообщениях).
+Перефразируй правку Марины в связное, дружелюбное сообщение-уточнение для группового
+чата — от её лица, в деловом, но живом тоне. Сохраняй суть и все факты из её правки,
+ничего не добавляй от себя и не выдумывай деталей, которых в её правке не было. Не
+пересказывай заново предыдущий ответ целиком — это именно уточнение/дополнение к нему.
+Ответь только текстом сообщения для чата, без пояснений, без кавычек вокруг и без
+подписи."""
+def rephrase_correction(
+ group_title: str, asker_name: str, question: str, previous_answer: str, raw_correction: str
+) -> str:
+ user_content = (
+ f"Групповой чат: «{group_title}»\n"
+ f"Вопрос от {asker_name}: {question}\n\n"
+ f"Ранее отвечала: {previous_answer}\n\n"
+ f"Новая правка Марины: {raw_correction}"
+ )
+ response = client.messages.create(
+ model=config.MODEL_NAME,
+ max_tokens=1024,
+ system=_CORRECTION_SYSTEM_PROMPT,
+ messages=[{"role": "user", "content": user_content}],
+ )
+ text = "\n".join(block.text for block in response.content if block.type == "text").strip()
+ return text or raw_correction
