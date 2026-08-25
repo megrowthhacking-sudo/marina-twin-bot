@@ -11,7 +11,7 @@ import logging
 import random
 import re
 import time
-from datetime import time as digest_time
+from datetime import datetime, time as digest_time
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -723,13 +723,24 @@ def _is_urgent(task: dict) -> bool:
     return (task.get("priority") or "") in _URGENT_PRIORITIES
 
 
+def _format_due_suffix(due_date: float | None) -> str:
+    """Возвращает суффикс со сроком «(до ДД.ММ.ГГГГ)» для строки отчёта, если у задачи
+    задан срок в ClickUp, иначе пустую строку."""
+    if not due_date:
+        return ""
+    dt = datetime.fromtimestamp(due_date, tz=ZoneInfo(config.MARINATWIN_TIMEZONE))
+    return f" (до {dt.strftime('%d.%m.%Y')})"
+
+
 def _format_task_lines(tasks: list[dict]) -> list[str]:
     """Форматирует список задач ClickUp (см. clickup_client.get_open_tasks) в пронумерованные
-    строки отчёта, отмечая срочные/высокоприоритетные задачи значком 🔴."""
+    строки отчёта, отмечая срочные/высокоприоритетные задачи значком 🔴 и, если у задачи
+    задан срок в ClickUp, дописывая его в конце строки."""
     lines = []
     for i, t in enumerate(tasks, start=1):
         marker = "🔴 " if _is_urgent(t) else ""
-        lines.append(f"{i}. {marker}{t['name']}")
+        due_suffix = _format_due_suffix(t.get("due_date"))
+        lines.append(f"{i}. {marker}{t['name']}{due_suffix}")
     return lines
 
 
