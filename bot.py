@@ -217,6 +217,88 @@ async def _propose_escalation_correction(update: Update, context: ContextTypes.D
         storage.link_escalation_dm_message(esc_id, sent_chunk.message_id)
 
 
+async def _send_draft_with_buttons(context, esc_id: int, preview_text: str, keyboard) -> None:
+    chunks = _split_for_telegram(preview_text)
+    for i, chunk in enumerate(chunks):
+        sent = await context.bot.send_message(
+            chat_id=config.OWNER_USER_ID, text=chunk, reply_markup=keyboard if i == len(chunks) - 1 else None
+        )
+        storage.link_escalation_dm_message(esc_id, sent.message_id)
+
+
+def _initial_draft_keyboard(esc_id: int):
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Подтверждаю", callback_data=f"esc_confirm:{esc_id}"),
+            InlineKeyboardButton("❌ Не подтверждаю", callback_data=f"esc_cancel:{esc_id}"),
+        ]]
+    )
+
+
+async def _propose_initial_draft(context, esc_id: int, group_title: str, asker_name: str, question: str) -> None:
+    try:
+        draft = escalation.draft_initial_answer(group_title, asker_name, question)
+    except Exception:
+        logger.exception("Не удалось составить черновик ответа для эскалации #%s", esc_id)
+        draft = ""
+
+    if not draft:
+        storage.set_escalation_flow_stage(esc_id, "awaiting_own_text")
+        await context.bot.send_message(
+            chat_id=config.OWNER_USER_ID,
+            text="Не смогла сама составить черновик — напиши, пожалуйста, ответ своими словами.",
+        )
+        return
+
+    storage.set_escalation_draft(esc_id, raw_text=draft, posted_text=draft)
+    storage.set_escalation_flow_stage(esc_id, "initial_draft")
+    preview = f"Предлагаю ответить в «{group_title}»:\n\n{draft}"
+    await _send_draft_with_buttons(context, esc_id, preview, _initial_draft_keyboard(esc_id))
+
+
+async def _finalize_own_answer(context, esc: dict, raw_text: str) -> None:
+    esc_id = esc["id"]
+    group_title = esc["group_title"]
+    asker_name = esc["asker_name"]
+    question = esc["question"]
+
+    await context.bot.send_chat_action(chat_id=config.OWNER_USER_ID, action=ChatAction.TYPING)
+    try:
+        final_text = escalation.rephrase_answer(group_title, asker_name, question, raw_text)
+    except Exception:
+        logger.exception("Не удалось перефразировать ответ для эскалации #%s — использую как есть", esc_id)
+        final_text = raw_text
+
+    storage.set_escalation_draft(esc_id, raw_text=raw_text, posted_text=final_text)
+    storage.set_escalation_flow_stage(esc_id, "final_draft")
+    preview = f"Вот как получилось для «{group_title}»:\n\n{final_text}"
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("📤 Отправляю", callback_data=f"esc_confirm:{esc_id}"),
+            InlineKeyboardButton("🚫 Не отправляю", callback_data=f"esc_cancel:{esc_id}"),
+        ]]
+    )
+    await _send_draft_with_buttons(context, esc_id, preview, keyboard)
+
+
+_CANCEL_PHRASES = {"отмена", "отмена.", "отмена!"}
+
+
+async def _handle_owner_escalation_message(update, context, esc: dict, text: str) -> None:
+    esc_id = esc["id"]
+    if text.strip().lower() in _CANCEL_PHRASES:
+        storage.cancel_escalation_flow(esc_id)
+        await update.message.reply_text(
+            f"Поняла, не вмешиваюсь — вопрос от {esc['asker_name']} из «{esc['group_title']}» оставляю на тебя."
+        )
+        return
+
+    if not esc["resolved"]:
+        await _finalize_own_answer(context, esc, text)
+        return
+    await _propose_escalation_correction(update, context, esc, text)
+
+
 async def handle_escalation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает нажатие кнопки "Отправить"/"Не отправлять" под черновиком правки
     (см. _propose_escalation_correction)."""
@@ -237,7 +319,52 @@ async def handle_escalation_callback(update: Update, context: ContextTypes.DEFAU
         await query.edit_message_text("Не нашла эту эскалацию — возможно, устарела.")
         return
 
+    if action == "esc_retry":
+        await query.edit_message_text("Секунду, предложу другой вариант...")
+        try:
+            draft = escalation.draft_initial_answer(esc["group_title"], esc["asker_name"], esc["question"])
+        except Exception:
+            logger.exception("Не удалось составить повторный черновик для эскалации #%s", esc_id)
+            draft = ""
+
+        if not draft:
+            storage.set_escalation_flow_stage(esc_id, "awaiting_own_text")
+            await context.bot.send_message(
+                chat_id=config.OWNER_USER_ID,
+                text="Не смогла сама составить другой вариант — напиши, пожалуйста, ответ своими словами.",
+            )
+            return
+
+        storage.set_escalation_draft(esc_id, raw_text=draft, posted_text=draft)
+        storage.set_escalation_flow_stage(esc_id, "initial_draft")
+        preview = f"Предлагаю ответить в «{esc['group_title']}»:\n\n{draft}"
+        await _send_draft_with_buttons(context, esc_id, preview, _initial_draft_keyboard(esc_id))
+        return
+
+    if action == "esc_own":
+        storage.set_escalation_flow_stage(esc_id, "awaiting_own_text")
+        await query.edit_message_text("Хорошо, жду твой вариант ответа обычным сообщением.")
+        return
+
     if action == "esc_cancel":
+        if not esc["resolved"] and esc["flow_stage"] == "initial_draft":
+            storage.set_escalation_flow_stage(esc_id, "reject_choice")
+            keyboard = InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton("🔄 Предложить новый ответ", callback_data=f"esc_retry:{esc_id}"),
+                    InlineKeyboardButton("✍️ Написать ответ", callback_data=f"esc_own:{esc_id}"),
+                ]]
+            )
+            await query.edit_message_text(
+                "Хорошо, не отправляю этот черновик. Предложить другой вариант, или напишешь сама?",
+                reply_markup=keyboard,
+            )
+            return
+        if not esc["resolved"] and esc["flow_stage"] == "final_draft":
+            storage.set_escalation_flow_stage(esc_id, "awaiting_own_text")
+            storage.clear_escalation_draft(esc_id)
+            await query.edit_message_text("Хорошо, не отправляю. Пришли новый вариант ответа обычным сообщением.")
+            return
         storage.clear_escalation_draft(esc_id)
         await query.edit_message_text("Хорошо, не отправляю. Пришли новую правку — ответом на исходный вопрос.")
         return
@@ -260,9 +387,13 @@ async def handle_escalation_callback(update: Update, context: ContextTypes.DEFAU
             )
             return
 
+        was_resolved = esc["resolved"]
         storage.update_escalation_after_answer(esc_id, raw_answer=draft_raw, posted_text=draft_posted)
         storage.clear_escalation_draft(esc_id)
-        await query.edit_message_text(f"Готово, отправила уточнение в «{esc['group_title']}» 👍")
+        if was_resolved:
+            await query.edit_message_text(f"Готово, отправила уточнение в «{esc['group_title']}» 👍")
+        else:
+            await query.edit_message_text(f"Готово, ответила в «{esc['group_title']}» 👍")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -289,11 +420,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if reply_to:
             esc = storage.get_escalation_by_any_dm_message_id(reply_to.message_id)
             if esc:
-                if not esc["resolved"]:
-                    pending_tuple = (esc["id"], esc["group_chat_id"], esc["group_title"], esc["asker_name"], esc["question"])
-                    await _resolve_escalation(update, context, pending_tuple, text)
-                else:
-                    await _propose_escalation_correction(update, context, esc, text)
+                await _handle_owner_escalation_message(update, context, esc, text)
                 return
             await update.message.reply_text(
                 "Не нашла вопрос, на который вы отвечаете (возможно, устарел). Если "
@@ -304,8 +431,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         pending = storage.get_oldest_pending_escalation()
         if pending:
-            await _resolve_escalation(update, context, pending, text)
-            return
+            esc = storage.get_escalation(pending[0])
+            if esc:
+                await _handle_owner_escalation_message(update, context, esc, text)
+                return
 
     state = storage.get_chat(chat_id)
     history: list = state["history"]
@@ -381,22 +510,19 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if config.OWNER_USER_ID is not None:
             await update.message.reply_text(random.choice(_ACK_PHRASES))
             asker_name = (user.first_name or user.username or "коллега") if user else "коллега"
-            esc_id = storage.add_pending_escalation(chat.id, chat.title or str(chat.id), asker_name, text)
+            group_title = chat.title or str(chat.id)
+            esc_id = storage.add_pending_escalation(chat.id, group_title, asker_name, text)
             try:
                 sent = await context.bot.send_message(
                     chat_id=config.OWNER_USER_ID,
-                    text=(
-                        f"❓ Вопрос из группы «{chat.title or chat.id}» от {asker_name}:\n\n{text}\n\n"
-                        f"Ответь мне сюда обычным сообщением — перескажу это в чат.\n"
-                        f"Если позже захочешь поправить или дополнить ответ — сделай reply на это "
-                        f"или любое из моих следующих сообщений по этому вопросу, я спрошу "
-                        f"подтверждение перед отправкой. Так можно сколько угодно раз."
-                    ),
+                    text=f"❓ Вопрос из группы «{group_title}» от {asker_name}:\n\n{text}",
                 )
                 storage.set_escalation_dm_message_id(esc_id, sent.message_id)
                 storage.link_escalation_dm_message(esc_id, sent.message_id)
             except Exception:
                 logger.exception("Не удалось отправить эскалацию владелице (user_id=%s)", config.OWNER_USER_ID)
+                return
+            await _propose_initial_draft(context, esc_id, group_title, asker_name, text)
             return
         logger.warning(
             "Обращение к Марине в чате %s, но MARINATWIN_OWNER_USER_ID не настроен — "
@@ -766,7 +892,7 @@ def build_application() -> Application:
         if project["command"]:
             app.add_handler(CommandHandler(project["command"], _make_tasks_command_handler(project_key)))
     # Кнопки "Отправить"/"Не отправлять" под черновиком правки к эскалации.
-    app.add_handler(CallbackQueryHandler(handle_escalation_callback, pattern=r"^esc_(confirm|cancel):"))
+    app.add_handler(CallbackQueryHandler(handle_escalation_callback, pattern=r"^esc_(confirm|cancel|retry|own):"))
     # Личка — обычный разговор с персоной Marina Twin.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     # Группы — тихий сбор переписки, без ответов.
