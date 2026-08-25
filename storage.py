@@ -136,6 +136,18 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    # Все DM-сообщения бота, связанные с одной эскалацией (исходный пересланный вопрос,
+    # подтверждение ответа, черновики правок) — чтобы Марина могла сделать reply-правку
+    # на ЛЮБОЕ из них, а не только на самое первое сообщение (см.
+    # get_escalation_by_any_dm_message_id ниже и link_escalation_dm_message в bot.py).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS escalation_dm_messages (
+            message_id INTEGER PRIMARY KEY,
+            escalation_id INTEGER NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -331,6 +343,33 @@ def set_escalation_dm_message_id(escalation_id: int, message_id: int) -> None:
         (message_id, escalation_id),
     )
     _conn.commit()
+
+
+def link_escalation_dm_message(escalation_id: int, message_id: int) -> None:
+    """Запоминает, что это DM-сообщение бота относится к эскалации — чтобы reply на
+    него (не только на самое первое пересланное сообщение) тоже находил нужную
+    эскалацию, см. get_escalation_by_any_dm_message_id. Вызывается на каждое
+    отправленное владелице сообщение по ходу эскалации (исходный вопрос, подтверждение
+    ответа, черновик правки)."""
+    _conn.execute(
+        "INSERT OR REPLACE INTO escalation_dm_messages (message_id, escalation_id) VALUES (?, ?)",
+        (message_id, escalation_id),
+    )
+    _conn.commit()
+
+
+def get_escalation_by_any_dm_message_id(message_id: int) -> dict | None:
+    """Как get_escalation_by_dm_message_id, но проверяет ВСЕ DM-сообщения, связанные с
+    эскалацией (см. link_escalation_dm_message), а не только самое первое — на случай
+    если Марина отвечает reply-ом на более позднее сообщение (подтверждение ответа,
+    черновик правки), а не на исходный пересланный вопрос."""
+    row = _conn.execute(
+        "SELECT escalation_id FROM escalation_dm_messages WHERE message_id = ?",
+        (message_id,),
+    ).fetchone()
+    if row:
+        return get_escalation(row[0])
+    return get_escalation_by_dm_message_id(message_id)
 
 
 def update_escalation_after_answer(escalation_id: int, raw_answer: str, posted_text: str) -> None:
