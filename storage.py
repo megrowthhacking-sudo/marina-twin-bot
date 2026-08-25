@@ -113,6 +113,23 @@ def _connect() -> sqlite3.Connection:
             "draft_posted": "TEXT",
         },
     )
+    # Все сообщения в личке владелицы, относящиеся к эскалации — не только исходное
+    # пересланное сообщение с вопросом (dm_question_message_id), но и подтверждения,
+    # черновики правок и прочие связанные сообщения. Нужно, чтобы reply-matching
+    # (см. get_escalation_by_any_dm_message_id) срабатывал на ЛЮБОЕ сообщение из
+    # треда эскалации, а не только на самое первое.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS escalation_dm_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            escalation_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_escalation_dm_messages_message_id ON escalation_dm_messages(message_id)"
+    )
     # Задачи из "смешанных" (непривязанных к проекту) чатов, для которых Claude не смог
     # по контексту понять, к какому проекту они относятся ("unsorted" в classify-ответе).
     # Вместо того чтобы молча класть их в "Разобрать", бот спрашивает прямо в чате —
@@ -331,6 +348,30 @@ def set_escalation_dm_message_id(escalation_id: int, message_id: int) -> None:
         (message_id, escalation_id),
     )
     _conn.commit()
+
+
+def link_escalation_dm_message(escalation_id: int, message_id: int) -> None:
+    """Запоминает, что данное сообщение в личке владелицы (подтверждение, черновик
+    правки и т.п.) относится к этой эскалации — чтобы reply на него тоже матчился
+    (см. get_escalation_by_any_dm_message_id), а не только reply на самое первое
+    пересланное сообщение с вопросом."""
+    _conn.execute(
+        "INSERT INTO escalation_dm_messages (escalation_id, message_id) VALUES (?, ?)",
+        (escalation_id, message_id),
+    )
+    _conn.commit()
+
+
+def get_escalation_by_any_dm_message_id(message_id: int) -> dict | None:
+    """Находит эскалацию по message_id ЛЮБОГО связанного с ней сообщения в личке
+    владелицы — не только исходного пересланного вопроса, но и подтверждений,
+    черновиков правок и т.д. Так reply-matching работает независимо от того, на
+    какое именно сообщение из треда эскалации ответила владелица."""
+    row = _conn.execute(
+        "SELECT escalation_id FROM escalation_dm_messages WHERE message_id = ?",
+        (message_id,),
+    ).fetchone()
+    return get_escalation(row[0]) if row else None
 
 
 def update_escalation_after_answer(escalation_id: int, raw_answer: str, posted_text: str) -> None:
