@@ -51,7 +51,7 @@ CLICKUP_PROJECTS = {
         "env": "CLICKUP_LIST_UNSORTED",
         "label": "Разобрать",
         "command": "tasksmisc",
-        "keywords": (),
+        "keywords": ("смешанная группа", "разобрать"),
     },
 }
 # {"atlas": "901820614918", "altyn": "901820614919", ...} — только реально заданные.
