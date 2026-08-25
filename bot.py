@@ -163,14 +163,16 @@ async def _resolve_escalation(
     except Exception:
         logger.exception("Не удалось отправить ответ в группу %s (эскалация #%s)", group_chat_id, esc_id)
         storage.update_escalation_after_answer(esc_id, raw_answer=answer_text, posted_text=final_text)
-        await update.message.reply_text(
+        sent_fail = await update.message.reply_text(
             f"Поняла ответ, но не смогла отправить его в «{group_title}» (возможно, меня там больше нет) — "
             f"перешли, пожалуйста, вручную: {final_text}"
         )
+        storage.link_escalation_dm_message(esc_id, sent_fail.message_id)
         return
 
     storage.update_escalation_after_answer(esc_id, raw_answer=answer_text, posted_text=final_text)
-    await update.message.reply_text(f"Готово, ответила в «{group_title}» 👍")
+    sent_ok = await update.message.reply_text(f"Готово, ответила в «{group_title}» 👍")
+    storage.link_escalation_dm_message(esc_id, sent_ok.message_id)
 
 
 async def _propose_escalation_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, esc: dict, raw_correction: str) -> None:
@@ -211,7 +213,8 @@ async def _propose_escalation_correction(update: Update, context: ContextTypes.D
     )
     chunks = _split_for_telegram(preview)
     for i, chunk in enumerate(chunks):
-        await update.message.reply_text(chunk, reply_markup=keyboard if i == len(chunks) - 1 else None)
+        sent_chunk = await update.message.reply_text(chunk, reply_markup=keyboard if i == len(chunks) - 1 else None)
+        storage.link_escalation_dm_message(esc_id, sent_chunk.message_id)
 
 
 async def handle_escalation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -284,7 +287,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if config.OWNER_USER_ID is not None and user.id == config.OWNER_USER_ID:
         reply_to = update.message.reply_to_message
         if reply_to:
-            esc = storage.get_escalation_by_dm_message_id(reply_to.message_id)
+            esc = storage.get_escalation_by_any_dm_message_id(reply_to.message_id)
             if esc:
                 if not esc["resolved"]:
                     pending_tuple = (esc["id"], esc["group_chat_id"], esc["group_title"], esc["asker_name"], esc["question"])
@@ -292,6 +295,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 else:
                     await _propose_escalation_correction(update, context, esc, text)
                 return
+            await update.message.reply_text(
+                "Не нашла вопрос, на который вы отвечаете (возможно, устарел). Если "
+                "вопросов в очереди несколько — ответьте обычным сообщением (без "
+                "reply) на самый старый, либо сделайте reply точно на нужное "
+                "пересланное сообщение."
+            )
+            return
         pending = storage.get_oldest_pending_escalation()
         if pending:
             await _resolve_escalation(update, context, pending, text)
@@ -378,12 +388,13 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     text=(
                         f"❓ Вопрос из группы «{chat.title or chat.id}» от {asker_name}:\n\n{text}\n\n"
                         f"Ответь мне сюда обычным сообщением — перескажу это в чат.\n"
-                        f"Если позже захочешь поправить или дополнить ответ — сделай reply на ЭТО "
-                        f"сообщение с уточнением, я спрошу подтверждение перед отправкой. Так можно "
-                        f"сколько угодно раз."
+                        f"Если позже захочешь поправить или дополнить ответ — сделай reply на это "
+                        f"или любое из моих следующих сообщений по этому вопросу, я спрошу "
+                        f"подтверждение перед отправкой. Так можно сколько угодно раз."
                     ),
                 )
                 storage.set_escalation_dm_message_id(esc_id, sent.message_id)
+                storage.link_escalation_dm_message(esc_id, sent.message_id)
             except Exception:
                 logger.exception("Не удалось отправить эскалацию владелице (user_id=%s)", config.OWNER_USER_ID)
             return
@@ -395,6 +406,14 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     user_name = (user.first_name or user.username or "кто-то") if user else "кто-то"
     storage.add_group_message(chat.id, chat.title or str(chat.id), user_name, text)
+    # Раньше новое сообщение просто копилось в буфере до ближайшей периодической
+    # выгрузки (см. periodic_flush_job, CLICKUP_FLUSH_INTERVAL_MINUTES) — из-за этого
+    # /urgent и живые отчёты могли не видеть только что написанные задачи. Теперь
+    # выгружаем в ClickUp сразу же; periodic_flush_job остаётся как подстраховка на
+    # случай, если этот вызов упадёт (сеть, лимиты Claude/ClickUp).
+    if config.CLICKUP_ENABLED:
+        project_key = storage.get_chat_project(chat.id)
+        await _flush_chat_to_clickup(context, chat.id, chat.title or str(chat.id), project_key)
 
 
 def _create_and_log_task(
