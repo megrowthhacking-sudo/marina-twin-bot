@@ -111,6 +111,7 @@ def _connect() -> sqlite3.Connection:
             "last_posted_text": "TEXT",
             "draft_raw": "TEXT",
             "draft_posted": "TEXT",
+            "flow_stage": "TEXT",
         },
     )
     # Задачи из "смешанных" (непривязанных к проекту) чатов, для которых Claude не смог
@@ -313,6 +314,7 @@ def resolve_pending_escalation(escalation_id: int) -> None:
 _ESCALATION_COLUMNS = (
     "id", "group_chat_id", "group_title", "asker_name", "question", "resolved",
     "dm_question_message_id", "last_answer", "last_posted_text", "draft_raw", "draft_posted",
+    "flow_stage",
 )
 
 
@@ -376,8 +378,28 @@ def update_escalation_after_answer(escalation_id: int, raw_answer: str, posted_t
     """Фиксирует ответ (первый или очередная правка) как resolved + запоминает, что
     реально ушло в группу — это станет "предыдущим ответом" для следующей правки."""
     _conn.execute(
-        "UPDATE pending_escalations SET resolved = 1, last_answer = ?, last_posted_text = ? WHERE id = ?",
+        "UPDATE pending_escalations SET resolved = 1, flow_stage = NULL, last_answer = ?, last_posted_text = ? WHERE id = ?",
         (raw_answer, posted_text, escalation_id),
+    )
+    _conn.commit()
+
+
+def set_escalation_flow_stage(escalation_id: int, stage: str | None) -> None:
+    _conn.execute(
+        "UPDATE pending_escalations SET flow_stage = ? WHERE id = ?",
+        (stage, escalation_id),
+    )
+    _conn.commit()
+
+
+def cancel_escalation_flow(escalation_id: int) -> None:
+    _conn.execute(
+        """
+        UPDATE pending_escalations
+        SET resolved = 1, flow_stage = NULL, draft_raw = NULL, draft_posted = NULL
+        WHERE id = ?
+        """,
+        (escalation_id,),
     )
     _conn.commit()
 
