@@ -513,9 +513,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             group_title = chat.title or str(chat.id)
             esc_id = storage.add_pending_escalation(chat.id, group_title, asker_name, text)
             try:
+                username_suffix = f" (@{user.username})" if user and user.username else ""
                 sent = await context.bot.send_message(
                     chat_id=config.OWNER_USER_ID,
-                    text=f"❓ Вопрос из группы «{group_title}» от {asker_name}:\n\n{text}",
+                    text=f"❓ Вопрос из группы «{group_title}» от {asker_name}{username_suffix}:\n\n{text}",
                 )
                 storage.set_escalation_dm_message_id(esc_id, sent.message_id)
                 storage.link_escalation_dm_message(esc_id, sent.message_id)
