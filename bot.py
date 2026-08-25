@@ -15,7 +15,7 @@ from datetime import time as digest_time
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ChatType
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -685,6 +685,40 @@ async def handle_urgent_command(update: Update, context: ContextTypes.DEFAULT_TY
     await _send_urgent_report(context)
 
 
+async def handle_tasksall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/tasksall — только в личке, только для владелицы: одним сообщением (при необходимости
+    разбитым на части, см. _split_for_telegram) показывает открытые задачи сразу по ВСЕМ
+    проектам (Atlas, Алтын, BestSwift, Разобрать), живьём из ClickUp. Срочные задачи
+    (priority urgent/high) помечены 🔴 (см. _is_urgent)."""
+    if config.OWNER_USER_ID is not None and update.effective_user.id != config.OWNER_USER_ID:
+        return
+    if update.effective_chat.type != ChatType.PRIVATE:
+        return
+
+    sections = []
+    for project_key, project in config.CLICKUP_PROJECTS.items():
+        label = project["label"]
+        header = f"📋 {label}"
+        list_id = config.CLICKUP_LIST_IDS.get(project_key)
+        if not list_id:
+            sections.append(f"{header}\nНе настроено")
+            continue
+        try:
+            tasks = clickup_client.get_open_tasks(list_id)
+        except Exception:
+            logger.exception("Не удалось получить задачи проекта %s из ClickUp", project_key)
+            sections.append(f"{header}\nНе смогла получить задачи из ClickUp.")
+            continue
+        if not tasks:
+            sections.append(f"{header}\nНет задач")
+        else:
+            sections.append("\n".join([header] + _format_task_lines(tasks)))
+
+    text = "\n\n".join(sections)
+    for chunk in _split_for_telegram(text):
+        await update.message.reply_text(chunk)
+
+
 async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Утренний дайджест (время/часовой пояс — DAILY_DIGEST_HOUR/DAILY_DIGEST_MINUTE/
     MARINATWIN_TIMEZONE в config.py): по каждому проекту шлёт владелице отдельным
@@ -765,6 +799,9 @@ def build_application() -> Application:
     for project_key, project in config.CLICKUP_PROJECTS.items():
         if project["command"]:
             app.add_handler(CommandHandler(project["command"], _make_tasks_command_handler(project_key)))
+    # /tasksall — только в личке, только владелице: открытые задачи сразу по всем
+    # проектам одним отчётом (см. handle_tasksall_command).
+    app.add_handler(CommandHandler("tasksall", handle_tasksall_command))
     # Кнопки "Отправить"/"Не отправлять" под черновиком правки к эскалации.
     app.add_handler(CallbackQueryHandler(handle_escalation_callback, pattern=r"^esc_(confirm|cancel):"))
     # Личка — обычный разговор с персоной Marina Twin.
