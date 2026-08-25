@@ -273,7 +273,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not _is_allowed(user.id):
         logger.warning("Отклонён неразрешённый пользователь %s (%s)", user.id, user.username)
         await update.message.reply_text(
-            "Извини, этот бот только для сотрудников. Если это ошибка — напиши Марине."
+            "Извини, этот бот цифровая копия Марины, он общается в личном чате только с ней."
         )
         return
 
