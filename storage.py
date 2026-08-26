@@ -453,7 +453,7 @@ def get_escalation_by_group_message_id(chat_id: int, message_id: int) -> dict | 
     чтобы понять, к какой эскалации относится отредактированное сообщение
     (см. _handle_group_message_edited в bot.py)."""
     row = _conn.execute(
-        "SELECT id FROM pending_escalations WHERE group_chat_id = ? AND group_question_message_id = ?",
+        "SELECT id FROM pending_escalations WHERE group_chat_id = ? AND group_question_message_id = ? AND resolved = 0",
         (chat_id, message_id),
     ).fetchone()
     return get_escalation(row[0]) if row else None
