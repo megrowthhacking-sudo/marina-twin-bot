@@ -260,6 +260,60 @@ async def _send_draft_with_buttons(context, esc_id: int, preview_text: str, keyb
         storage.link_escalation_dm_message(esc_id, sent.message_id)
 
 
+def _format_mention(asker_name: str | None, asker_username: str | None) -> str:
+    """Единый формат обращения к автору вопроса — используется и в финальном сообщении,
+    отправляемом в группу, и в черновике на согласование в личке, чтобы владелица видела
+    заранее именно то, что уйдёт в чат. Раньше было либо/либо (юзернейм ИЛИ имя) — теряли
+    либо узнаваемость по имени, либо кликабельный тег; теперь показываем оба, если тег
+    известен."""
+    name = (asker_name or "").strip()
+    username = (asker_username or "").strip()
+    if name and username:
+        return f"{name} (@{username}), "
+    if username:
+        return f"@{username} "
+    if name:
+        return f"{name}, "
+    return ""
+
+
+def _strip_marina_trigger(text: str, bot_username: str | None, owner_username: str | None) -> str:
+    """Убирает из текста упоминание/тег/имя, которыми обратились к Марине — остаток
+    показывает, есть ли у самого тег-сообщения собственный текст вопроса, или это голый
+    тег (см. _extract_question_context)."""
+    stripped = text
+    if bot_username:
+        stripped = re.sub(re.escape(f"@{bot_username}"), "", stripped, flags=re.IGNORECASE)
+    if owner_username:
+        stripped = re.sub(re.escape(f"@{owner_username}"), "", stripped, flags=re.IGNORECASE)
+    stripped = _MARINA_NAME_RE.sub("", stripped)
+    return stripped.strip(" ,.!?:;\n-—")
+
+
+async def _extract_question_context(update: Update, context: ContextTypes.DEFAULT_TYPE, chat, msg, text: str) -> str:
+    """Обращение к Марине не всегда содержит сам вопрос — иногда коллега сначала пишет
+    вопрос отдельным сообщением, а к Марине обращается уже следующим, коротким ("Марина?",
+    просто тег без своего текста). Раньше в этом случае эскалация уходила с текстом самого
+    тег-сообщения, и владелица получала в личке вопрос без содержания. Теперь: если
+    тег-сообщение — reply на чьё-то ещё сообщение (не на сообщение самого бота), вопрос
+    берём оттуда; если это не reply, но у тег-сообщения почти нет своего текста — берём
+    последнее недавнее сообщение чата (см. storage.get_last_group_message). Если у
+    тег-сообщения есть содержательный текст — используем его как раньше."""
+    bot_username = context.bot.username
+    owner_username = await _get_owner_username(context)
+    remainder = _strip_marina_trigger(text, bot_username, owner_username)
+    reply_to = msg.reply_to_message
+    if reply_to and not (reply_to.from_user and reply_to.from_user.id == context.bot.id):
+        reply_text = (reply_to.text or reply_to.caption or "").strip()
+        if reply_text:
+            return f"{reply_text}\n\n{remainder}" if remainder else reply_text
+    if not remainder:
+        recent = storage.get_last_group_message(chat.id)
+        if recent and (recent.get("text") or "").strip():
+            return recent["text"].strip()
+    return text
+
+
 def _initial_draft_keyboard(esc_id: int):
     return InlineKeyboardMarkup(
         [[
@@ -270,7 +324,13 @@ def _initial_draft_keyboard(esc_id: int):
 
 
 async def _propose_initial_draft(
-    context, esc_id: int, group_title: str, asker_name: str, question: str, project_key: str | None = None
+    context,
+    esc_id: int,
+    group_title: str,
+    asker_name: str,
+    question: str,
+    project_key: str | None = None,
+    asker_username: str | None = None,
 ) -> None:
     try:
         draft = escalation.draft_initial_answer(group_title, asker_name, question, project_key)
@@ -288,7 +348,8 @@ async def _propose_initial_draft(
 
     storage.set_escalation_draft(esc_id, raw_text=draft, posted_text=draft)
     storage.set_escalation_flow_stage(esc_id, "initial_draft")
-    preview = f"Предлагаю ответить в «{group_title}»:\n\n{draft}"
+    mention = _format_mention(asker_name, asker_username)
+    preview = f"Предлагаю ответить в «{group_title}»:\n\n{mention}{draft}"
     await _send_draft_with_buttons(context, esc_id, preview, _initial_draft_keyboard(esc_id))
 
 
@@ -304,7 +365,8 @@ async def _finalize_own_answer(context, esc: dict, raw_text: str) -> None:
 
     storage.set_escalation_draft(esc_id, raw_text=raw_text, posted_text=final_text)
     storage.set_escalation_flow_stage(esc_id, "final_draft")
-    preview = f"Вот как получилось для «{group_title}»:\n\n{final_text}"
+    mention = _format_mention(esc.get("asker_name"), esc.get("asker_username"))
+    preview = f"Вот как получилось для «{group_title}»:\n\n{mention}{final_text}"
     keyboard = InlineKeyboardMarkup(
         [[
             InlineKeyboardButton("📤 Отправляю", callback_data=f"esc_confirm:{esc_id}"),
@@ -336,8 +398,7 @@ async def _send_confirmed_answer(context, query, esc: dict, draft_raw: str, draf
     """Фактическая отправка подтверждённого ответа в группу — вынесено из esc_confirm
     отдельной функцией, чтобы esc_confirm_anyway мог переиспользовать ту же логику."""
     esc_id = esc["id"]
-    asker_username = esc.get("asker_username")
-    mention = f"@{asker_username} " if asker_username else (f"{esc['asker_name']}, " if esc.get("asker_name") else "")
+    mention = _format_mention(esc.get("asker_name"), esc.get("asker_username"))
     text_to_send = f"{mention}{draft_posted}"
     reply_to_message_id = esc.get("group_question_message_id")
     try:
@@ -407,7 +468,8 @@ async def handle_escalation_callback(update: Update, context: ContextTypes.DEFAU
 
         storage.set_escalation_draft(esc_id, raw_text=draft, posted_text=draft)
         storage.set_escalation_flow_stage(esc_id, "initial_draft")
-        preview = f"Предлагаю ответить в «{esc['group_title']}»:\n\n{draft}"
+        mention = _format_mention(esc.get("asker_name"), esc.get("asker_username"))
+        preview = f"Предлагаю ответить в «{esc['group_title']}»:\n\n{mention}{draft}"
         await _send_draft_with_buttons(context, esc_id, preview, _initial_draft_keyboard(esc_id))
         return
 
@@ -417,8 +479,14 @@ async def handle_escalation_callback(update: Update, context: ContextTypes.DEFAU
         return
 
     if action == "esc_cancel":
-        if not esc["resolved"] and esc["flow_stage"] == "initial_draft":
+        # И "не подтверждаю" AI-черновика (initial_draft), и "не отправляю" собственного
+        # текста Марины (final_draft) ведут к одному и тому же выбору — предложить другой
+        # вариант или написать самой — и повторяются, пока ответ не будет принят/отправлен.
+        # Раньше final_draft вместо кнопок просто просил написать новый текст без выбора —
+        # цикл "предложить/написать" там не замыкался.
+        if not esc["resolved"] and esc["flow_stage"] in ("initial_draft", "final_draft"):
             storage.set_escalation_flow_stage(esc_id, "reject_choice")
+            storage.clear_escalation_draft(esc_id)
             keyboard = InlineKeyboardMarkup(
                 [[
                     InlineKeyboardButton("🔄 Предложить новый ответ", callback_data=f"esc_retry:{esc_id}"),
@@ -429,11 +497,6 @@ async def handle_escalation_callback(update: Update, context: ContextTypes.DEFAU
                 "Хорошо, не отправляю этот черновик. Предложить другой вариант, или напишешь сама?",
                 reply_markup=keyboard,
             )
-            return
-        if not esc["resolved"] and esc["flow_stage"] == "final_draft":
-            storage.set_escalation_flow_stage(esc_id, "awaiting_own_text")
-            storage.clear_escalation_draft(esc_id)
-            await query.edit_message_text("Хорошо, не отправляю. Пришли новый вариант ответа обычным сообщением.")
             return
         storage.clear_escalation_draft(esc_id)
         await query.edit_message_text("Хорошо, не отправляю. Пришли новую правку — ответом на исходный вопрос.")
@@ -648,22 +711,29 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if await _is_addressed_to_marina(update, context, text):
         if config.OWNER_USER_ID is not None:
             await msg.reply_text(random.choice(_ACK_PHRASES))
+            # Вопрос не всегда лежит в самом тег-сообщении — иногда коллега сначала пишет
+            # вопрос, а к Марине обращается уже следующим, коротким сообщением (см.
+            # _extract_question_context). question_text — то, что реально пойдёт как текст
+            # вопроса; text (сырое тег-сообщение) по-прежнему используем только для
+            # group_question_message_id/reply-threading ниже.
+            question_text = await _extract_question_context(update, context, chat, msg, text)
             asker_name = (user.first_name or user.username or "коллега") if user else "коллега"
+            asker_username = user.username if user else None
             group_title = chat.title or str(chat.id)
             esc_id = storage.add_pending_escalation(
                 chat.id,
                 group_title,
                 asker_name,
-                text,
+                question_text,
                 group_question_message_id=msg.message_id,
                 asker_user_id=user.id if user else None,
-                asker_username=user.username if user else None,
+                asker_username=asker_username,
             )
             try:
-                username_suffix = f" (@{user.username})" if user and user.username else ""
+                mention = _format_mention(asker_name, asker_username)
                 sent = await context.bot.send_message(
                     chat_id=config.OWNER_USER_ID,
-                    text=f"❓ Вопрос из группы «{group_title}» от {asker_name}{username_suffix}:\n\n{text}",
+                    text=f"❓ Вопрос из группы «{group_title}» от {mention.rstrip(', ')}:\n\n{question_text}",
                 )
                 storage.set_escalation_dm_message_id(esc_id, sent.message_id)
                 storage.link_escalation_dm_message(esc_id, sent.message_id)
@@ -671,7 +741,9 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 logger.exception("Не удалось отправить эскалацию владелице (user_id=%s)", config.OWNER_USER_ID)
                 return
             project_key = storage.get_chat_project(chat.id)
-            await _propose_initial_draft(context, esc_id, group_title, asker_name, text, project_key)
+            await _propose_initial_draft(
+                context, esc_id, group_title, asker_name, question_text, project_key, asker_username
+            )
             return
         logger.warning(
             "Обращение к Марине в чате %s, но MARINATWIN_OWNER_USER_ID не настроен — "
