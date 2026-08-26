@@ -502,8 +502,11 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     bound_project = _detect_project_binding(text)
     if bound_project:
         storage.set_chat_project(chat.id, bound_project)
-        label = config.CLICKUP_PROJECTS[bound_project]["label"]
-        await update.message.reply_text(f"Поняла, буду собирать здесь задачи по проекту «{label}» 👍")
+        if bound_project == "unsorted":
+            await update.message.reply_text("Поняла, буду собирать отсюда задачи в папку «Unsorted» 👍")
+        else:
+            label = config.CLICKUP_PROJECTS[bound_project]["label"]
+            await update.message.reply_text(f"Поняла, буду собирать здесь задачи по проекту «{label}» 👍")
         return
 
     if _is_addressed_to_marina(update, context, text):
