@@ -112,6 +112,16 @@ def _connect() -> sqlite3.Connection:
             "draft_raw": "TEXT",
             "draft_posted": "TEXT",
             "flow_stage": "TEXT",
+            # group_question_message_id/asker_user_id/asker_username — message_id вопроса
+            # в группе и данные автора, чтобы финальный ответ ушёл как reply именно на
+            # него и с тегом по нику (см. esc_confirm в bot.py). edited_question — если
+            # вопрос отредактировали, пока шло согласование с владелицей, сюда попадает
+            # новый текст (см. handle_group_message_edited в bot.py) — используется в
+            # следующей доработке (проверка перед финальной отправкой).
+            "group_question_message_id": "INTEGER",
+            "asker_user_id": "INTEGER",
+            "asker_username": "TEXT",
+            "edited_question": "TEXT",
         },
     )
     # Задачи из "смешанных" (непривязанных к проекту) чатов, для которых Claude не смог
@@ -279,13 +289,31 @@ def set_chat_project(chat_id: int, project: str) -> None:
 
 # --- Отложенные вопросы из групп ("эскалация" к владелице в личку) ---
 
-def add_pending_escalation(group_chat_id: int, group_title: str, asker_name: str, question: str) -> int:
+def add_pending_escalation(
+    group_chat_id: int,
+    group_title: str,
+    asker_name: str,
+    question: str,
+    group_question_message_id: int | None = None,
+    asker_user_id: int | None = None,
+    asker_username: str | None = None,
+) -> int:
+    """group_question_message_id — message_id вопроса в группе (нужен, чтобы финальный
+    ответ ушёл как reply именно на него, а не отдельным сообщением — см. esc_confirm в
+    bot.py). asker_user_id/asker_username — чтобы тегнуть автора вопроса по нику в
+    финальном ответе, если ник у него есть."""
     cur = _conn.execute(
         """
-        INSERT INTO pending_escalations (group_chat_id, group_title, asker_name, question, created_at, resolved)
-        VALUES (?, ?, ?, ?, ?, 0)
+        INSERT INTO pending_escalations (
+            group_chat_id, group_title, asker_name, question, created_at, resolved,
+            group_question_message_id, asker_user_id, asker_username
+        )
+        VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
         """,
-        (group_chat_id, group_title, asker_name, question, time.time()),
+        (
+            group_chat_id, group_title, asker_name, question, time.time(),
+            group_question_message_id, asker_user_id, asker_username,
+        ),
     )
     _conn.commit()
     return cur.lastrowid
@@ -314,7 +342,7 @@ def resolve_pending_escalation(escalation_id: int) -> None:
 _ESCALATION_COLUMNS = (
     "id", "group_chat_id", "group_title", "asker_name", "question", "resolved",
     "dm_question_message_id", "last_answer", "last_posted_text", "draft_raw", "draft_posted",
-    "flow_stage",
+    "flow_stage", "group_question_message_id", "asker_user_id", "asker_username", "edited_question",
 )
 
 
