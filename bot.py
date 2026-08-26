@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -292,17 +293,14 @@ async def _propose_initial_draft(
 
 
 async def _finalize_own_answer(context, esc: dict, raw_text: str) -> None:
+    """Марина написала ответ своими словами (после кнопки "✍️ Написать ответ", либо
+    ответив на пересланный вопрос сразу своим текстом). В отличие от AI-черновика, её
+    собственный текст здесь НЕ переформулируем — он и так от её лица, перефразировка
+    только исказила бы то, что она реально хотела сказать. Просто показываем как есть
+    и просим подтверждение перед отправкой (см. esc_confirm)."""
     esc_id = esc["id"]
     group_title = esc["group_title"]
-    asker_name = esc["asker_name"]
-    question = esc["question"]
-
-    await context.bot.send_chat_action(chat_id=config.OWNER_USER_ID, action=ChatAction.TYPING)
-    try:
-        final_text = escalation.rephrase_answer(group_title, asker_name, question, raw_text)
-    except Exception:
-        logger.exception("Не удалось перефразировать ответ для эскалации #%s — использую как есть", esc_id)
-        final_text = raw_text
+    final_text = raw_text
 
     storage.set_escalation_draft(esc_id, raw_text=raw_text, posted_text=final_text)
     storage.set_escalation_flow_stage(esc_id, "final_draft")
@@ -410,8 +408,27 @@ async def handle_escalation_callback(update: Update, context: ContextTypes.DEFAU
         if not draft_posted:
             await query.edit_message_text("Этот черновик уже не актуален — пришли уточнение заново.")
             return
+        # Отвечаем именно на сообщение с вопросом (reply в Telegram) — даже если в
+        # группе с тех пор накопилась куча других сообщений, коллеги сразу видят, на
+        # какой вопрос это ответ. Плюс тегаем автора вопроса по нику, если он есть
+        # (иначе — просто по имени, без кликабельного тега).
+        asker_username = esc.get("asker_username")
+        mention = f"@{asker_username} " if asker_username else (f"{esc['asker_name']}, " if esc.get("asker_name") else "")
+        text_to_send = f"{mention}{draft_posted}"
+        reply_to_message_id = esc.get("group_question_message_id")
         try:
-            await context.bot.send_message(chat_id=esc["group_chat_id"], text=draft_posted)
+            try:
+                await context.bot.send_message(
+                    chat_id=esc["group_chat_id"], text=text_to_send, reply_to_message_id=reply_to_message_id,
+                )
+            except BadRequest:
+                # Исходное сообщение с вопросом не нашлось (могли удалить) — отправляем
+                # обычным сообщением, тег автора всё равно сохраняем.
+                logger.warning(
+                    "Не удалось ответить reply-ом на вопрос (message_id=%s, эскалация #%s) — отправляю без reply",
+                    reply_to_message_id, esc_id,
+                )
+                await context.bot.send_message(chat_id=esc["group_chat_id"], text=text_to_send)
         except Exception:
             logger.exception(
                 "Не удалось отправить уточнение в группу %s (эскалация #%s)", esc["group_chat_id"], esc_id
@@ -567,7 +584,15 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(random.choice(_ACK_PHRASES))
             asker_name = (user.first_name or user.username or "коллега") if user else "коллега"
             group_title = chat.title or str(chat.id)
-            esc_id = storage.add_pending_escalation(chat.id, group_title, asker_name, text)
+            esc_id = storage.add_pending_escalation(
+                chat.id,
+                group_title,
+                asker_name,
+                text,
+                group_question_message_id=update.message.message_id,
+                asker_user_id=user.id if user else None,
+                asker_username=user.username if user else None,
+            )
             try:
                 username_suffix = f" (@{user.username})" if user and user.username else ""
                 sent = await context.bot.send_message(
