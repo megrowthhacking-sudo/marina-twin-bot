@@ -50,7 +50,8 @@ def get_open_tasks(list_id: str) -> list[dict]:
     журнала когда-либо созданных ботом задач (тот не узнаёт о том, что задачу закрыли
     или поменяли напрямую в ClickUp, минуя бота). Возвращает список словарей
     {"id", "name", "priority" (urgent/high/normal/low/None), "date_created" (unix-время
-    в секундах), "url"}, по возрастанию даты создания. Бросает исключение при ошибке
+    в секундах), "due_date" (unix-время в секундах или None, если срок не задан в ClickUp),
+    "url"}, по возрастанию даты создания. Бросает исключение при ошибке
     сети/API — вызывающий код сам решает, как это залогировать и что ответить
     пользователю."""
     if not config.CLICKUP_API_TOKEN:
@@ -74,12 +75,18 @@ def get_open_tasks(list_id: str) -> list[dict]:
                 created = float(t.get("date_created") or 0) / 1000
             except (TypeError, ValueError):
                 created = 0.0
+            raw_due = t.get("due_date")
+            try:
+                due_date = float(raw_due) / 1000 if raw_due else None
+            except (TypeError, ValueError):
+                due_date = None
             tasks.append(
                 {
                     "id": t.get("id"),
                     "name": t.get("name") or "(без названия)",
                     "priority": priority,
                     "date_created": created,
+                    "due_date": due_date,
                     "url": t.get("url"),
                 }
             )
