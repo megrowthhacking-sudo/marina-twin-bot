@@ -661,6 +661,7 @@ async def _resolve_classification_reply(
     classification_id = classification["id"]
     project_key = _detect_project_keyword(reply_text) or "unsorted"
     label = config.CLICKUP_PROJECTS[project_key]["label"]
+    assignee_id = _resolve_assignee_id(classification.get("task_assignee_name"))
 
     task_id = _create_and_log_task(
         classification["chat_id"],
@@ -669,6 +670,7 @@ async def _resolve_classification_reply(
         classification["task_title"],
         classification["task_description"],
         classification["task_priority"],
+        assignee_id,
     )
     storage.resolve_classification(classification_id, project_key)
 
@@ -687,8 +689,15 @@ async def _sweep_stale_classifications(context: ContextTypes.DEFAULT_TYPE) -> No
     cutoff = time.time() - config.CLICKUP_CLASSIFICATION_TIMEOUT_MINUTES * 60
     for c in storage.get_unresolved_classifications_older_than(cutoff):
         label = config.CLICKUP_PROJECTS["unsorted"]["label"]
+        assignee_id = _resolve_assignee_id(c.get("task_assignee_name"))
         task_id = _create_and_log_task(
-            c["chat_id"], c["chat_title"], "unsorted", c["task_title"], c["task_description"], c["task_priority"]
+            c["chat_id"],
+            c["chat_title"],
+            "unsorted",
+            c["task_title"],
+            c["task_description"],
+            c["task_priority"],
+            assignee_id,
         )
         storage.resolve_classification(c["id"], "unsorted")
         if task_id:
@@ -776,7 +785,7 @@ async def _flush_chat_to_clickup(
                 if not title:
                     continue
                 classification_id = storage.add_pending_classification(
-                    chat_id, chat_title, title, t.get("description", ""), t.get("priority")
+                    chat_id, chat_title, title, t.get("description", ""), t.get("priority"), t.get("assignee_name")
                 )
                 await _ask_classification_question(context, chat_id, chat_title, classification_id, title)
         storage.mark_flushed(chat_id)
