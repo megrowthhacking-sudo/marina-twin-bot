@@ -80,6 +80,23 @@ MARINATWIN_TIMEZONE = os.environ.get("MARINATWIN_TIMEZONE", "Europe/Moscow").str
 DAILY_DIGEST_HOUR = int(os.environ.get("DAILY_DIGEST_HOUR", "9"))
 DAILY_DIGEST_MINUTE = int(os.environ.get("DAILY_DIGEST_MINUTE", "0"))
 
+# Карта имён (как они могут прозвучать в переписке, в нижнем регистре) на ClickUp
+# user_id — для автоматического назначения ответственного при создании задачи
+# (см. _resolve_assignee_id в bot.py). Сопоставление регистронезависимое.
+CLICKUP_ASSIGNEE_MAP = {
+    "николай хребет": 113538064,
+    "nikolay hrebet": 113538064,
+    "хребет": 113538064,
+    "николай": 113538064,
+    "ник галт": 113538351,
+    "nick galt": 113538351,
+    "галт": 113538351,
+    "ник": 113538351,
+    "марина копылова": 113538088,
+    "maryna kopylova": 113538088,
+    "марина": 113538088,
+}
+
 # Telegram user_id владелицы (Марины) — только ей пересылаются вопросы из групп,
 # адресованные "Марине" (см. эскалацию в bot.py). Если не задан явно, но задан ровно
 # один MARINATWIN_ALLOWED_USER_IDS — используем его. Иначе эскалация выключена.

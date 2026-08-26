@@ -26,10 +26,18 @@ def _headers() -> dict:
     }
 
 
-def create_task(list_id: str, name: str, description: str = "", priority: str | None = None) -> dict:
+def create_task(
+    list_id: str,
+    name: str,
+    description: str = "",
+    priority: str | None = None,
+    assignees: list[int] | None = None,
+) -> dict:
     """Создаёт задачу в указанном списке ClickUp (list_id — конкретный проектный список,
-    см. config.CLICKUP_LIST_IDS). Бросает исключение при ошибке — вызывающий код (bot.py)
-    сам решает, как это залогировать и не уронить остальную выгрузку."""
+    см. config.CLICKUP_LIST_IDS). assignees — список ClickUp user_id, которым назначить
+    задачу (см. config.CLICKUP_ASSIGNEE_MAP и _resolve_assignee_id в bot.py); опционально.
+    Бросает исключение при ошибке — вызывающий код (bot.py) сам решает, как это залогировать
+    и не уронить остальную выгрузку."""
     if not config.CLICKUP_API_TOKEN:
         raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
 
@@ -37,6 +45,8 @@ def create_task(list_id: str, name: str, description: str = "", priority: str | 
     priority_num = PRIORITY_MAP.get((priority or "").lower())
     if priority_num:
         payload["priority"] = priority_num
+    if assignees:
+        payload["assignees"] = assignees
 
     url = f"{BASE_URL}/list/{list_id}/task"
     resp = requests.post(url, headers=_headers(), json=payload, timeout=20)
