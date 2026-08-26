@@ -235,9 +235,11 @@ def _initial_draft_keyboard(esc_id: int):
     )
 
 
-async def _propose_initial_draft(context, esc_id: int, group_title: str, asker_name: str, question: str) -> None:
+async def _propose_initial_draft(
+    context, esc_id: int, group_title: str, asker_name: str, question: str, project_key: str | None = None
+) -> None:
     try:
-        draft = escalation.draft_initial_answer(group_title, asker_name, question)
+        draft = escalation.draft_initial_answer(group_title, asker_name, question, project_key)
     except Exception:
         logger.exception("Не удалось составить черновик ответа для эскалации #%s", esc_id)
         draft = ""
@@ -501,12 +503,30 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     bound_project = _detect_project_binding(text)
     if bound_project:
+        previous_project = storage.get_chat_project(chat.id)
         storage.set_chat_project(chat.id, bound_project)
         if bound_project == "unsorted":
-            await update.message.reply_text("Поняла, буду собирать отсюда задачи в папку «Unsorted» 👍")
+            if previous_project and previous_project != "unsorted":
+                prev_label = config.CLICKUP_PROJECTS[previous_project]["label"]
+                await update.message.reply_text(
+                    f"Поняла, переключаю этот чат с проекта «{prev_label}» на «Unsorted» — "
+                    f"теперь буду собирать отсюда задачи в папку «Unsorted» 👍"
+                )
+            else:
+                await update.message.reply_text("Поняла, буду собирать отсюда задачи в папку «Unsorted» 👍")
         else:
             label = config.CLICKUP_PROJECTS[bound_project]["label"]
-            await update.message.reply_text(f"Поняла, буду собирать здесь задачи по проекту «{label}» 👍")
+            if previous_project and previous_project != bound_project:
+                prev_label = (
+                    "Unsorted" if previous_project == "unsorted"
+                    else config.CLICKUP_PROJECTS[previous_project]["label"]
+                )
+                await update.message.reply_text(
+                    f"Поняла, переключаю этот чат с проекта «{prev_label}» на «{label}» — "
+                    f"теперь буду собирать здесь задачи по проекту «{label}» 👍"
+                )
+            else:
+                await update.message.reply_text(f"Поняла, буду собирать здесь задачи по проекту «{label}» 👍")
         return
 
     if _is_addressed_to_marina(update, context, text):
@@ -526,7 +546,8 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception:
                 logger.exception("Не удалось отправить эскалацию владелице (user_id=%s)", config.OWNER_USER_ID)
                 return
-            await _propose_initial_draft(context, esc_id, group_title, asker_name, text)
+            project_key = storage.get_chat_project(chat.id)
+            await _propose_initial_draft(context, esc_id, group_title, asker_name, text, project_key)
             return
         logger.warning(
             "Обращение к Марине в чате %s, но MARINATWIN_OWNER_USER_ID не настроен — "
