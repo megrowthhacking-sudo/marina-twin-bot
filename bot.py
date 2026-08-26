@@ -7,6 +7,7 @@ Telegram-бот "Marina Twin" — штатный юрист по праву РФ
 Нужны переменные окружения: TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY (см. .env.example).
 """
 
+import asyncio
 import logging
 import random
 import re
@@ -702,68 +703,84 @@ async def _sweep_stale_classifications(context: ContextTypes.DEFAULT_TYPE) -> No
                 )
 
 
+"""Один и тот же чат может попасть на выгрузку из двух разных мест почти одновременно:
+сразу после нового сообщения (см. handle_group_message) и по расписанию
+(periodic_flush_job, независимый job на том же event loop). Раньше это иногда
+приводило к тому, что оба вызова читали ОДИН и тот же непрочитанный буфер (ещё до
+того, как первый успевал пометить его прочитанным — вызов Claude занимает заметное
+время), и задача извлекалась дважды с чуть разными формулировками — на практике
+наблюдалось как два похожих ClickUp-таска с разницей в несколько секунд и
+дословно совпадающей цитатой источника. Лок на чат сериализует выгрузки одного и
+того же чата: второй вызов дожидается первого и застаёт буфер уже пустым."""
+_chat_flush_locks: dict[int, asyncio.Lock] = {}
+
+def _get_chat_flush_lock(chat_id: int) -> asyncio.Lock:
+    """Возвращает asyncio.Lock для указанного chat_id, создавая при необходимости."""
+    lock = _chat_flush_locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _chat_flush_locks[chat_id] = lock
+    return lock
+
+
 async def _flush_chat_to_clickup(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_title: str, project_key: str | None
 ) -> int:
     """Извлекает задачи из накопленных сообщений одного чата и пушит их в ClickUp.
     Возвращает число созданных задач.
-
     Буфер помечается прочитанным ТОЛЬКО если вызов Claude отработал (успешно или с
     пустым результатом) — если сам вызов извлечения упал (сеть, лимиты, кончился
     баланс на Anthropic API и т.п.), сообщения остаются непрочитанными и попробуем
     ещё раз на следующей выгрузке, а не теряем их молча. А вот если сам ClickUp
     отказал при создании конкретной задачи (см. _push_tasks) — это уже не повод
     держать буфер вечно, тут по-прежнему помечаем прочитанным.
-
     project_key задан → чат закреплён за одним проектом, все задачи туда, без
     классификации. project_key is None → "смешанный" чат без привязки: каждая задача
     классифицируется отдельно (Atlas/Алтын/BestSwift); неоднозначные не падают молча
-    в "Разобрать", а сначала переспрашиваются в чате (см. _ask_classification_question)."""
-    rows = storage.get_unflushed(chat_id)
-    if not rows:
-        return 0
-
-    if project_key:
-        list_id = config.CLICKUP_LIST_IDS.get(project_key)
-        if not list_id:
-            # Проект закреплён, но список для него ещё не настроен — не теряем буфер,
-            # просто ждём (не помечаем flushed, не тратим вызов Claude впустую).
+    в "Разобрать", а сначала переспрашиваются в чате (см. _ask_classification_question).
+    Сериализовано локом на chat_id (см. _get_chat_flush_lock) — защита от гонки между
+    немедленной выгрузкой из handle_group_message и периодической (periodic_flush_job)."""
+    async with _get_chat_flush_lock(chat_id):
+        rows = storage.get_unflushed(chat_id)
+        if not rows:
             return 0
-        try:
-            tasks = task_extractor.extract_tasks(chat_title, rows)
-        except Exception:
-            logger.exception(
-                "Ошибка извлечения задач для чата %s (%s) — оставляю буфер непрочитанным, попробую ещё раз",
-                chat_id, chat_title,
-            )
-            return 0
-        created = _push_tasks(chat_id, chat_title, tasks, lambda _t: project_key)
-    else:
-        try:
-            tasks = task_extractor.extract_tasks_classified(chat_title, rows)
-        except Exception:
-            logger.exception(
-                "Ошибка извлечения/классификации задач для чата %s (%s) — оставляю буфер непрочитанным, попробую ещё раз",
-                chat_id, chat_title,
-            )
-            return 0
-
-        clear_tasks = [t for t in tasks if t.get("project") in ("atlas", "altyn", "bestswift")]
-        ambiguous_tasks = [t for t in tasks if t not in clear_tasks]
-
-        created = _push_tasks(chat_id, chat_title, clear_tasks, lambda t: t.get("project"))
-
-        for t in ambiguous_tasks:
-            title = (t.get("title") or "").strip()
-            if not title:
-                continue
-            classification_id = storage.add_pending_classification(
-                chat_id, chat_title, title, t.get("description", ""), t.get("priority")
-            )
-            await _ask_classification_question(context, chat_id, chat_title, classification_id, title)
-
-    storage.mark_flushed(chat_id)
-    return created
+        if project_key:
+            list_id = config.CLICKUP_LIST_IDS.get(project_key)
+            if not list_id:
+                # Проект закреплён, но список для него ещё не настроен — не теряем буфер,
+                # просто ждём (не помечаем flushed, не тратим вызов Claude впустую).
+                return 0
+            try:
+                tasks = task_extractor.extract_tasks(chat_title, rows)
+            except Exception:
+                logger.exception(
+                    "Ошибка извлечения задач для чата %s (%s) — оставляю буфер непрочитанным, попробую ещё раз",
+                    chat_id, chat_title,
+                )
+                return 0
+            created = _push_tasks(chat_id, chat_title, tasks, lambda _t: project_key)
+        else:
+            try:
+                tasks = task_extractor.extract_tasks_classified(chat_title, rows)
+            except Exception:
+                logger.exception(
+                    "Ошибка извлечения/классификации задач для чата %s (%s) — оставляю буфер непрочитанным, попробую ещё раз",
+                    chat_id, chat_title,
+                )
+                return 0
+            clear_tasks = [t for t in tasks if t.get("project") in ("atlas", "altyn", "bestswift")]
+            ambiguous_tasks = [t for t in tasks if t not in clear_tasks]
+            created = _push_tasks(chat_id, chat_title, clear_tasks, lambda t: t.get("project"))
+            for t in ambiguous_tasks:
+                title = (t.get("title") or "").strip()
+                if not title:
+                    continue
+                classification_id = storage.add_pending_classification(
+                    chat_id, chat_title, title, t.get("description", ""), t.get("priority")
+                )
+                await _ask_classification_question(context, chat_id, chat_title, classification_id, title)
+        storage.mark_flushed(chat_id)
+        return created
 
 
 _URGENT_PRIORITIES = {"urgent", "high"}
