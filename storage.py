@@ -137,6 +137,11 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    # Имя исполнителя, извлечённое из текста задачи (см. _resolve_assignee_id в bot.py) —
+    # нужно сохранить и для неоднозначных (по проекту) задач, чтобы после ответа на
+    # уточняющий вопрос (или по таймауту) назначить исполнителя так же, как это уже
+    # делается для задач с сразу понятным проектом.
+    _ensure_columns(conn, "pending_classifications", {"task_assignee_name": "TEXT"})
     # Все DM-сообщения бота, связанные с одной эскалацией (исходный пересланный вопрос,
     # подтверждение ответа, черновики правок) — чтобы Марина могла сделать reply-правку
     # на ЛЮБОЕ из них, а не только на самое первое сообщение (см.
@@ -424,20 +429,21 @@ def clear_escalation_draft(escalation_id: int) -> None:
 
 _CLASSIFICATION_COLUMNS = (
     "id", "chat_id", "chat_title", "task_title", "task_description", "task_priority",
-    "question_message_id", "created_at", "resolved", "resolved_project",
+    "question_message_id", "created_at", "resolved", "resolved_project", "task_assignee_name",
 )
 
 
 def add_pending_classification(
-    chat_id: int, chat_title: str, task_title: str, task_description: str, task_priority: str | None
+    chat_id: int, chat_title: str, task_title: str, task_description: str, task_priority: str | None,
+    task_assignee_name: str | None = None,
 ) -> int:
     cur = _conn.execute(
         """
         INSERT INTO pending_classifications
-        (chat_id, chat_title, task_title, task_description, task_priority, created_at, resolved)
-        VALUES (?, ?, ?, ?, ?, ?, 0)
+        (chat_id, chat_title, task_title, task_description, task_priority, task_assignee_name, created_at, resolved)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
         """,
-        (chat_id, chat_title, task_title, task_description, task_priority, time.time()),
+        (chat_id, chat_title, task_title, task_description, task_priority, task_assignee_name, time.time()),
     )
     _conn.commit()
     return cur.lastrowid
