@@ -238,6 +238,24 @@ def get_unflushed(chat_id: int) -> list[dict]:
     return [{"user_name": r[0], "text": r[1], "ts": r[2]} for r in rows]
 
 
+def get_last_group_message(chat_id: int, max_age_seconds: float = 600) -> dict | None:
+    """Последнее сообщение в чате (независимо от того, выгружено ли оно уже в ClickUp)
+    не старше max_age_seconds. Используется, когда к Марине обратились отдельным
+    коротким сообщением-тегом без собственного текста вопроса — тогда за вопросом
+    заглядываем в предыдущее сообщение чата (см. _extract_question_context в bot.py).
+    Обычный get_unflushed тут не подходит: сообщение почти всегда уже помечено
+    flushed к этому моменту (немедленная выгрузка в ClickUp срабатывает сразу же
+    после каждого непомеченного сообщения, ещё до того как придёт тег)."""
+    cutoff = time.time() - max_age_seconds
+    row = _conn.execute(
+        "SELECT user_name, text, ts FROM group_messages WHERE chat_id = ? AND ts >= ? ORDER BY ts DESC LIMIT 1",
+        (chat_id, cutoff),
+    ).fetchone()
+    if not row:
+        return None
+    return {"user_name": row[0], "text": row[1], "ts": row[2]}
+
+
 def mark_flushed(chat_id: int) -> None:
     _conn.execute("UPDATE group_messages SET flushed = 1 WHERE chat_id = ? AND flushed = 0", (chat_id,))
     _conn.commit()
