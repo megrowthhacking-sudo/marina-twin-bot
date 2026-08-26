@@ -113,7 +113,7 @@ def _detect_project_keyword(text: str) -> str | None:
 
 # --- Обращение к "Марине" в группе (упоминание, reply, имя) ---
 
-_MARINA_NAME_RE = re.compile(r"\bмарин(а|ы|е|у|ой|ою)\b|\bmarina\b", re.IGNORECASE)
+_MARINA_NAME_RE = re.compile(r"\bмарин(а|ы|е|у|ой|ою)\b|\bmar[iy]na\b|\bmary\b", re.IGNORECASE)
 
 _ACK_PHRASES = [
     "Секунду, уточню и вернусь 🙂",
@@ -121,10 +121,42 @@ _ACK_PHRASES = [
     "Сейчас, только уточню детали — и сразу вернусь с ответом.",
 ]
 
+# Кэш @username живой владелицы (для распознавания обращений вида "@её_ник ..." в
+# группе — отдельно от @username самого бота). None до первой попытки резолва;
+# _owner_username_resolved отличает "ещё не пробовали" от "пробовали, не вышло" —
+# чтобы не долбить Telegram API на каждое сообщение при ошибке.
+_owner_username_cache: str | None = None
+_owner_username_resolved = False
 
-def _is_addressed_to_marina(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+
+async def _get_owner_username(context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    """Резолвит и кэширует @username живой Марины (config.OWNER_USER_ID) через Telegram
+    API — один раз за время жизни процесса (username меняется крайне редко). Нужен,
+    чтобы обращение в группе по её личному тегу (не тегу бота) тоже ловилось как
+    вопрос к ней. При ошибке — тихо None, не роняем обработку сообщения."""
+    global _owner_username_cache, _owner_username_resolved
+    if _owner_username_resolved:
+        return _owner_username_cache
+    _owner_username_resolved = True
+    if config.OWNER_USER_ID is None:
+        return None
+    try:
+        chat = await context.bot.get_chat(config.OWNER_USER_ID)
+        _owner_username_cache = chat.username
+    except Exception:
+        logger.exception(
+            "Не удалось получить username владелицы (user_id=%s) для распознавания обращений",
+            config.OWNER_USER_ID,
+        )
+    return _owner_username_cache
+
+
+async def _is_addressed_to_marina(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
     bot_username = context.bot.username
     if bot_username and f"@{bot_username.lower()}" in text.lower():
+        return True
+    owner_username = await _get_owner_username(context)
+    if owner_username and f"@{owner_username.lower()}" in text.lower():
         return True
     reply_to = update.message.reply_to_message
     if reply_to and reply_to.from_user and reply_to.from_user.id == context.bot.id:
@@ -530,7 +562,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 await update.message.reply_text(f"Поняла, буду собирать здесь задачи по проекту «{label}» 👍")
         return
 
-    if _is_addressed_to_marina(update, context, text):
+    if await _is_addressed_to_marina(update, context, text):
         if config.OWNER_USER_ID is not None:
             await update.message.reply_text(random.choice(_ACK_PHRASES))
             asker_name = (user.first_name or user.username or "коллега") if user else "коллега"
