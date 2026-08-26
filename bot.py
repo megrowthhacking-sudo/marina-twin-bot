@@ -588,6 +588,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if esc:
                 await _handle_owner_escalation_message(update, context, esc, text)
                 return
+        # Обычное сообщение владелицы в личке (не reply на эскалацию) — помимо ответа
+        # Twin ниже, заодно проверяем, не задача ли это, и если да — заносим в ClickUp
+        # (см. _log_owner_dm_tasks). Только для самой владелицы: у остальных пользователей
+        # в личке — просто разговор с Twin, их сообщения в ClickUp не идут.
+        await _log_owner_dm_tasks(user, text)
 
     state = storage.get_chat(chat_id)
     history: list = state["history"]
@@ -824,6 +829,32 @@ def _push_tasks(chat_id: int, chat_title: str, tasks: list[dict], project_for: c
         ):
             created += 1
     return created
+
+
+async def _log_owner_dm_tasks(user, text: str) -> None:
+    """Марина написала что-то похожее на задачу прямо в личке боту (не в группе) — заносим
+    в ClickUp так же, как задачи из групповых чатов: с классификацией по проекту
+    (Atlas/Алтын/BestSwift), а если по тексту не понятно, к какому проекту это относится —
+    в "Unsorted" (личка не привязана к одному проекту, а спрашивать классификацию прямо в
+    разговоре с Twin неуместно — это отдельная папка на разбор, как и для групп). Обычный
+    разговорный обмен репликами task_extractor и так отфильтровывает (см.
+    task_extractor._TASK_RULES — не каждое сообщение порождает задачу). Не должно мешать
+    основному ответу Twin — любая ошибка тут только логируется, наружу не всплывает."""
+    if not config.CLICKUP_ENABLED:
+        return
+    chat_title = "Личка Марины"
+    try:
+        tasks = task_extractor.extract_tasks_classified(
+            chat_title, [{"user_name": user.first_name or "Марина", "text": text, "ts": time.time()}]
+        )
+    except Exception:
+        logger.exception("Ошибка извлечения задач из личного сообщения владелицы")
+        return
+    if not tasks:
+        return
+    created = _push_tasks(user.id, chat_title, tasks, lambda t: t.get("project") or "unsorted")
+    if created:
+        logger.info("Из личного сообщения владелицы занесено задач в ClickUp: %s", created)
 
 
 async def _ask_classification_question(
