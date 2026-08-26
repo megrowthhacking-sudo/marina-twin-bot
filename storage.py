@@ -448,6 +448,46 @@ def clear_escalation_draft(escalation_id: int) -> None:
     _conn.commit()
 
 
+def get_escalation_by_group_message_id(chat_id: int, message_id: int) -> dict | None:
+    """Находит эскалацию по (chat_id, message_id) исходного вопроса в группе — нужно,
+    чтобы понять, к какой эскалации относится отредактированное сообщение
+    (см. _handle_group_message_edited в bot.py)."""
+    row = _conn.execute(
+        "SELECT id FROM pending_escalations WHERE group_chat_id = ? AND group_question_message_id = ?",
+        (chat_id, message_id),
+    ).fetchone()
+    return get_escalation(row[0]) if row else None
+
+
+def set_escalation_edited_question(escalation_id: int, text: str) -> None:
+    """Запоминает новый текст вопроса, если его отредактировали в группе, пока шло
+    согласование ответа с владелицей (см. _handle_group_message_edited в bot.py) —
+    используется в esc_confirm, чтобы предупредить владелицу перед отправкой."""
+    _conn.execute(
+        "UPDATE pending_escalations SET edited_question = ? WHERE id = ?",
+        (text, escalation_id),
+    )
+    _conn.commit()
+
+
+def clear_escalation_edited_question(escalation_id: int) -> None:
+    _conn.execute(
+        "UPDATE pending_escalations SET edited_question = NULL WHERE id = ?",
+        (escalation_id,),
+    )
+    _conn.commit()
+
+
+def update_escalation_question(escalation_id: int, question: str) -> None:
+    """Заменяет текст вопроса эскалации новым (после esc_edited_rewrite) — черновик
+    и подтверждение дальше строятся уже вокруг обновлённого вопроса."""
+    _conn.execute(
+        "UPDATE pending_escalations SET question = ? WHERE id = ?",
+        (question, escalation_id),
+    )
+    _conn.commit()
+
+
 # --- Уточнение проекта для неоднозначных задач в "смешанных" чатах ---
 
 _CLASSIFICATION_COLUMNS = (

@@ -332,6 +332,43 @@ async def _handle_owner_escalation_message(update, context, esc: dict, text: str
     await _propose_escalation_correction(update, context, esc, text)
 
 
+async def _send_confirmed_answer(context, query, esc: dict, draft_raw: str, draft_posted: str) -> None:
+    """Фактическая отправка подтверждённого ответа в группу — вынесено из esc_confirm
+    отдельной функцией, чтобы esc_confirm_anyway мог переиспользовать ту же логику."""
+    esc_id = esc["id"]
+    asker_username = esc.get("asker_username")
+    mention = f"@{asker_username} " if asker_username else (f"{esc['asker_name']}, " if esc.get("asker_name") else "")
+    text_to_send = f"{mention}{draft_posted}"
+    reply_to_message_id = esc.get("group_question_message_id")
+    try:
+        try:
+            await context.bot.send_message(
+                chat_id=esc["group_chat_id"], text=text_to_send, reply_to_message_id=reply_to_message_id,
+            )
+        except BadRequest:
+            logger.warning(
+                "Не удалось ответить reply-ом на вопрос (message_id=%s, эскалация #%s) — отправляю без reply",
+                reply_to_message_id, esc_id,
+            )
+            await context.bot.send_message(chat_id=esc["group_chat_id"], text=text_to_send)
+    except Exception:
+        logger.exception(
+            "Не удалось отправить уточнение в группу %s (эскалация #%s)", esc["group_chat_id"], esc_id
+        )
+        await query.edit_message_text(
+            f"Не смогла отправить в «{esc['group_title']}» (возможно, меня там больше нет) — "
+            f"перешли, пожалуйста, вручную:\n\n{draft_posted}"
+        )
+        return
+    was_resolved = esc["resolved"]
+    storage.update_escalation_after_answer(esc_id, raw_answer=draft_raw, posted_text=draft_posted)
+    storage.clear_escalation_draft(esc_id)
+    if was_resolved:
+        await query.edit_message_text(f"Готово, отправила уточнение в «{esc['group_title']}» 👍")
+    else:
+        await query.edit_message_text(f"Готово, ответила в «{esc['group_title']}» 👍")
+
+
 async def handle_escalation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает нажатие кнопки "Отправить"/"Не отправлять" под черновиком правки
     (см. _propose_escalation_correction)."""
@@ -408,44 +445,45 @@ async def handle_escalation_callback(update: Update, context: ContextTypes.DEFAU
         if not draft_posted:
             await query.edit_message_text("Этот черновик уже не актуален — пришли уточнение заново.")
             return
-        # Отвечаем именно на сообщение с вопросом (reply в Telegram) — даже если в
-        # группе с тех пор накопилась куча других сообщений, коллеги сразу видят, на
-        # какой вопрос это ответ. Плюс тегаем автора вопроса по нику, если он есть
-        # (иначе — просто по имени, без кликабельного тега).
-        asker_username = esc.get("asker_username")
-        mention = f"@{asker_username} " if asker_username else (f"{esc['asker_name']}, " if esc.get("asker_name") else "")
-        text_to_send = f"{mention}{draft_posted}"
-        reply_to_message_id = esc.get("group_question_message_id")
-        try:
-            try:
-                await context.bot.send_message(
-                    chat_id=esc["group_chat_id"], text=text_to_send, reply_to_message_id=reply_to_message_id,
-                )
-            except BadRequest:
-                # Исходное сообщение с вопросом не нашлось (могли удалить) — отправляем
-                # обычным сообщением, тег автора всё равно сохраняем.
-                logger.warning(
-                    "Не удалось ответить reply-ом на вопрос (message_id=%s, эскалация #%s) — отправляю без reply",
-                    reply_to_message_id, esc_id,
-                )
-                await context.bot.send_message(chat_id=esc["group_chat_id"], text=text_to_send)
-        except Exception:
-            logger.exception(
-                "Не удалось отправить уточнение в группу %s (эскалация #%s)", esc["group_chat_id"], esc_id
+        edited_question = esc.get("edited_question")
+        if edited_question and edited_question != esc["question"]:
+            keyboard = InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton("📤 Всё равно отправляю", callback_data=f"esc_confirm_anyway:{esc_id}"),
+                    InlineKeyboardButton("✍️ Напишу новый ответ", callback_data=f"esc_edited_rewrite:{esc_id}"),
+                ]]
             )
             await query.edit_message_text(
-                f"Не смогла отправить в «{esc['group_title']}» (возможно, меня там больше нет) — "
-                f"перешли, пожалуйста, вручную:\n\n{draft_posted}"
+                f"Стоп — пока согласовывали ответ, вопрос в «{esc['group_title']}» успели отредактировать.\n\n"
+                f"Было: {esc['question']}\n\n"
+                f"Стало: {edited_question}\n\n"
+                f"Подготовленный ответ:\n{draft_posted}\n\n"
+                f"Отправить его всё равно, или лучше написать новый под изменённый вопрос?",
+                reply_markup=keyboard,
             )
             return
-
-        was_resolved = esc["resolved"]
-        storage.update_escalation_after_answer(esc_id, raw_answer=draft_raw, posted_text=draft_posted)
+        await _send_confirmed_answer(context, query, esc, draft_raw, draft_posted)
+        return
+    if action == "esc_confirm_anyway":
+        draft_posted = esc.get("draft_posted")
+        draft_raw = esc.get("draft_raw")
+        if not draft_posted:
+            await query.edit_message_text("Этот черновик уже не актуален — пришли уточнение заново.")
+            return
+        storage.clear_escalation_edited_question(esc_id)
+        await _send_confirmed_answer(context, query, esc, draft_raw, draft_posted)
+        return
+    if action == "esc_edited_rewrite":
+        new_question = esc.get("edited_question") or esc["question"]
+        storage.update_escalation_question(esc_id, new_question)
+        storage.clear_escalation_edited_question(esc_id)
         storage.clear_escalation_draft(esc_id)
-        if was_resolved:
-            await query.edit_message_text(f"Готово, отправила уточнение в «{esc['group_title']}» 👍")
-        else:
-            await query.edit_message_text(f"Готово, ответила в «{esc['group_title']}» 👍")
+        storage.set_escalation_flow_stage(esc_id, "awaiting_own_text")
+        await query.edit_message_text(
+            f"Хорошо — вопрос теперь звучит так:\n\n{new_question}\n\n"
+            f"Напиши, пожалуйста, новый ответ обычным сообщением."
+        )
+        return
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -524,27 +562,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(chunk)
 
 
+async def _handle_group_message_edited(chat, msg, text: str) -> None:
+    """Пользователь отредактировал своё сообщение в группе. Проверяем, не относится ли
+    отредактированное сообщение к вопросу, который сейчас в процессе эскалации — если да,
+    запоминаем новый текст, чтобы esc_confirm предупредил владелицу перед отправкой
+    (см. handle_escalation_callback). Иначе игнорируем. Раньше правки сообщений доходили
+    до этого же MessageHandler'а (filters.TEXT матчит и edited_message) и падали
+    необработанным AttributeError на update.message.text, т.к. update.message для
+    edited-апдейта всегда None (правильное поле — update.effective_message)."""
+    esc = storage.get_escalation_by_group_message_id(chat.id, msg.message_id)
+    if not esc:
+        return
+    if text == esc["question"]:
+        storage.clear_escalation_edited_question(esc["id"])
+        return
+    storage.set_escalation_edited_question(esc["id"], text)
+    logger.info(
+        "Вопрос эскалации #%s отредактирован в группе %s — запомнила новый текст", esc["id"], chat.id
+    )
+
+
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """В групповых чатах Marina Twin по умолчанию молча слушает и копит переписку —
-    не отвечает, не участвует в разговоре. Два исключения:
+    не отвечает, не участвует в разговоре. Три исключения:
     (1) сообщение закрепляет чат за проектом ("эта группа про задачи Altyn") —
-        отвечает подтверждением;
+    отвечает подтверждением;
     (2) к ней явно обращаются (@упоминание, reply на её сообщение, имя "Марина") —
-        отвечает "сейчас вернусь" и пересылает вопрос владелице в личку (см. handle_message).
+    отвечает "сейчас вернусь" и пересылает вопрос владелице в личку (см. handle_message);
+    (3) кто-то отредактировал уже написанное сообщение — см. _handle_group_message_edited.
     Иначе сообщение просто уходит в буфер — задачи из него достаются командой
     /tasksatlas /tasksaltyn /tasksbs /tasksmisc, либо автоматически по расписанию
     (см. periodic_flush_job) для уже привязанных к проекту чатов, либо (для чатов без
     привязки) классифицируются по проекту индивидуально при автовыгрузке."""
     chat = update.effective_chat
     user = update.effective_user
-    text = update.message.text or ""
+    msg = update.effective_message
+    if msg is None:
+        return
+    text = msg.text or ""
     if not text.strip():
+        return
+
+    if update.edited_message is not None:
+        await _handle_group_message_edited(chat, msg, text)
         return
 
     # Ответ на уточняющий вопрос "Atlas, Altyn или BestSwift?" (см.
     # _ask_classification_question) — проверяем в первую очередь, это отдельный поток
     # от привязки чата и обращения к "Марине" ниже.
-    reply_to = update.message.reply_to_message
+    reply_to = msg.reply_to_message
     if reply_to:
         classification = storage.get_classification_by_question_message_id(chat.id, reply_to.message_id)
         if classification:
@@ -558,12 +624,12 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if bound_project == "unsorted":
             if previous_project and previous_project != "unsorted":
                 prev_label = config.CLICKUP_PROJECTS[previous_project]["label"]
-                await update.message.reply_text(
+                await msg.reply_text(
                     f"Поняла, переключаю этот чат с проекта «{prev_label}» на «Unsorted» — "
                     f"теперь буду собирать отсюда задачи в папку «Unsorted» 👍"
                 )
             else:
-                await update.message.reply_text("Поняла, буду собирать отсюда задачи в папку «Unsorted» 👍")
+                await msg.reply_text("Поняла, буду собирать отсюда задачи в папку «Unsorted» 👍")
         else:
             label = config.CLICKUP_PROJECTS[bound_project]["label"]
             if previous_project and previous_project != bound_project:
@@ -571,17 +637,17 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     "Unsorted" if previous_project == "unsorted"
                     else config.CLICKUP_PROJECTS[previous_project]["label"]
                 )
-                await update.message.reply_text(
+                await msg.reply_text(
                     f"Поняла, переключаю этот чат с проекта «{prev_label}» на «{label}» — "
                     f"теперь буду собирать здесь задачи по проекту «{label}» 👍"
                 )
             else:
-                await update.message.reply_text(f"Поняла, буду собирать здесь задачи по проекту «{label}» 👍")
+                await msg.reply_text(f"Поняла, буду собирать здесь задачи по проекту «{label}» 👍")
         return
 
     if await _is_addressed_to_marina(update, context, text):
         if config.OWNER_USER_ID is not None:
-            await update.message.reply_text(random.choice(_ACK_PHRASES))
+            await msg.reply_text(random.choice(_ACK_PHRASES))
             asker_name = (user.first_name or user.username or "коллега") if user else "коллега"
             group_title = chat.title or str(chat.id)
             esc_id = storage.add_pending_escalation(
@@ -589,7 +655,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 group_title,
                 asker_name,
                 text,
-                group_question_message_id=update.message.message_id,
+                group_question_message_id=msg.message_id,
                 asker_user_id=user.id if user else None,
                 asker_username=user.username if user else None,
             )
@@ -623,6 +689,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if config.CLICKUP_ENABLED:
         project_key = storage.get_chat_project(chat.id)
         await _flush_chat_to_clickup(context, chat.id, chat.title or str(chat.id), project_key)
+
 
 
 def _resolve_assignee_id(name: str | None) -> int | None:
@@ -1073,7 +1140,12 @@ def build_application() -> Application:
         if project["command"]:
             app.add_handler(CommandHandler(project["command"], _make_tasks_command_handler(project_key)))
     # Кнопки "Отправить"/"Не отправлять" под черновиком правки к эскалации.
-    app.add_handler(CallbackQueryHandler(handle_escalation_callback, pattern=r"^esc_(confirm|cancel|retry|own):"))
+    app.add_handler(
+        CallbackQueryHandler(
+            handle_escalation_callback,
+            pattern=r"^esc_(confirm_anyway|edited_rewrite|confirm|cancel|retry|own):",
+        )
+    )
     # Личка — обычный разговор с персоной Marina Twin.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     # Группы — тихий сбор переписки, без ответов.
