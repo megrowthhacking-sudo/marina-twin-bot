@@ -543,18 +543,41 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await _flush_chat_to_clickup(context, chat.id, chat.title or str(chat.id), project_key)
 
 
+def _resolve_assignee_id(name: str | None) -> int | None:
+    """Пытается сопоставить имя ответственного (как его назвал Claude в task_extractor.py,
+    поле assignee_name) с ClickUp user_id по config.CLICKUP_ASSIGNEE_MAP. Осознанно строгое
+    сравнение (без нечётких совпадений) — лучше не проставить Assignee, чем назначить не
+    тому человеку. Пусто/нет совпадения — None, вызывающий код просто не передаёт assignees."""
+    if not name:
+        return None
+    return config.CLICKUP_ASSIGNEE_MAP.get(name.strip().lower())
+
+
 def _create_and_log_task(
-    chat_id: int, chat_title: str, project_key: str, title: str, description: str, priority
+    chat_id: int,
+    chat_title: str,
+    project_key: str,
+    title: str,
+    description: str,
+    priority,
+    assignee_id: int | None = None,
 ) -> str | None:
     """Создаёт одну задачу в ClickUp-списке project_key и логирует её в pushed_tasks
     (нужно и для отладки, и для отчёта по /tasksX — см. _send_project_report).
-    Возвращает id созданной задачи в ClickUp, либо None при неудаче (список не
-    настроен или ClickUp отказал)."""
+    assignee_id — ClickUp user_id ответственного, если удалось сопоставить (см.
+    _resolve_assignee_id), иначе None. Возвращает id созданной задачи в ClickUp, либо
+    None при неудаче (список не настроен или ClickUp отказал)."""
     list_id = config.CLICKUP_LIST_IDS.get(project_key)
     if not list_id:
         return None
     try:
-        result = clickup_client.create_task(list_id, name=title, description=description or "", priority=priority)
+        result = clickup_client.create_task(
+            list_id,
+            name=title,
+            description=description or "",
+            priority=priority,
+            assignees=[assignee_id] if assignee_id else None,
+        )
         task_id = str(result.get("id", ""))
         storage.log_pushed_task(chat_id, chat_title, task_id, title, project_key)
         return task_id
@@ -574,7 +597,10 @@ def _push_tasks(chat_id: int, chat_title: str, tasks: list[dict], project_for: c
         project_key = project_for(t)
         if not project_key:
             continue
-        if _create_and_log_task(chat_id, chat_title, project_key, title, t.get("description", ""), t.get("priority")):
+        assignee_id = _resolve_assignee_id(t.get("assignee_name"))
+        if _create_and_log_task(
+            chat_id, chat_title, project_key, title, t.get("description", ""), t.get("priority"), assignee_id
+        ):
             created += 1
     return created
 
