@@ -448,6 +448,49 @@ def clear_escalation_draft(escalation_id: int) -> None:
     _conn.commit()
 
 
+def get_escalation_by_group_message_id(group_chat_id: int, message_id: int) -> dict | None:
+    """Ищет ещё неотвеченную (resolved=0) эскалацию по паре (чат, message_id вопроса в
+    группе) — так ловим редактирование исходного вопроса, пока Марина ещё согласовывает
+    ответ с владелицей (см. _handle_group_message_edited в bot.py). Резолвленные
+    эскалации не ищем — если вопрос отредактировали уже после ответа, это отдельная
+    история, не про "не отправить мимо изменившегося вопроса"."""
+    row = _conn.execute(
+        """
+        SELECT id FROM pending_escalations
+        WHERE group_chat_id = ? AND group_question_message_id = ? AND resolved = 0
+        """,
+        (group_chat_id, message_id),
+    ).fetchone()
+    return get_escalation(row[0]) if row else None
+
+
+def set_escalation_edited_question(escalation_id: int, edited_question: str) -> None:
+    _conn.execute(
+        "UPDATE pending_escalations SET edited_question = ? WHERE id = ?",
+        (edited_question, escalation_id),
+    )
+    _conn.commit()
+
+
+def clear_escalation_edited_question(escalation_id: int) -> None:
+    _conn.execute(
+        "UPDATE pending_escalations SET edited_question = NULL WHERE id = ?",
+        (escalation_id,),
+    )
+    _conn.commit()
+
+
+def update_escalation_question(escalation_id: int, new_question: str) -> None:
+    """Заменяет сохранённый текст вопроса на отредактированный — вызывается, когда
+    владелица решает написать новый ответ под изменённый вопрос (см. esc_edited_rewrite
+    в bot.py)."""
+    _conn.execute(
+        "UPDATE pending_escalations SET question = ? WHERE id = ?",
+        (new_question, escalation_id),
+    )
+    _conn.commit()
+
+
 # --- Уточнение проекта для неоднозначных задач в "смешанных" чатах ---
 
 _CLASSIFICATION_COLUMNS = (
