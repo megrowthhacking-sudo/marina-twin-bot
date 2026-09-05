@@ -1295,7 +1295,11 @@ def build_application() -> Application:
 
 def main() -> None:
     # claude_client уже при импорте выше загрузил базу знаний (см. kb.load_core внутри него)
-    logger.info("База загружена, запускаю бота (модель: %s)", config.MODEL_NAME)
+    logger.info(
+        "База загружена, запускаю бота (модель: %s, лёгкая модель: %s)",
+        config.MODEL_NAME,
+        config.LIGHT_MODEL_NAME,
+    )
     app = build_application()
     app.run_polling()
 

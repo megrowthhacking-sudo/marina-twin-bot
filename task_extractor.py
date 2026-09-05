@@ -81,7 +81,7 @@ def _call_extractor(system_prompt: str, chat_title: str, messages: list[dict]) -
     user_content = f"Групповой чат: «{chat_title}»\n\nПереписка:\n{transcript}"
 
     response = client.messages.create(
-        model=config.MODEL_NAME,
+        model=config.LIGHT_MODEL_NAME,
         max_tokens=2048,
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],

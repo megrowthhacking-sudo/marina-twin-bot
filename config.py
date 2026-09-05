@@ -6,6 +6,11 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 MODEL_NAME = os.environ.get("MARINATWIN_MODEL", "claude-sonnet-5")
 MAX_OUTPUT_TOKENS = int(os.environ.get("MARINATWIN_MAX_TOKENS", "4096"))
 
+# "Лёгкая" модель для фоновых/технических вызовов без базы знаний и без голоса
+# Марины (разбор чата в JSON-задачи, пересказ уже готового ответа) — там, где
+# не нужна полная Sonnet-модель. В ~2 раза дешевле по input и output токенам.
+LIGHT_MODEL_NAME = os.environ.get("MARINATWIN_LIGHT_MODEL", "claude-haiku-4-5")
+
 # Через запятую: telegram user_id сотрудников, которым разрешено писать боту.
 # Пусто = доступ разрешён всем (годится только для локального теста!).
 _allowed_raw = os.environ.get("MARINATWIN_ALLOWED_USER_IDS", "").strip()

@@ -38,7 +38,7 @@ def rephrase_answer(group_title: str, asker_name: str, question: str, raw_answer
         f"Черновой ответ Марины: {raw_answer}"
     )
     response = client.messages.create(
-        model=config.MODEL_NAME,
+        model=config.LIGHT_MODEL_NAME,
         max_tokens=1024,
         system=_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_content}],
@@ -124,7 +124,7 @@ def rephrase_correction(group_title: str, asker_name: str, question: str, previo
         f"Новая правка Марины: {raw_correction}"
     )
     response = client.messages.create(
-        model=config.MODEL_NAME,
+        model=config.LIGHT_MODEL_NAME,
         max_tokens=1024,
         system=_CORRECTION_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_content}],
