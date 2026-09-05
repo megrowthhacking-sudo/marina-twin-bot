@@ -73,7 +73,10 @@ def _split_for_telegram(text: str) -> list[str]:
 
 def _update_active_countries(active: list[str], mentioned: set[str], russia_only: bool) -> list[str]:
     if russia_only:
-        return []
+        # Разговор явно "вернулся" к России — сбрасываем остальные страны, но RUSSIA
+        # теперь сам по себе подключаемый модуль (не часть core), так что явно
+        # включаем именно его, а не пустой список.
+        return ["RUSSIA"]
     if not mentioned:
         return active
     # Новые упоминания — в начало (приоритет), без дублей, обрезаем по лимиту.

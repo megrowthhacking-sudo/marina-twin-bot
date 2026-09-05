@@ -22,7 +22,6 @@ KB_DIR = Path(__file__).parent / "kb"
 # одним cache_control breakpoint-ом.
 CORE_FILES = [
     "MarinaTwin_00_SYSTEM_PROMPT.md",
-    "MarinaTwin_KB_RU_LAW.md",
     "MarinaTwin_KB_SKILLS.md",
     "MarinaTwin_KB_LAW_EAEU.md",
     "MarinaTwin_OPS_ALTYN_ACCOUNTS_GATEWAYS.md",
@@ -32,7 +31,18 @@ CORE_FILES = [
 
 # code страны -> (человекочитаемое имя, имя файла, ключевые слова/подстроки для распознавания
 # в тексте сообщения; ищутся регистронезависимо, как подстроки в словах).
+#
+# RUSSIA — раньше был безусловно частью CORE_FILES (932 КБ, ~64% всего объёма core) —
+# теперь, как и остальные страны, подключается только при обнаружении в тексте одного
+# из триггеров. Кроме явных "россия"/"рф" в список специально добавлены "алтын"/"рнко" —
+# это RF-юрисдикция компании (юрлицо + партнёрский банк), и вопросы про неё часто не
+# называют страну напрямую, только имя проекта/сущности.
 COUNTRY_MODULES = {
+    "RUSSIA": (
+        "Россия",
+        "MarinaTwin_KB_RU_LAW.md",
+        ["росси", " рф ", "рф,", "рф.", "российск", "алтын", "рнко"],
+    ),
     "BELARUS": (
         "Беларусь",
         "MarinaTwin_KB_LAW_BELARUS.md",
@@ -135,5 +145,7 @@ def detect_countries(text: str) -> set[str]:
 def mentions_russia_only(text: str) -> bool:
     lowered = f" {text.lower()} "
     has_russia = any(kw in lowered for kw in RUSSIA_RESET_KEYWORDS)
-    has_other = bool(detect_countries(text))
+    # RUSSIA теперь тоже входит в detect_countries() (см. COUNTRY_MODULES) — не считать
+    # её "другой страной" сама против себя же.
+    has_other = bool(detect_countries(text) - {"RUSSIA"})
     return has_russia and not has_other
