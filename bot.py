@@ -580,6 +580,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "пересланное сообщение."
             )
             return
+        # Если владелица нажала "✏️ Изменить" под черновиком встречи (см.
+        # handle_calendar_callback) — следующее её сообщение (даже не reply) нужно
+        # перехватить как исправленный текст встречи, а не как обычный разговор с Twin
+        # или лог задач/встреч ниже. Проверяется раньше "pending = get_oldest_pending_
+        # escalation()", чтобы правка встречи не была случайно принята за ответ на
+        # старый висящий вопрос эскалации.
+        if config.GOOGLE_CALENDAR_ENABLED:
+            awaiting_meeting = storage.get_meeting_awaiting_edit(user.id)
+            if awaiting_meeting:
+                await _apply_meeting_edit(context, user, awaiting_meeting, text)
+                return
         pending = storage.get_oldest_pending_escalation()
         if pending:
             esc = storage.get_escalation(pending[0])
@@ -878,23 +889,37 @@ def _format_meeting_time(iso_str: str) -> str:
 
 def _meeting_confirm_keyboard(meeting_id: int):
     return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("✅ Добавить", callback_data=f"cal_confirm:{meeting_id}"),
-            InlineKeyboardButton("❌ Не добавлять", callback_data=f"cal_cancel:{meeting_id}"),
-        ]]
+        [
+            [InlineKeyboardButton("✏️ Изменить", callback_data=f"cal_edit:{meeting_id}")],
+            [
+                InlineKeyboardButton("❌ Отменить", callback_data=f"cal_cancel:{meeting_id}"),
+                InlineKeyboardButton("✅ Применить", callback_data=f"cal_confirm:{meeting_id}"),
+            ],
+        ]
     )
+
+
+def _render_meeting_preview(title: str, start_iso: str, end_iso: str, location: str, *, editing: bool = False) -> str:
+    """Общий текст превью черновика встречи — используется и при первом предложении
+    (см. _propose_meeting_draft), и после правки по кнопке "✏️ Изменить" (см.
+    _apply_meeting_edit), чтобы формулировка не расходилась между двумя местами."""
+    start_human = _format_meeting_time(start_iso)
+    end_human = _format_meeting_time(end_iso)
+    location_line = f"\n📍 {location}" if location else ""
+    heading = "📅 Обновила черновик встречи:" if editing else "📅 Похоже, ты хочешь поставить встречу:"
+    return f"{heading}\n\n«{title}»\n{start_human} – {end_human}{location_line}\n\nПрименить?"
 
 
 async def _propose_meeting_draft(context: ContextTypes.DEFAULT_TYPE, user, text: str) -> None:
     """Если сообщение владелицы в личке похоже на просьбу поставить встречу — извлекает
     название/время (meeting_extractor.extract_meeting, лёгкая модель без базы знаний) и
-    присылает черновик с кнопками подтверждения. Событие в Google Calendar реально
-    создаётся только по нажатию "✅ Добавить" (см. handle_calendar_callback) —
-    calendar_client.create_event отсюда не вызывается. Молча ничего не делает, если
-    Google Calendar не настроен (config.GOOGLE_CALENDAR_ENABLED) или сообщение не похоже
-    на просьбу поставить встречу. Не мешает основному ответу Twin — вызывается
-    параллельно, как и _log_owner_dm_tasks для задач; любая ошибка тут только
-    логируется, наружу не всплывает."""
+    присылает черновик с кнопками "✏️ Изменить"/"❌ Отменить"/"✅ Применить". Событие в
+    Google Calendar реально создаётся только по нажатию "✅ Применить" (см.
+    handle_calendar_callback) — calendar_client.create_event отсюда не вызывается. Молча
+    ничего не делает, если Google Calendar не настроен (config.GOOGLE_CALENDAR_ENABLED)
+    или сообщение не похоже на просьбу поставить встречу. Не мешает основному ответу
+    Twin — вызывается параллельно, как и _log_owner_dm_tasks для задач; любая ошибка тут
+    только логируется, наружу не всплывает."""
     if not config.GOOGLE_CALENDAR_ENABLED:
         return
     try:
@@ -908,14 +933,38 @@ async def _propose_meeting_draft(context: ContextTypes.DEFAULT_TYPE, user, text:
     meeting_id = storage.add_pending_meeting(
         user.id, text, meeting["title"], meeting["start"], meeting["end"], meeting["location"]
     )
-    start_human = _format_meeting_time(meeting["start"])
-    end_human = _format_meeting_time(meeting["end"])
-    location_line = f"\n📍 {meeting['location']}" if meeting["location"] else ""
-    preview = (
-        f"📅 Похоже, ты хочешь поставить встречу:\n\n"
-        f"«{meeting['title']}»\n{start_human} – {end_human}{location_line}\n\n"
-        f"Добавить в календарь?"
+    preview = _render_meeting_preview(meeting["title"], meeting["start"], meeting["end"], meeting["location"])
+    await context.bot.send_message(
+        chat_id=user.id, text=preview, reply_markup=_meeting_confirm_keyboard(meeting_id)
     )
+
+
+async def _apply_meeting_edit(context: ContextTypes.DEFAULT_TYPE, user, meeting: dict, text: str) -> None:
+    """Владелица нажала "✏️ Изменить" под черновиком встречи (см. handle_calendar_callback,
+    action "cal_edit") и следующим сообщением прислала исправленный текст — перехватывается
+    в handle_message раньше обычной обработки личного сообщения (см. get_meeting_awaiting_edit).
+    Заново прогоняет текст через meeting_extractor и обновляет ТОТ ЖЕ черновик (тот же
+    meeting_id, не создаёт новый), затем снова показывает превью с теми же тремя
+    кнопками. Если новый текст тоже не удалось разобрать — awaiting_edit не снимается
+    (см. storage.get_meeting_awaiting_edit/update_meeting_details), можно сразу
+    попробовать ещё раз, не нажимая "Изменить" заново."""
+    meeting_id = meeting["id"]
+    try:
+        parsed = meeting_extractor.extract_meeting(text, config.MARINATWIN_TIMEZONE)
+    except Exception:
+        logger.exception("Ошибка при разборе исправленного текста встречи (#%s)", meeting_id)
+        parsed = None
+    if not parsed:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                "Не поняла — опиши, пожалуйста, ещё раз с датой и временем "
+                "(можно приблизительно, например «в четверг в 15:00»)."
+            ),
+        )
+        return
+    storage.update_meeting_details(meeting_id, parsed["title"], parsed["start"], parsed["end"], parsed["location"])
+    preview = _render_meeting_preview(parsed["title"], parsed["start"], parsed["end"], parsed["location"], editing=True)
     await context.bot.send_message(
         chat_id=user.id, text=preview, reply_markup=_meeting_confirm_keyboard(meeting_id)
     )
@@ -953,10 +1002,13 @@ def _mirror_meeting_to_clickup(meeting: dict) -> None:
 
 
 async def handle_calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает кнопки "✅ Добавить"/"❌ Не добавлять" под черновиком встречи (см.
-    _propose_meeting_draft). Реальное создание события в Google Calendar
-    (calendar_client.create_event) происходит только здесь, после подтверждения —
-    не в момент разбора текста."""
+    """Обрабатывает кнопки "✏️ Изменить"/"❌ Отменить"/"✅ Применить" под черновиком
+    встречи (см. _propose_meeting_draft). Реальное создание события в Google Calendar
+    (calendar_client.create_event) происходит только здесь, по "✅ Применить" — не в
+    момент разбора текста. "✏️ Изменить" ничего не создаёт и не отменяет — только
+    переводит черновик в режим ожидания исправленного текста (см.
+    storage.set_meeting_awaiting_edit, обрабатывается дальше в handle_message →
+    _apply_meeting_edit)."""
     query = update.callback_query
     await query.answer()
 
@@ -977,6 +1029,13 @@ async def handle_calendar_callback(update: Update, context: ContextTypes.DEFAULT
     if action == "cal_cancel":
         storage.cancel_meeting(meeting_id)
         await query.edit_message_text("Хорошо, не добавляю в календарь.")
+        return
+
+    if action == "cal_edit":
+        storage.set_meeting_awaiting_edit(meeting_id, True)
+        await query.edit_message_text(
+            f"✏️ Хорошо, напиши, как исправить «{meeting['title']}» — пришлю новый черновик."
+        )
         return
 
     if action == "cal_confirm":
@@ -1430,7 +1489,7 @@ def build_application() -> Application:
     )
     # Кнопки "Добавить"/"Не добавлять" под черновиком встречи (Google Calendar).
     app.add_handler(
-        CallbackQueryHandler(handle_calendar_callback, pattern=r"^cal_(confirm|cancel):")
+        CallbackQueryHandler(handle_calendar_callback, pattern=r"^cal_(confirm|cancel|edit):")
     )
     # Личка — обычный разговор с персоной Marina Twin.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))

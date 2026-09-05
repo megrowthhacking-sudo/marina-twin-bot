@@ -185,6 +185,12 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    # awaiting_edit — владелица нажала "✏️ Изменить" под черновиком встречи и должна
+    # прислать исправленный текст следующим сообщением (см. bot.py::handle_message —
+    # проверяется до обычной обработки личного сообщения, чтобы текст не ушёл мимо, в
+    # обычный разговор с Twin или в лог задач). Сбрасывается обратно в 0, как только
+    # исправленный текст разобран (см. storage.update_meeting_details).
+    _ensure_columns(conn, "pending_meetings", {"awaiting_edit": "INTEGER NOT NULL DEFAULT 0"})
     conn.commit()
     return conn
 
@@ -627,7 +633,7 @@ def get_unresolved_classifications_older_than(cutoff_ts: float) -> list[dict]:
 
 _MEETING_COLUMNS = (
     "id", "owner_user_id", "raw_text", "title", "start_iso", "end_iso", "location",
-    "created_at", "resolved", "calendar_event_id",
+    "created_at", "resolved", "calendar_event_id", "awaiting_edit",
 )
 
 
@@ -666,9 +672,53 @@ def resolve_meeting(meeting_id: int, calendar_event_id: str) -> None:
 
 
 def cancel_meeting(meeting_id: int) -> None:
-    """Владелица нажала "Не добавлять" — встреча в календарь не пошла, просто помечаем
+    """Владелица нажала "❌ Отменить" — встреча в календарь не пошла, просто помечаем
     черновик закрытым."""
     _conn.execute("UPDATE pending_meetings SET resolved = 1 WHERE id = ?", (meeting_id,))
+    _conn.commit()
+
+
+def set_meeting_awaiting_edit(meeting_id: int, value: bool) -> None:
+    """Владелица нажала "✏️ Изменить" — следующее её сообщение в личке нужно перехватить
+    как исправленный текст встречи, а не как обычный разговор/лог задач (см.
+    bot.py::handle_message, get_meeting_awaiting_edit ниже)."""
+    _conn.execute(
+        "UPDATE pending_meetings SET awaiting_edit = ? WHERE id = ?",
+        (1 if value else 0, meeting_id),
+    )
+    _conn.commit()
+
+
+def get_meeting_awaiting_edit(owner_user_id: int) -> dict | None:
+    """Есть ли у владелицы черновик встречи, ждущий исправленного текста (см.
+    set_meeting_awaiting_edit) — если несколько (не должно случаться в норме), берём
+    самый свежий. resolved-встречи не считаются: если её уже отменили/подтвердили
+    другим путём, ожидание правки больше не актуально."""
+    row = _conn.execute(
+        f"""
+        SELECT {', '.join(_MEETING_COLUMNS)} FROM pending_meetings
+        WHERE owner_user_id = ? AND awaiting_edit = 1 AND resolved = 0
+        ORDER BY id DESC LIMIT 1
+        """,
+        (owner_user_id,),
+    ).fetchone()
+    return dict(zip(_MEETING_COLUMNS, row)) if row else None
+
+
+def update_meeting_details(
+    meeting_id: int, title: str, start_iso: str, end_iso: str, location: str
+) -> None:
+    """Обновляет черновик встречи после того, как владелица прислала исправленный текст
+    (см. bot.py::_apply_meeting_edit) — тот же meeting_id, новые данные поверх старых,
+    и снимает awaiting_edit (исправление разобрано и применено к черновику)."""
+    _conn.execute(
+        """
+        UPDATE pending_meetings
+        SET title = ?, start_iso = ?, end_iso = ?, location = ?, awaiting_edit = 0
+        WHERE id = ?
+        """,
+        (title, start_iso, end_iso, location, meeting_id),
+    )
     _conn.commit()
 
 
