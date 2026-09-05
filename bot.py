@@ -921,6 +921,37 @@ async def _propose_meeting_draft(context: ContextTypes.DEFAULT_TYPE, user, text:
     )
 
 
+def _mirror_meeting_to_clickup(meeting: dict) -> None:
+    """Дублирует подтверждённую встречу в ClickUp-список config.CLICKUP_LIST_SCHEDULE
+    (папка "Расписание Марина Twin" → список "Встречи") — по просьбе владелицы, чтобы
+    видеть своё расписание и там же, где остальные задачи. Приватность (видит только
+    она) обеспечивается настройками самого списка в ClickUp (Guests & Permissions), не
+    этим кодом. Если список не настроен — тихо ничего не делает. Любая ошибка только
+    логируется: неудачное зеркалирование не должно откатывать уже созданное событие в
+    Google Calendar и не должно ломать подтверждение для владелицы (см.
+    handle_calendar_callback — событие в календаре уже создано к моменту этого вызова)."""
+    if not config.CLICKUP_LIST_SCHEDULE:
+        return
+    try:
+        start_dt = datetime.fromisoformat(meeting["start_iso"])
+        end_dt = datetime.fromisoformat(meeting["end_iso"])
+        start_ms = int(start_dt.timestamp() * 1000)
+        due_ms = int(end_dt.timestamp() * 1000)
+    except ValueError:
+        start_ms = due_ms = None
+    description = f"📍 {meeting['location']}" if meeting.get("location") else ""
+    try:
+        clickup_client.create_task(
+            config.CLICKUP_LIST_SCHEDULE,
+            name=meeting["title"],
+            description=description,
+            start_date_ms=start_ms,
+            due_date_ms=due_ms,
+        )
+    except Exception:
+        logger.exception("Не удалось продублировать встречу в ClickUp (расписание): %s", meeting["title"])
+
+
 async def handle_calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает кнопки "✅ Добавить"/"❌ Не добавлять" под черновиком встречи (см.
     _propose_meeting_draft). Реальное создание события в Google Calendar
@@ -965,6 +996,7 @@ async def handle_calendar_callback(update: Update, context: ContextTypes.DEFAULT
             )
             return
         storage.resolve_meeting(meeting_id, event_id)
+        _mirror_meeting_to_clickup(meeting)
         await query.edit_message_text(f"Готово, добавила в календарь: «{meeting['title']}» 📅")
 
 

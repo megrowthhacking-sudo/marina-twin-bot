@@ -32,12 +32,17 @@ def create_task(
     description: str = "",
     priority: str | None = None,
     assignees: list[int] | None = None,
+    start_date_ms: int | None = None,
+    due_date_ms: int | None = None,
 ) -> dict:
     """Создаёт задачу в указанном списке ClickUp (list_id — конкретный проектный список,
     см. config.CLICKUP_LIST_IDS). assignees — список ClickUp user_id (см.
-    config.CLICKUP_ASSIGNEE_MAP), можно не указывать. Бросает исключение при ошибке —
-    вызывающий код (bot.py) сам решает, как это залогировать и не уронить остальную
-    выгрузку."""
+    config.CLICKUP_ASSIGNEE_MAP), можно не указывать. start_date_ms/due_date_ms — unix-время
+    в МИЛЛИСЕКУНДАХ (не секундах — так требует ClickUp API), если нужно проставить время
+    начала/дедлайна с точностью до часа (см. bot.py::_mirror_meeting_to_clickup — зеркало
+    встреч Google Calendar в список "Расписание Марина Twin"); без них задача создаётся
+    без дат, как раньше. Бросает исключение при ошибке — вызывающий код (bot.py) сам
+    решает, как это залогировать и не уронить остальную выгрузку."""
     if not config.CLICKUP_API_TOKEN:
         raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
 
@@ -47,6 +52,12 @@ def create_task(
         payload["priority"] = priority_num
     if assignees:
         payload["assignees"] = assignees
+    if start_date_ms is not None:
+        payload["start_date"] = start_date_ms
+        payload["start_date_time"] = True
+    if due_date_ms is not None:
+        payload["due_date"] = due_date_ms
+        payload["due_date_time"] = True
 
     url = f"{BASE_URL}/list/{list_id}/task"
     resp = requests.post(url, headers=_headers(), json=payload, timeout=20)
