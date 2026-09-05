@@ -456,6 +456,24 @@ def cancel_escalation_flow(escalation_id: int) -> None:
     _conn.commit()
 
 
+def cancel_all_pending_escalations() -> int:
+    """Массовая версия cancel_escalation_flow — для команды /cancelall в bot.py: Марина
+    уже вживую ответила сама во всех висящих групповых чатах, и по каждому из них не
+    нужно ни ждать её ответа в личке, ни присылать AI-черновик/предложение ответить.
+    Помечает resolved=1 и чистит черновик/стадию для ВСЕХ ещё не закрытых эскалаций
+    разом (не влияет на уже отвеченные через бота — те и так resolved). Возвращает
+    число отменённых эскалаций (для текста подтверждения владелице)."""
+    cur = _conn.execute(
+        """
+        UPDATE pending_escalations
+        SET resolved = 1, flow_stage = NULL, draft_raw = NULL, draft_posted = NULL
+        WHERE resolved = 0
+        """
+    )
+    _conn.commit()
+    return cur.rowcount
+
+
 def set_escalation_draft(escalation_id: int, raw_text: str, posted_text: str) -> None:
     _conn.execute(
         "UPDATE pending_escalations SET draft_raw = ?, draft_posted = ? WHERE id = ?",

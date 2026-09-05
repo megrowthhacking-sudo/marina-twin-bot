@@ -9,7 +9,6 @@ Telegram-бот "Marina Twin" — штатный юрист по праву РФ
 
 import asyncio
 import logging
-import random
 import re
 import time
 from datetime import datetime, time as digest_time
@@ -118,12 +117,6 @@ def _detect_project_keyword(text: str) -> str | None:
 # --- Обращение к "Марине" в группе (упоминание, reply, имя) ---
 
 _MARINA_NAME_RE = re.compile(r"\bмарин(а|ы|е|у|ой|ою)\b|\bmar[iy]na\b|\bmary\b", re.IGNORECASE)
-
-_ACK_PHRASES = [
-    "Секунду, уточню и вернусь 🙂",
-    "Дай мне минутку — уточню и отвечу.",
-    "Сейчас, только уточню детали — и сразу вернусь с ответом.",
-]
 
 # Кэш @username живой владелицы (для распознавания обращений вида "@её_ник ..." в
 # группе — отдельно от @username самого бота). None до первой попытки резолва;
@@ -659,7 +652,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     (1) сообщение закрепляет чат за проектом ("эта группа про задачи Altyn") —
     отвечает подтверждением;
     (2) к ней явно обращаются (@упоминание, reply на её сообщение, имя "Марина") —
-    отвечает "сейчас вернусь" и пересылает вопрос владелице в личку (см. handle_message);
+    молча (без плейсхолдера в самом чате — раньше был "секунду, уточню и вернусь",
+    но это раздражало коллег) пересылает вопрос владелице в личку с черновиком ответа
+    на кнопках (см. _propose_initial_draft); в группе появится что-то, только когда
+    Марина подтвердит ответ в личке (см. handle_escalation_callback/esc_confirm);
     (3) кто-то отредактировал уже написанное сообщение — см. _handle_group_message_edited.
     Иначе сообщение просто уходит в буфер — задачи из него достаются командой
     /tasksatlas /tasksaltyn /tasksbs /tasksmisc, либо автоматически по расписанию
@@ -718,7 +714,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if await _is_addressed_to_marina(update, context, text):
         if config.OWNER_USER_ID is not None:
-            await msg.reply_text(random.choice(_ACK_PHRASES))
+            # Раньше здесь был плейсхолдер в саму группу ("Секунду, уточню и вернусь") —
+            # убрали: коллег раздражало, что бот вообще что-то говорит в чате прежде,
+            # чем Марина реально ответила. Теперь в группе тихо, пока не подтверждён
+            # финальный ответ (см. esc_confirm в handle_escalation_callback).
             # Вопрос не всегда лежит в самом тег-сообщении — иногда коллега сначала пишет
             # вопрос, а к Марине обращается уже следующим, коротким сообщением (см.
             # _extract_question_context). question_text — то, что реально пойдёт как текст
@@ -1129,6 +1128,30 @@ async def handle_urgent_command(update: Update, context: ContextTypes.DEFAULT_TY
     await _send_urgent_report(context)
 
 
+async def handle_cancelall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancelall — только в личке, только владелице: она сама, вживую, уже ответила
+    на висящие вопросы прямо в группах (или решила, что бот отвечать не должен) — и не
+    хочет, чтобы бот всё ещё ждал её ответа в личке или напоминал об этих вопросах.
+    Разом снимает ВСЕ ещё не закрытые через бота эскалации (см.
+    storage.cancel_all_pending_escalations) — бот в эти чаты по этим вопросам больше не
+    вернётся и черновики/кнопки по ним больше не актуальны."""
+    chat = update.effective_chat
+    if chat.type != "private":
+        await update.message.reply_text("Эта команда работает только в личке.")
+        return
+    if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+        await update.message.reply_text("Эта команда только для владелицы.")
+        return
+    cancelled = storage.cancel_all_pending_escalations()
+    if cancelled:
+        await update.message.reply_text(
+            f"Поняла, сняла все висящие вопросы ({cancelled} шт.) — раз ты уже ответила "
+            f"сама, в эти чаты возвращаться не буду."
+        )
+    else:
+        await update.message.reply_text("Висящих вопросов и не было — всё чисто.")
+
+
 async def _send_tasksall_report(context: ContextTypes.DEFAULT_TYPE) -> str:
     """/tasksall — по каждому проекту (в порядке config.CLICKUP_PROJECTS) тянет живые
     открытые задачи из ClickUp и собирает единый отчёт с разделом на каждый проект,
@@ -1245,6 +1268,9 @@ def build_application() -> Application:
     # /urgent — только в личке, только владелице: живая сводка срочных задач по всем
     # проектам сразу (см. handle_urgent_command / _send_urgent_report).
     app.add_handler(CommandHandler("urgent", handle_urgent_command))
+    # /cancelall — только в личке, только владелице: снимает разом все висящие вопросы
+    # из групп, на которые она ещё не ответила через бота (см. handle_cancelall_command).
+    app.add_handler(CommandHandler("cancelall", handle_cancelall_command))
     # /tasksall — только в личке, только владелице: живой отчёт по открытым задачам
     # сразу всех четырёх проектов одним сообщением (см. handle_tasksall_command).
     app.add_handler(CommandHandler("tasksall", handle_tasksall_command))
