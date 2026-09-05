@@ -27,11 +27,13 @@ from telegram.ext import (
     filters,
 )
 
+import calendar_client
 import claude_client
 import clickup_client
 import config
 import escalation
 import kb
+import meeting_extractor
 import storage
 import task_extractor
 
@@ -586,9 +588,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 return
         # Обычное сообщение владелицы в личке (не reply на эскалацию) — помимо ответа
         # Twin ниже, заодно проверяем, не задача ли это, и если да — заносим в ClickUp
-        # (см. _log_owner_dm_tasks). Только для самой владелицы: у остальных пользователей
-        # в личке — просто разговор с Twin, их сообщения в ClickUp не идут.
+        # (см. _log_owner_dm_tasks), и не похоже ли сообщение на просьбу поставить встречу
+        # (см. _propose_meeting_draft). Только для самой владелицы: у остальных
+        # пользователей в личке — просто разговор с Twin, их сообщения в ClickUp/календарь
+        # не идут.
         await _log_owner_dm_tasks(user, text)
+        await _propose_meeting_draft(context, user, text)
 
     state = storage.get_chat(chat_id)
     history: list = state["history"]
@@ -857,6 +862,110 @@ async def _log_owner_dm_tasks(user, text: str) -> None:
     created = _push_tasks(user.id, chat_title, tasks, lambda t: t.get("project") or "unsorted")
     if created:
         logger.info("Из личного сообщения владелицы занесено задач в ClickUp: %s", created)
+
+
+def _format_meeting_time(iso_str: str) -> str:
+    """ISO 8601 → человекочитаемо для превью черновика встречи, например
+    "08.09 (вт) 15:00". При ошибке разбора возвращает исходную строку как есть —
+    лучше показать сырую дату, чем упасть на форматировании превью."""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except ValueError:
+        return iso_str
+    weekday_short = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"][dt.weekday()]
+    return dt.strftime(f"%d.%m ({weekday_short}) %H:%M")
+
+
+def _meeting_confirm_keyboard(meeting_id: int):
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Добавить", callback_data=f"cal_confirm:{meeting_id}"),
+            InlineKeyboardButton("❌ Не добавлять", callback_data=f"cal_cancel:{meeting_id}"),
+        ]]
+    )
+
+
+async def _propose_meeting_draft(context: ContextTypes.DEFAULT_TYPE, user, text: str) -> None:
+    """Если сообщение владелицы в личке похоже на просьбу поставить встречу — извлекает
+    название/время (meeting_extractor.extract_meeting, лёгкая модель без базы знаний) и
+    присылает черновик с кнопками подтверждения. Событие в Google Calendar реально
+    создаётся только по нажатию "✅ Добавить" (см. handle_calendar_callback) —
+    calendar_client.create_event отсюда не вызывается. Молча ничего не делает, если
+    Google Calendar не настроен (config.GOOGLE_CALENDAR_ENABLED) или сообщение не похоже
+    на просьбу поставить встречу. Не мешает основному ответу Twin — вызывается
+    параллельно, как и _log_owner_dm_tasks для задач; любая ошибка тут только
+    логируется, наружу не всплывает."""
+    if not config.GOOGLE_CALENDAR_ENABLED:
+        return
+    try:
+        meeting = meeting_extractor.extract_meeting(text, config.MARINATWIN_TIMEZONE)
+    except Exception:
+        logger.exception("Ошибка при разборе сообщения на предмет встречи")
+        return
+    if not meeting:
+        return
+
+    meeting_id = storage.add_pending_meeting(
+        user.id, text, meeting["title"], meeting["start"], meeting["end"], meeting["location"]
+    )
+    start_human = _format_meeting_time(meeting["start"])
+    end_human = _format_meeting_time(meeting["end"])
+    location_line = f"\n📍 {meeting['location']}" if meeting["location"] else ""
+    preview = (
+        f"📅 Похоже, ты хочешь поставить встречу:\n\n"
+        f"«{meeting['title']}»\n{start_human} – {end_human}{location_line}\n\n"
+        f"Добавить в календарь?"
+    )
+    await context.bot.send_message(
+        chat_id=user.id, text=preview, reply_markup=_meeting_confirm_keyboard(meeting_id)
+    )
+
+
+async def handle_calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает кнопки "✅ Добавить"/"❌ Не добавлять" под черновиком встречи (см.
+    _propose_meeting_draft). Реальное создание события в Google Calendar
+    (calendar_client.create_event) происходит только здесь, после подтверждения —
+    не в момент разбора текста."""
+    query = update.callback_query
+    await query.answer()
+
+    if config.OWNER_USER_ID is not None and query.from_user.id != config.OWNER_USER_ID:
+        return
+
+    action, _, meeting_id_raw = (query.data or "").partition(":")
+    try:
+        meeting_id = int(meeting_id_raw)
+    except ValueError:
+        return
+
+    meeting = storage.get_meeting(meeting_id)
+    if not meeting or meeting["resolved"]:
+        await query.edit_message_text("Этот черновик встречи уже не актуален.")
+        return
+
+    if action == "cal_cancel":
+        storage.cancel_meeting(meeting_id)
+        await query.edit_message_text("Хорошо, не добавляю в календарь.")
+        return
+
+    if action == "cal_confirm":
+        try:
+            event_id = calendar_client.create_event(
+                meeting["title"],
+                meeting["start_iso"],
+                meeting["end_iso"],
+                location=meeting["location"] or None,
+            )
+        except Exception:
+            logger.exception("Не удалось создать событие в Google Calendar (встреча #%s)", meeting_id)
+            await query.edit_message_text(
+                "Не смогла добавить в календарь (возможно, проблема с доступом) — "
+                "добавь, пожалуйста, вручную: "
+                f"«{meeting['title']}», {_format_meeting_time(meeting['start_iso'])}"
+            )
+            return
+        storage.resolve_meeting(meeting_id, event_id)
+        await query.edit_message_text(f"Готово, добавила в календарь: «{meeting['title']}» 📅")
 
 
 async def _ask_classification_question(
@@ -1286,6 +1395,10 @@ def build_application() -> Application:
             handle_escalation_callback,
             pattern=r"^esc_(confirm_anyway|edited_rewrite|confirm|cancel|retry|own):",
         )
+    )
+    # Кнопки "Добавить"/"Не добавлять" под черновиком встречи (Google Calendar).
+    app.add_handler(
+        CallbackQueryHandler(handle_calendar_callback, pattern=r"^cal_(confirm|cancel):")
     )
     # Личка — обычный разговор с персоной Marina Twin.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))

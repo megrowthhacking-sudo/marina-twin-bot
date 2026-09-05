@@ -139,3 +139,14 @@ elif ALLOWED_USER_IDS and len(ALLOWED_USER_IDS) == 1:
     OWNER_USER_ID = next(iter(ALLOWED_USER_IDS))
 else:
     OWNER_USER_ID = None
+
+# --- Google Calendar: постановка встреч из личного диалога с владелицей ---
+# GOOGLE_SERVICE_ACCOUNT_JSON — полное содержимое JSON-ключа сервисного аккаунта Google
+# (Cloud Console → IAM → Service Accounts → Keys). Владелица делится своим личным
+# календарём с email этого сервисного аккаунта (Settings → Share with specific people →
+# "Make changes to events") — без OAuth-флоу и без истекающих токенов, надёжнее для
+# постоянно работающего сервера. GOOGLE_CALENDAR_ID — обычно её собственный gmail-адрес
+# (id основного календаря совпадает с адресом почты).
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip() or None
+GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "").strip() or None
+GOOGLE_CALENDAR_ENABLED = bool(GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_CALENDAR_ID)

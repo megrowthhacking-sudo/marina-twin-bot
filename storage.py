@@ -165,6 +165,26 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    # Черновики встреч из личного диалога с владелицей (см. meeting_extractor.py,
+    # bot.py::_propose_meeting_draft) — ждут подтверждения кнопкой, прежде чем реально
+    # создать событие в Google Calendar (calendar_client.py). start_iso/end_iso — ISO 8601
+    # с таймзоной, calendar_event_id заполняется только после успешного создания.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_meetings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_user_id INTEGER NOT NULL,
+            raw_text TEXT NOT NULL,
+            title TEXT NOT NULL,
+            start_iso TEXT NOT NULL,
+            end_iso TEXT NOT NULL,
+            location TEXT,
+            created_at REAL NOT NULL,
+            resolved INTEGER NOT NULL DEFAULT 0,
+            calendar_event_id TEXT
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -601,6 +621,55 @@ def get_unresolved_classifications_older_than(cutoff_ts: float) -> list[dict]:
         (cutoff_ts,),
     ).fetchall()
     return [dict(zip(_CLASSIFICATION_COLUMNS, r)) for r in rows]
+
+
+# --- Черновики встреч (Google Calendar, см. meeting_extractor.py / calendar_client.py) ---
+
+_MEETING_COLUMNS = (
+    "id", "owner_user_id", "raw_text", "title", "start_iso", "end_iso", "location",
+    "created_at", "resolved", "calendar_event_id",
+)
+
+
+def add_pending_meeting(
+    owner_user_id: int, raw_text: str, title: str, start_iso: str, end_iso: str, location: str
+) -> int:
+    cur = _conn.execute(
+        """
+        INSERT INTO pending_meetings (
+            owner_user_id, raw_text, title, start_iso, end_iso, location, created_at, resolved
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+        """,
+        (owner_user_id, raw_text, title, start_iso, end_iso, location, time.time()),
+    )
+    _conn.commit()
+    return cur.lastrowid
+
+
+def get_meeting(meeting_id: int) -> dict | None:
+    row = _conn.execute(
+        f"SELECT {', '.join(_MEETING_COLUMNS)} FROM pending_meetings WHERE id = ?",
+        (meeting_id,),
+    ).fetchone()
+    return dict(zip(_MEETING_COLUMNS, row)) if row else None
+
+
+def resolve_meeting(meeting_id: int, calendar_event_id: str) -> None:
+    """Встреча реально создана в Google Calendar — фиксируем id события (см.
+    calendar_client.create_event) на случай будущего редактирования/отмены."""
+    _conn.execute(
+        "UPDATE pending_meetings SET resolved = 1, calendar_event_id = ? WHERE id = ?",
+        (calendar_event_id, meeting_id),
+    )
+    _conn.commit()
+
+
+def cancel_meeting(meeting_id: int) -> None:
+    """Владелица нажала "Не добавлять" — встреча в календарь не пошла, просто помечаем
+    черновик закрытым."""
+    _conn.execute("UPDATE pending_meetings SET resolved = 1 WHERE id = ?", (meeting_id,))
+    _conn.commit()
 
 
 def get_chats_with_pending_and_project() -> list[tuple[int, str, str]]:
