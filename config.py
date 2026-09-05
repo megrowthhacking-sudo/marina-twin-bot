@@ -150,3 +150,11 @@ else:
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip() or None
 GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "").strip() or None
 GOOGLE_CALENDAR_ENABLED = bool(GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_CALENDAR_ID)
+
+# Список ClickUp (папка "Расписание Марина Twin", список "Встречи"), куда зеркалятся все
+# подтверждённые встречи из Google Calendar — по просьбе владелицы, чтобы видеть своё
+# расписание и в ClickUp тоже. Список создан отдельно от 4 проектных
+# (config.CLICKUP_LIST_IDS) — приватность (видимость только владелице) настраивается в
+# самом ClickUp через Guests & Permissions списка/папки, это не поле API. Если не задан —
+# зеркалирование просто не происходит (событие в календаре всё равно создаётся).
+CLICKUP_LIST_SCHEDULE = os.environ.get("CLICKUP_LIST_SCHEDULE", "").strip() or None
