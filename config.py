@@ -148,16 +148,25 @@ CLICKUP_ASSIGNEE_MAP = {
 # упомянутое имя с реальным ClickUp-аккаунтом, см. CLICKUP_ASSIGNEE_MAP выше). Для КАЖДОГО
 # ключа этого словаря bot.py автоматически заводит ещё и "weekly"-версию команды
 # (например "/nikolayweekly") — см. CLICKUP_LIST_WEEKLY ниже.
+# "telegram_username" (часть 30, по прямой просьбе владелицы) — @username сотрудника,
+# КАК ЕГО ПРИСЛАЛА ВЛАДЕЛИЦА, в нижнем регистре и без "@" (сравнение с реальным
+# update.effective_user.username идёт регистронезависимо, см.
+# bot.py::_maybe_capture_employee_telegram_id). Сам по себе username НЕ годится для
+# отправки сообщений (Telegram API требует числовой user_id, который бот узнаёт только
+# из реального сообщения этого человека) — как только кто-то с таким username напишет
+# что угодно в личку боту или в любую группу, где бот присутствует, его настоящий
+# telegram_user_id автоматически сохранится в storage.employee_telegram_ids и кнопка
+# "➡️ Переслать" начнёт работать для него сама, без правки кода/конфига.
 EMPLOYEE_COMMANDS = {
-    "lili": {"label": "Лили", "assignee_id": 113538039},
-    "olga": {"label": "Ольга", "assignee_id": 113538035},
-    "sveta": {"label": "Света", "assignee_id": 113538038},
-    "ilya": {"label": "Илья", "assignee_id": 113538037},
-    "nazgul": {"label": "Назгул", "assignee_id": 113538036},
+    "lili": {"label": "Лили", "assignee_id": 113538039, "telegram_username": "ffforgetmenot"},
+    "olga": {"label": "Ольга", "assignee_id": 113538035, "telegram_username": "yama_888"},
+    "sveta": {"label": "Света", "assignee_id": 113538038, "telegram_username": "claire_claire_bs"},
+    "ilya": {"label": "Илья", "assignee_id": 113538037, "telegram_username": "fesius_altyn"},
+    "nazgul": {"label": "Назгул", "assignee_id": 113538036, "telegram_username": "asisst_0_0"},
     "ub": {"label": "Юрий Борисович", "assignee_id": 113538374},
     "alex": {"label": "Саша", "assignee_id": None, "name_prefix": "саша:"},
     "marina": {"label": "Марина", "assignee_id": 113538088},
-    "nikolay": {"label": "Николай Хребет", "assignee_id": 113538064},
+    "nikolay": {"label": "Николай Хребет", "assignee_id": 113538064, "telegram_username": "nikolai_ip_lawyer"},
     "nick": {"label": "Ник Галт", "assignee_id": 113538351},
 }
 

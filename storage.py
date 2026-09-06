@@ -241,6 +241,25 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    # Telegram user_id сотрудников, распознанные автоматически (по прямой просьбе
+    # владелицы, часть 30) — она прислала их @username, а не числовой id, но Telegram
+    # не даёт боту написать первым тому, кто ему никогда не писал (нужен именно
+    # числовой user_id, а не @username). Вместо того чтобы просить каждого сотрудника
+    # отдельно прислать id, бот сам подглядывает @username в КАЖДОМ сообщении, которое
+    # и так получает (личка + группы, см. bot.py::_maybe_capture_employee_telegram_id) —
+    # как только кто-то из совпадающих @username напишет что угодно в любом видимом
+    # боту месте, его настоящий telegram_user_id сохраняется сюда и кнопка "➡️ Переслать"
+    # сразу начинает работать для него, без нового деплоя и без env-переменных.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS employee_telegram_ids (
+            employee_key TEXT PRIMARY KEY,
+            telegram_user_id INTEGER NOT NULL,
+            telegram_username TEXT,
+            resolved_at REAL NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -907,3 +926,38 @@ def get_chats_with_pending_and_project() -> list[tuple[int, str, str]]:
         """
     ).fetchall()
     return [(r[0], r[1] or str(r[0]), r[2]) for r in rows]
+
+
+# --- Автоматически распознанные telegram_user_id сотрудников (часть 30) ---
+
+def save_employee_telegram_id(employee_key: str, telegram_user_id: int, telegram_username: str | None = None) -> None:
+    """Запоминает (или обновляет) настоящий telegram_user_id сотрудника — см.
+    bot.py::_maybe_capture_employee_telegram_id. Перезаписывает предыдущее значение,
+    если вдруг сотрудник сменил Telegram-аккаунт/username."""
+    _conn.execute(
+        """
+        INSERT INTO employee_telegram_ids (employee_key, telegram_user_id, telegram_username, resolved_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(employee_key) DO UPDATE SET
+            telegram_user_id = excluded.telegram_user_id,
+            telegram_username = excluded.telegram_username,
+            resolved_at = excluded.resolved_at
+        """,
+        (employee_key, telegram_user_id, telegram_username, time.time()),
+    )
+    _conn.commit()
+
+
+def get_employee_telegram_id(employee_key: str) -> int | None:
+    row = _conn.execute(
+        "SELECT telegram_user_id FROM employee_telegram_ids WHERE employee_key = ?", (employee_key,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def get_all_employee_telegram_ids() -> dict[str, int]:
+    """{employee_key: telegram_user_id, ...} — только те, что уже реально распознаны
+    (см. save_employee_telegram_id), используется вместе с ручными env-переменными
+    config.EMPLOYEE_COMMANDS[...]["telegram_user_id"] в bot.py::_available_forward_recipients."""
+    rows = _conn.execute("SELECT employee_key, telegram_user_id FROM employee_telegram_ids").fetchall()
+    return {row[0]: row[1] for row in rows}
