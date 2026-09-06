@@ -1561,20 +1561,72 @@ async def handle_tasksall_command(update: Update, context: ContextTypes.DEFAULT_
         await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
 
 
-def _format_employee_task_lines(tasks: list[dict]) -> list[str]:
+# Сколько задач умещаем в одно сообщение отчёта по сотруднику вместе с кнопками (по
+# прямой просьбе владелицы, 06.09-часть 24: у каждой задачи 4 кнопки-действия, см.
+# _employee_task_keyboard) — при большом числе задач (например, у Лили их около 80)
+# один Telegram-message с сотнями inline-кнопок технически ненадёжен/неюзабелен, поэтому
+# длинные отчёты режутся на несколько сообщений подряд, а не на одно (согласовано с
+# владелицей заранее, см. AskUserQuestion в истории части 24).
+_EMPLOYEE_TASKS_PAGE_SIZE = 15
+
+
+def _sort_tasks_fire_first(tasks: list[dict], fire_ids: set[str]) -> list[dict]:
+    """Задачи, помеченные кнопкой "🔥 Горит" (см. handle_employee_task_callback), идут
+    первыми (в своём относительном порядке между собой), остальные — как были получены
+    от ClickUp. Это ЧИСТО отображение внутри бота — никакого поля/тега в самом ClickUp
+    не меняется (так по прямой просьбе владелицы: заводить теги под это в ClickUp —
+    лишняя сложность, ей достаточно видеть это только здесь)."""
+    fire = [t for t in tasks if t["id"] in fire_ids]
+    rest = [t for t in tasks if t["id"] not in fire_ids]
+    return fire + rest
+
+
+def _format_employee_task_lines(tasks: list[dict], fire_ids: set[str], start_index: int = 1) -> list[str]:
     """Как _format_task_lines, но для отчёта по сотруднику (см. _send_employee_report) —
     задачи теперь могут быть из любого места ClickUp (см.
     clickup_client.get_open_tasks_team_wide), поэтому в конце строки, если известно,
-    дописывается название списка/проекта, откуда задача — иначе Марине было бы неясно,
-    к какому из многих пространств ClickUp она относится."""
+    дописывается название списка/проекта, откуда задача. start_index — чтобы нумерация
+    была сквозной между несколькими сообщениями одного отчёта (см.
+    _EMPLOYEE_TASKS_PAGE_SIZE) — номер строки в тексте специально совпадает с номером на
+    кнопках под ней (см. _employee_task_keyboard), это и есть привязка кнопок "к каждой
+    задаче" в интерфейсе, где сами кнопки физически не могут стоять внутри строки текста.
+    Задачи, помеченные "🔥 Горит" (fire_ids), получают значок 🔥 вместо обычного 🔴 у
+    срочных — визуально понятно, что задача поднята вручную, а не просто высокий
+    приоритет в ClickUp."""
     lines = []
-    for i, t in enumerate(tasks, start=1):
-        marker = "🔴 " if _is_urgent(t) else ""
+    for offset, t in enumerate(tasks):
+        i = start_index + offset
+        marker = "🔥 " if t["id"] in fire_ids else ("🔴 " if _is_urgent(t) else "")
         due_suffix = _format_due_suffix(t.get("due_date"))
         list_name = t.get("list_name")
         location_suffix = f" [{list_name}]" if list_name else ""
         lines.append(f"{i}. {marker}{t['name']}{due_suffix}{location_suffix}")
     return lines
+
+
+def _employee_task_keyboard(tasks: list[dict], start_index: int = 1) -> InlineKeyboardMarkup:
+    """Строит ряд из 4 кнопок-действий под каждой задачей отчёта по сотруднику (по
+    прямой просьбе владелицы, 06.09-часть 24, см. handle_employee_task_callback):
+    "✅ Сделано" (закрывает задачу в ClickUp), "🗑 Удалить" (удаляет из ClickUp насовсем,
+    с шагом подтверждения), "🔴 Срочная" (ставит приоритет Urgent в ClickUp), "🔥 Горит"
+    (локальная пометка только в боте — поднимает наверх списка при следующем вызове
+    команды). Номер на кнопках специально совпадает с номером строки в тексте отчёта
+    (см. _format_employee_task_lines, тот же start_index) — Telegram не даёт разместить
+    inline-кнопку буквально внутри строки текста, поэтому визуальная привязка кнопки к
+    конкретной задаче держится на совпадении номеров."""
+    rows = []
+    for offset, t in enumerate(tasks):
+        i = start_index + offset
+        task_id = t["id"]
+        rows.append(
+            [
+                InlineKeyboardButton(f"{i}.✅", callback_data=f"emp:done:{task_id}"),
+                InlineKeyboardButton(f"{i}.🗑", callback_data=f"emp:delask:{task_id}"),
+                InlineKeyboardButton(f"{i}.🔴", callback_data=f"emp:urgent:{task_id}"),
+                InlineKeyboardButton(f"{i}.🔥", callback_data=f"emp:fire:{task_id}"),
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 async def _send_employee_report(context: ContextTypes.DEFAULT_TYPE, employee_key: str) -> None:
@@ -1589,7 +1641,14 @@ async def _send_employee_report(context: ContextTypes.DEFAULT_TYPE, employee_key
     находятся по буквальному текстовому префиксу "Саша:" в начале названия (так их
     заводит task_extractor.py, когда не может сопоставить имя с реальным
     ClickUp-аккаунтом) — в этом случае приходится тянуть ВСЕ открытые задачи workspace
-    без серверного фильтра и отфильтровывать по префиксу уже на своей стороне."""
+    без серверного фильтра и отфильтровывать по префиксу уже на своей стороне.
+
+    С 06.09 (часть 24) каждая задача сопровождается рядом из 4 кнопок-действий (см.
+    _employee_task_keyboard/handle_employee_task_callback) — отчёт при этом режется на
+    несколько сообщений подряд (см. _EMPLOYEE_TASKS_PAGE_SIZE), а не остаётся одним, как
+    раньше: с кнопками под сотней с лишним задач (см. случай Лили) одно сообщение
+    технически ненадёжно. Задачи, помеченные кнопкой "🔥 Горит" (storage.get_fire_task_ids),
+    показываются первыми (см. _sort_tasks_fire_first)."""
     if config.OWNER_USER_ID is None:
         return
     employee = config.EMPLOYEE_COMMANDS[employee_key]
@@ -1608,18 +1667,138 @@ async def _send_employee_report(context: ContextTypes.DEFAULT_TYPE, employee_key
         return
     if name_prefix:
         tasks = [t for t in tasks if t["name"].strip().lower().startswith(name_prefix)]
+
     if not tasks:
-        text = f"👤 {label} — открытых задач нигде в ClickUp не нашла."
-    else:
-        text = (
-            f"👤 {label} — открытые задачи по всему ClickUp ({len(tasks)}):\n"
-            + "\n".join(_format_employee_task_lines(tasks))
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=config.OWNER_USER_ID, text=f"👤 {label} — открытых задач нигде в ClickUp не нашла.",
+            )
+        except Exception:
+            logger.exception("Не удалось отправить отчёт по сотруднику %s владелице", employee_key)
+        return
+
+    fire_ids = storage.get_fire_task_ids()
+    tasks = _sort_tasks_fire_first(tasks, fire_ids)
+    total = len(tasks)
+    pages = [
+        tasks[i : i + _EMPLOYEE_TASKS_PAGE_SIZE]
+        for i in range(0, total, _EMPLOYEE_TASKS_PAGE_SIZE)
+    ]
     try:
-        for chunk in _split_for_telegram(text):
-            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
+        for page_num, page_tasks in enumerate(pages, start=1):
+            start_index = (page_num - 1) * _EMPLOYEE_TASKS_PAGE_SIZE + 1
+            header = f"👤 {label} — открытые задачи по всему ClickUp ({total})"
+            if len(pages) > 1:
+                header += f", часть {page_num}/{len(pages)}"
+            text = header + ":\n" + "\n".join(_format_employee_task_lines(page_tasks, fire_ids, start_index))
+            keyboard = _employee_task_keyboard(page_tasks, start_index)
+            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text, reply_markup=keyboard)
     except Exception:
         logger.exception("Не удалось отправить отчёт по сотруднику %s владелице", employee_key)
+
+
+_EMPLOYEE_TASK_ACTIONS = ("done", "urgent", "fire", "delask", "delyes", "delno")
+
+
+async def handle_employee_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопки под задачами в отчётах по сотрудникам (см. _send_employee_report,
+    _employee_task_keyboard) — по прямой просьбе владелицы, 06.09-часть 24:
+    "✅ Сделано" — закрывает задачу в ClickUp (см. clickup_client.mark_task_done —
+    сама разбирается, каким именно статусом закрывать конкретный список задачи).
+    "🔴 Срочная" — ставит приоритет Urgent в ClickUp (тот же 🔴, что уже используется в
+    остальных отчётах для срочных/высокоприоритетных задач).
+    "🔥 Горит" — переключатель ЧИСТО внутри бота (см. storage.mark_task_fire/
+    unmark_task_fire) — ничего не меняет в самом ClickUp, только поднимает задачу в
+    начало списка и меняет значок при следующем вызове той же команды (согласовано с
+    владелицей заранее — заводить под это тег в ClickUp она не захотела).
+    "🗑 Удалить" — двухшаговое действие: сначала "delask" присылает отдельное
+    сообщение-подтверждение с именем задачи ("delyes"/"delno"), и только "delyes" реально
+    удаляет задачу из ClickUp НАСОВСЕМ — шаг подтверждения добавлен по прямой просьбе
+    владелицы (риск случайного нажатия на маленькой кнопке в телефоне на необратимое
+    действие).
+    Только для владелицы — тот же общий паттерн проверки, что и у остальных callback-
+    кнопок бота (см. handle_escalation_callback)."""
+    query = update.callback_query
+    if config.OWNER_USER_ID is not None and query.from_user.id != config.OWNER_USER_ID:
+        await query.answer()
+        return
+
+    _, _, rest = (query.data or "").partition(":")
+    action, _, task_id = rest.partition(":")
+    if action not in _EMPLOYEE_TASK_ACTIONS or not task_id:
+        await query.answer()
+        return
+
+    if action == "done":
+        try:
+            clickup_client.mark_task_done(task_id)
+        except Exception:
+            logger.exception("Не удалось закрыть задачу %s из отчёта по сотруднику", task_id)
+            await query.answer("Не смогла отметить как сделано — проверь в ClickUp.", show_alert=True)
+            return
+        storage.unmark_task_fire(task_id)
+        await query.answer("✅ Отмечено как сделано в ClickUp")
+        return
+
+    if action == "urgent":
+        try:
+            clickup_client.set_task_priority(task_id, "urgent")
+        except Exception:
+            logger.exception("Не удалось поставить приоритет задаче %s из отчёта по сотруднику", task_id)
+            await query.answer("Не смогла поставить приоритет — проверь в ClickUp.", show_alert=True)
+            return
+        await query.answer("🔴 Помечено как срочное в ClickUp")
+        return
+
+    if action == "fire":
+        if storage.is_task_fire(task_id):
+            storage.unmark_task_fire(task_id)
+            await query.answer("Сняла пометку 🔥")
+        else:
+            storage.mark_task_fire(task_id)
+            await query.answer("🔥 Пометила — поднимется наверх при следующем вызове команды")
+        return
+
+    if action == "delask":
+        await query.answer()
+        try:
+            task = clickup_client.get_task(task_id)
+        except Exception:
+            logger.exception("Не удалось прочитать задачу %s перед удалением", task_id)
+            task = None
+        task_name = task["name"] if task else task_id
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🗑 Да, удалить насовсем", callback_data=f"emp:delyes:{task_id}"),
+                    InlineKeyboardButton("Отмена", callback_data=f"emp:delno:{task_id}"),
+                ]
+            ]
+        )
+        await context.bot.send_message(
+            chat_id=config.OWNER_USER_ID,
+            text=f"Точно удалить эту задачу насовсем из ClickUp?\n«{task_name}»\n\nЭто необратимо.",
+            reply_markup=keyboard,
+        )
+        return
+
+    if action == "delyes":
+        try:
+            clickup_client.delete_task(task_id)
+        except Exception:
+            logger.exception("Не удалось удалить задачу %s из отчёта по сотруднику", task_id)
+            await query.answer()
+            await query.edit_message_text("Не смогла удалить — проверь в ClickUp.")
+            return
+        storage.unmark_task_fire(task_id)
+        await query.answer()
+        await query.edit_message_text("🗑 Удалено насовсем.")
+        return
+
+    if action == "delno":
+        await query.answer()
+        await query.edit_message_text("Отменила, задача осталась в ClickUp.")
+        return
 
 
 def _make_employee_command_handler(employee_key: str):
@@ -1772,6 +1951,14 @@ def build_application() -> Application:
     # только в личке, только владелице (см. config.EMPLOYEE_COMMANDS / _send_employee_report).
     for employee_key in config.EMPLOYEE_COMMANDS:
         app.add_handler(CommandHandler(employee_key, _make_employee_command_handler(employee_key)))
+    # Кнопки под задачами в отчётах по сотрудникам (✅/🗑/🔴/🔥, см.
+    # _employee_task_keyboard/handle_employee_task_callback).
+    app.add_handler(
+        CallbackQueryHandler(
+            handle_employee_task_callback,
+            pattern=r"^emp:(done|urgent|fire|delask|delyes|delno):",
+        )
+    )
     # Личка — обычный разговор с персоной Marina Twin.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     # Группы — тихий сбор переписки, без ответов.
