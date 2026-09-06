@@ -134,17 +134,20 @@ CLICKUP_ASSIGNEE_MAP = {
 }
 
 # Персональные команды по сотрудникам (по просьбе владелицы, 06.09): /lili /olga /sveta
-# /ilya /nazgul /alex /ub — каждая выгружает в личку владелицы открытые задачи ЭТОГО
-# человека сразу по всем 4 проектным спискам (config.CLICKUP_LIST_IDS), а не по
-# отдельным личным папкам ClickUp ("Саша"/"Ник"/... в иерархии воркспейса) — это
-# ручной архив вне зоны ответственности бота. Ключ словаря = имя Telegram-команды без
-# "/" (буквы/цифры/"_", кириллица Telegram не распознаёт как команду — поэтому
-# "Назгул" стала "/nazgul"). "assignee_id" — ClickUp user_id для серверной фильтрации
-# (см. clickup_client.get_open_tasks); у Саши реального аккаунта ClickUp нет, поэтому
-# для него assignee_id=None, а вместо этого задаётся "name_prefix" — задачи находятся
-# по буквальному текстовому префиксу "Саша:" в начале названия задачи (так их заводит
-# task_extractor.py, когда не может сопоставить упомянутое имя с реальным ClickUp-
-# аккаунтом, см. CLICKUP_ASSIGNEE_MAP выше).
+# /ilya /nazgul /alex /ub /marina /nikolay /nick (двое последних добавлены позже той же
+# части 06.09 — Николай Хребет и Ник Галт) — каждая выгружает в личку владелицы открытые
+# задачи ЭТОГО человека по всему ClickUp workspace (см. CLICKUP_TEAM_WIDE_ENABLED выше и
+# bot.py::_send_employee_report), а не по отдельным личным папкам ClickUp ("Саша"/"Ник"/...
+# в иерархии воркспейса) — это ручной архив вне зоны ответственности бота. Ключ словаря =
+# имя Telegram-команды без "/" (буквы/цифры/"_", кириллица Telegram не распознаёт как
+# команду — поэтому "Назгул" стала "/nazgul"). "assignee_id" — ClickUp user_id для
+# серверной фильтрации (см. clickup_client.get_open_tasks/get_open_tasks_team_wide); у
+# Саши реального аккаунта ClickUp нет, поэтому для него assignee_id=None, а вместо этого
+# задаётся "name_prefix" — задачи находятся по буквальному текстовому префиксу "Саша:" в
+# начале названия задачи (так их заводит task_extractor.py, когда не может сопоставить
+# упомянутое имя с реальным ClickUp-аккаунтом, см. CLICKUP_ASSIGNEE_MAP выше). Для КАЖДОГО
+# ключа этого словаря bot.py автоматически заводит ещё и "weekly"-версию команды
+# (например "/nikolayweekly") — см. CLICKUP_LIST_WEEKLY ниже.
 EMPLOYEE_COMMANDS = {
     "lili": {"label": "Лили", "assignee_id": 113538039},
     "olga": {"label": "Ольга", "assignee_id": 113538035},
@@ -154,7 +157,21 @@ EMPLOYEE_COMMANDS = {
     "ub": {"label": "Юрий Борисович", "assignee_id": 113538374},
     "alex": {"label": "Саша", "assignee_id": None, "name_prefix": "саша:"},
     "marina": {"label": "Марина", "assignee_id": 113538088},
+    "nikolay": {"label": "Николай Хребет", "assignee_id": 113538064},
+    "nick": {"label": "Ник Галт", "assignee_id": 113538351},
 }
+
+# Список ClickUp "WEEKLY TASKS" (id 901819932817) в пространстве "РАСПИСАНИЕ" — по прямой
+# просьбе владелицы (06.09): для каждого человека из EMPLOYEE_COMMANDS выше заведена ещё
+# и "weekly"-команда (например "/nikolayweekly", см. bot.py::_send_employee_weekly_report),
+# которая ищет задачи этого человека НЕ по всему ClickUp, а ТОЛЬКО в этом одном общем
+# списке — в отличие от команд без "weekly" (которые ищут по всему workspace, см.
+# CLICKUP_TEAM_ID выше). Значение — id списка, найден через
+# mcp__ClickUp__clickup_get_workspace_hierarchy (пространство "РАСПИСАНИЕ" содержит ровно
+# один список верхнего уровня — "WEEKLY TASKS"; отдельные списки "WEEKLY TASKS (copy)" в
+# других местах воркспейса — шаблоны, не эта же самая задача).
+CLICKUP_LIST_WEEKLY = os.environ.get("CLICKUP_LIST_WEEKLY", "").strip() or None
+CLICKUP_WEEKLY_ENABLED = bool(CLICKUP_API_TOKEN and CLICKUP_LIST_WEEKLY)
 
 # Часовой пояс утреннего дайджеста (IANA-имя, например "Europe/Moscow" или
 # "Asia/Almaty") и время, во сколько его слать владелице — по каждому проекту
