@@ -161,6 +161,35 @@ EMPLOYEE_COMMANDS = {
     "nick": {"label": "Ник Галт", "assignee_id": 113538351},
 }
 
+# Telegram user_id сотрудников — по прямой просьбе владелицы (часть 29): кнопка
+# "➡️ Переслать" под отчётом/задачей должна уметь переслать её конкретному человеку в
+# Telegram, а не только показывать в личке владелицы. Технически Telegram-бот может
+# писать только тем, чей user_id ему уже известен (человек должен был хоть раз сам
+# написать боту) — поэтому это НЕ автоматический разбор, а ручная настройка через
+# отдельные env-переменные (владелица присылает id/@username, дальше их можно узнать
+# через любого "id-бота" в Telegram, например @userinfobot). Пока переменная не задана
+# для кого-то — этот человек просто не появляется в списке получателей "Переслать" (см.
+# bot.py::_available_forward_recipients), без падения бота.
+_EMPLOYEE_TELEGRAM_ID_ENV = {
+    "lili": "TELEGRAM_ID_LILI",
+    "olga": "TELEGRAM_ID_OLGA",
+    "sveta": "TELEGRAM_ID_SVETA",
+    "ilya": "TELEGRAM_ID_ILYA",
+    "nazgul": "TELEGRAM_ID_NAZGUL",
+    "ub": "TELEGRAM_ID_UB",
+    "alex": "TELEGRAM_ID_ALEX",
+    "marina": "TELEGRAM_ID_MARINA",
+    "nikolay": "TELEGRAM_ID_NIKOLAY",
+    "nick": "TELEGRAM_ID_NICK",
+}
+for _employee_key, _env_name in _EMPLOYEE_TELEGRAM_ID_ENV.items():
+    _raw_tg_id = os.environ.get(_env_name, "").strip()
+    if _raw_tg_id:
+        try:
+            EMPLOYEE_COMMANDS[_employee_key]["telegram_user_id"] = int(_raw_tg_id)
+        except ValueError:
+            pass
+
 # Список ClickUp "WEEKLY TASKS" (id 901819932817) в пространстве "РАСПИСАНИЕ" — по прямой
 # просьбе владелицы (06.09): для каждого человека из EMPLOYEE_COMMANDS выше заведена ещё
 # и "weekly"-команда (например "/nikolayweekly", см. bot.py::_send_employee_weekly_report),
