@@ -163,7 +163,7 @@ EMPLOYEE_COMMANDS = {
     "sveta": {"label": "Света", "assignee_id": 113538038, "telegram_username": "claire_claire_bs"},
     "ilya": {"label": "Илья", "assignee_id": 113538037, "telegram_username": "fesius_altyn"},
     "nazgul": {"label": "Назгул", "assignee_id": 113538036, "telegram_username": "asisst_0_0"},
-    "ub": {"label": "Юрий Борисович", "assignee_id": 113538374},
+    "ub": {"label": "Юрий Борисович", "assignee_id": 113538374, "telegram_username": "k601570v"},
     "alex": {"label": "Саша", "assignee_id": None, "name_prefix": "саша:"},
     "marina": {"label": "Марина", "assignee_id": 113538088},
     "nikolay": {"label": "Николай Хребет", "assignee_id": 113538064, "telegram_username": "nikolai_ip_lawyer"},
