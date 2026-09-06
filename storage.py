@@ -191,6 +191,28 @@ def _connect() -> sqlite3.Connection:
     # обычный разговор с Twin или в лог задач). Сбрасывается обратно в 0, как только
     # исправленный текст разобран (см. storage.update_meeting_details).
     _ensure_columns(conn, "pending_meetings", {"awaiting_edit": "INTEGER NOT NULL DEFAULT 0"})
+    # "Память" группового чата (по прямой просьбе владелицы, 06.09) — скользящая
+    # текстовая сводка того, что обсуждалось в чате, чтобы предлагаемые Мариной
+    # черновики ответов (см. escalation.draft_initial_answer, chat_summary) учитывали
+    # контекст более ранней переписки, а не только сам вопрос. last_message_id —
+    # id последнего обработанного сообщения из group_messages (курсор, НЕ связан с
+    # флагом flushed — тот про выгрузку в ClickUp, это независимый процесс) — по нему
+    # periodic_memory_job (bot.py) находит только новые сообщения при следующем
+    # обновлении. ВАЖНО (платформенное ограничение Telegram Bot API, не решается кодом):
+    # group_messages, а значит и эта память, копит только то, что бот реально видел
+    # начиная с момента, как его добавили в чат и он начал получать сообщения — доступа
+    # к истории чата ДО этого момента у бота нет и не может быть через Bot API.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_memory (
+            chat_id INTEGER PRIMARY KEY,
+            chat_title TEXT,
+            summary TEXT NOT NULL DEFAULT '',
+            last_message_id INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -298,6 +320,73 @@ def get_chats_with_pending() -> list[tuple[int, str]]:
         """
     ).fetchall()
     return [(r[0], r[1] or str(r[0])) for r in rows]
+
+
+# --- "Память" группового чата (см. chat_memory.py, periodic_memory_job в bot.py) ---
+
+def get_messages_since(chat_id: int, since_id: int, limit: int = 500) -> list[dict]:
+    """Сообщения чата с id строго больше since_id, по возрастанию — независимый от
+    flushed (ClickUp) курсор для наращивания памяти чата: id в group_messages растёт
+    монотонно и строки никогда не удаляются, так что это надёжная точка возобновления
+    между запусками periodic_memory_job. limit — защитный потолок на один проход (при
+    очень активном чате память всё равно догонит его за несколько следующих запусков
+    job, а не потеряет остаток)."""
+    rows = _conn.execute(
+        "SELECT id, user_name, text, ts FROM group_messages WHERE chat_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
+        (chat_id, since_id, limit),
+    ).fetchall()
+    return [{"id": r[0], "user_name": r[1], "text": r[2], "ts": r[3]} for r in rows]
+
+
+def get_chats_with_new_messages_for_memory() -> list[tuple[int, str]]:
+    """Групповые чаты, у которых есть сообщения новее последнего обработанного для
+    памяти этого чата (включая чаты, где памяти ещё вообще нет — тогда курсор считается
+    равным 0, то есть все накопленные сообщения новые). Используется periodic_memory_job
+    (bot.py), чтобы не перебирать на каждый тик все чаты подряд, а только те, где реально
+    есть что добавить в сводку."""
+    rows = _conn.execute(
+        """
+        SELECT gm.chat_id, MAX(gm.chat_title)
+        FROM group_messages gm
+        LEFT JOIN chat_memory cm ON cm.chat_id = gm.chat_id
+        WHERE gm.id > COALESCE(cm.last_message_id, 0)
+        GROUP BY gm.chat_id
+        """
+    ).fetchall()
+    return [(r[0], r[1] or str(r[0])) for r in rows]
+
+
+def get_chat_memory(chat_id: int) -> dict | None:
+    """Текущая сводка памяти чата, если уже накоплена хоть раз (см. save_chat_memory).
+    None — если по этому чату памяти ещё нет (новый чат либо ещё не дошла очередь
+    periodic_memory_job)."""
+    row = _conn.execute(
+        "SELECT summary, last_message_id, updated_at FROM chat_memory WHERE chat_id = ?",
+        (chat_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {"summary": row[0], "last_message_id": row[1], "updated_at": row[2]}
+
+
+def save_chat_memory(chat_id: int, chat_title: str, summary: str, last_message_id: int) -> None:
+    """Перезаписывает (или создаёт) сводку памяти чата целиком — это именно
+    "скользящее" обновление: chat_memory.update_chat_memory каждый раз просит модель
+    построить НОВУЮ полную сводку на основе старой + новых сообщений, а не дописывает
+    к старому тексту, поэтому здесь просто REPLACE, а не APPEND."""
+    _conn.execute(
+        """
+        INSERT INTO chat_memory (chat_id, chat_title, summary, last_message_id, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            chat_title = excluded.chat_title,
+            summary = excluded.summary,
+            last_message_id = excluded.last_message_id,
+            updated_at = excluded.updated_at
+        """,
+        (chat_id, chat_title, summary, last_message_id, time.time()),
+    )
+    _conn.commit()
 
 
 def log_pushed_task(chat_id: int, chat_title: str, clickup_task_id: str, title: str, project: str | None = None) -> None:

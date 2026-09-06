@@ -186,6 +186,16 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").
 GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "").strip() or None
 GOOGLE_CALENDAR_ENABLED = bool(GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_CALENDAR_ID)
 
+# Как часто обновлять "память" групповых чатов — скользящую текстовую сводку того, что
+# обсуждалось в каждом чате, чтобы черновики ответов Марине (см. escalation.draft_initial_answer,
+# chat_memory.py, bot.py::periodic_memory_job) учитывали более раннюю переписку, а не только
+# сам вопрос (по прямой просьбе владелицы, 06.09). Работает независимо от
+# CLICKUP_FLUSH_INTERVAL_MINUTES выше — это отдельный процесс со своим курсором
+# (storage.chat_memory), не связанный с выгрузкой задач в ClickUp. Раз в 30 минут по
+# умолчанию — компромисс между свежестью памяти и лишними вызовами лёгкой модели в тихих
+# чатах (сам job пропускает чаты без новых сообщений, см. get_chats_with_new_messages_for_memory).
+MEMORY_UPDATE_INTERVAL_MINUTES = int(os.environ.get("MEMORY_UPDATE_INTERVAL_MINUTES", "30"))
+
 # Список ClickUp (папка "Расписание Марина Twin", список "Встречи"), куда зеркалятся все
 # подтверждённые встречи из Google Calendar — по просьбе владелицы, чтобы видеть своё
 # расписание и в ClickUp тоже. Список создан отдельно от 4 проектных
