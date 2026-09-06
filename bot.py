@@ -1807,9 +1807,9 @@ async def handle_tasksall_command(update: Update, context: ContextTypes.DEFAULT_
         await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
 
 
-# Небольшая пауза между сообщениями отчёта по сотруднику (по прямой просьбе владелицы,
-# часть 28: теперь на каждую задачу отдельное Telegram-сообщение со своими кнопками —
-# см. _send_task_button_report) — при большом числе задач (например, у Лили их около 80)
+# Небольшая пауза между сообщениями режима правки (по прямой просьбе владелицы, часть 28:
+# на каждую задачу отдельное Telegram-сообщение со своими кнопками — см.
+# _send_edit_mode_report) — при большом числе задач (например, у Лили их около 80)
 # рассылка десятков сообщений подряд без паузы рискует упереться в лимит Telegram на
 # сообщения в один чат (см. также RetryAfter-обработку в _send_owner_message_with_retry).
 _TASK_MESSAGE_DELAY_SECONDS = 0.35
@@ -1831,12 +1831,10 @@ def _format_employee_task_lines(tasks: list[dict], start_index: int = 1) -> list
     дописывается местоположение задачи (пространство / папка / список — см.
     _format_task_location; по прямой просьбе владелицы, часть 27). start_index — чтобы
     сквозная нумерация не сбивалась, если этот список задач — часть большего отчёта.
-    С части 28 каждая строка уходит отдельным Telegram-сообщением сразу со своими
-    кнопками под ней (см. _send_task_button_report/_employee_task_keyboard) — раньше
-    (часть 24-27) номер строки специально совпадал с номером на кнопках, потому что много
-    задач с кнопками шли пачкой в одном сообщении и Telegram не даёт вставить кнопку
-    внутрь строки текста; теперь, когда на сообщение ровно одна задача, эта привязка не
-    нужна, но сама нумерация остаётся — просто для читаемости длинного списка.
+    Используется и для компактного списка по умолчанию (см. _send_compact_report, часть
+    29, без кнопок под строками), и для режима правки (см. _send_edit_mode_report, часть
+    28-29 — там каждая строка уходит отдельным Telegram-сообщением сразу со своими
+    кнопками под ней, см. _employee_task_keyboard).
     Задачи, помеченные "🔥 Горит" (см. _is_fire), получают значок 🔥 вместо обычного 🔴 у
     срочных — визуально понятно, что задача поднята вручную, а не просто высокий
     приоритет в ClickUp."""
@@ -1852,30 +1850,60 @@ def _format_employee_task_lines(tasks: list[dict], start_index: int = 1) -> list
 
 
 def _employee_task_keyboard(task: dict, include_weekly_button: bool = False) -> InlineKeyboardMarkup:
-    """Строит ряд кнопок-действий под ОДНОЙ задачей отчёта по сотруднику (по прямой
-    просьбе владелицы, 06.09-часть 24, кнопка "📆 Weekly" добавлена в части 27, реальный
-    текст вместо номеров-значков — часть 28, см. handle_employee_task_callback):
-    "✅ Готово" (закрывает задачу в ClickUp), "🗑 Удалить" (удаляет из ClickUp насовсем, с
-    шагом подтверждения), "🔴 Срочно" (ставит приоритет Urgent в ClickUp), "🔥 Горит"
-    (ставит/снимает настоящий тег ClickUp "кричащая задача", см. _is_fire — поднимает
-    задачу наверх списка при следующем вызове команды), и, если include_weekly_button —
-    5-я кнопка "📆 Weekly" (переносит задачу в список WEEKLY TASKS со статусом Unsorted;
-    только там, где задачи и так ищутся по всему ClickUp — см. _send_employee_report —
-    переносить в weekly-отчётах, которые и так уже из WEEKLY TASKS, бессмысленно).
-    С части 28 каждая задача — отдельное Telegram-сообщение (см.
-    _send_task_button_report), поэтому кнопки больше не нужно подписывать номером задачи —
-    сама привязка "кнопка под своей задачей" теперь физическая, а не через совпадение
-    номеров."""
+    """Строит кнопки-действия под ОДНОЙ задачей в режиме правки (по прямой просьбе
+    владелицы, 06.09-часть 24, кнопка "📆 Weekly" — часть 27, "➡️ Переслать" — часть 29,
+    см. handle_employee_task_callback). Первый ряд: "✅ Готово" (закрывает задачу в
+    ClickUp), "🗑 Удалить" (удаляет из ClickUp насовсем, с шагом подтверждения),
+    "➡️ Переслать" (пересылает эту задачу конкретному сотруднику в Telegram, см.
+    _available_forward_recipients — рядом с "Удалить" по прямой просьбе владелицы).
+    Второй ряд: "🔴 Срочно" (ставит приоритет Urgent в ClickUp), "🔥 Горит" (ставит/снимает
+    настоящий тег ClickUp "кричащая задача", см. _is_fire — поднимает задачу наверх списка
+    при следующем вызове команды), и, если include_weekly_button — "📆 Weekly" (переносит
+    задачу в список WEEKLY TASKS со статусом Unsorted; только там, где задачи и так ищутся
+    по всему ClickUp — переносить в weekly-отчётах, которые и так уже из WEEKLY TASKS,
+    бессмысленно). Разбито на 2 ряда, а не 1 (как в части 28), чтобы 6 подписанных
+    текстом кнопок не становились слишком узкими/тесными на экране телефона.
+    Показывается только в режиме правки (см. _send_edit_mode_report, попадаем туда через
+    кнопку "✏️ Править" под компактным списком, часть 29) — компактный список сам по себе
+    кнопок под задачами не несёт."""
     task_id = task["id"]
-    row = [
+    row1 = [
         InlineKeyboardButton("✅ Готово", callback_data=f"emp:done:{task_id}"),
         InlineKeyboardButton("🗑 Удалить", callback_data=f"emp:delask:{task_id}"),
+        InlineKeyboardButton("➡️ Переслать", callback_data=f"emp:fwdask:{task_id}"),
+    ]
+    row2 = [
         InlineKeyboardButton("🔴 Срочно", callback_data=f"emp:urgent:{task_id}"),
         InlineKeyboardButton("🔥 Горит", callback_data=f"emp:fire:{task_id}"),
     ]
     if include_weekly_button:
-        row.append(InlineKeyboardButton("📆 Weekly", callback_data=f"emp:weekly:{task_id}"))
-    return InlineKeyboardMarkup([row])
+        row2.append(InlineKeyboardButton("📆 Weekly", callback_data=f"emp:weekly:{task_id}"))
+    return InlineKeyboardMarkup([row1, row2])
+
+
+def _available_forward_recipients() -> list[tuple[str, str]]:
+    """Возвращает [(employee_key, label), ...] только для тех сотрудников, у кого задан
+    telegram_user_id (см. config._EMPLOYEE_TELEGRAM_ID_ENV) — по прямой просьбе
+    владелицы, часть 29: пересылка технически возможна только тем, чей Telegram user_id
+    уже известен (человек должен был хоть раз сам написать боту), поэтому список
+    получателей строится из уже настроенных, а не из всех config.EMPLOYEE_COMMANDS."""
+    return [
+        (key, employee["label"])
+        for key, employee in config.EMPLOYEE_COMMANDS.items()
+        if employee.get("telegram_user_id")
+    ]
+
+
+def _no_forward_recipients_text() -> str:
+    """Единый текст на случай, если владелица ещё не прислала ни одного telegram
+    id/@username сотрудников (см. _available_forward_recipients) — и кнопка "Переслать"
+    (что на компактном списке, что под отдельной задачей) не падает, а прямо объясняет,
+    чего не хватает."""
+    return (
+        "Пока не знаю ничьих Telegram id — пришли мне @username или numeric id нужных "
+        "сотрудников (например, попроси их написать что-нибудь боту @userinfobot, он в "
+        "ответ покажет их id), и я включу пересылку."
+    )
 
 
 async def _send_owner_message_with_retry(
@@ -1883,10 +1911,11 @@ async def _send_owner_message_with_retry(
 ) -> None:
     """Шлёт одно сообщение владелице в личку с одной попыткой повтора при HTTP 429 от
     Telegram (RetryAfter) — по прямой просьбе владелицы, часть 28: с переходом на "одно
-    сообщение на задачу" в _send_task_button_report сообщений в один чат подряд стало
-    ощутимо больше (например, у Лили ~80 задач), и Telegram иногда просит подождать между
-    сообщениями в один и тот же чат. Любая другая ошибка отправки просто поднимается
-    дальше — вызывающий код сам решает, как её залогировать/остановить рассылку."""
+    сообщение на задачу" в режиме правки (см. _send_edit_mode_report) сообщений в один чат
+    подряд стало ощутимо больше (например, у Лили ~80 задач), и Telegram иногда просит
+    подождать между сообщениями в один и тот же чат. Любая другая ошибка отправки просто
+    поднимается дальше — вызывающий код сам решает, как её залогировать/остановить
+    рассылку."""
     try:
         await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text, reply_markup=reply_markup)
     except RetryAfter as e:
@@ -1894,26 +1923,92 @@ async def _send_owner_message_with_retry(
         await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text, reply_markup=reply_markup)
 
 
-async def _send_task_button_report(
+_EDIT_MODE_BATCH_SIZE = 10
+
+
+def _report_action_keyboard(kind: str, key: str) -> InlineKeyboardMarkup:
+    """Кнопки под компактным списком задач (по прямой просьбе владелицы, часть 29):
+    "✏️ Править" — открывает режим правки для этого же набора задач (см.
+    handle_report_action_callback/_send_edit_mode_report), "➡️ Переслать" — пересылает
+    ВЕСЬ этот список конкретному сотруднику в Telegram (см.
+    _available_forward_recipients/_forward_report_to_employee). kind/key кодируют, какой
+    именно отчёт заново запросить при нажатии (см. _fetch_report_data) — "emp"/employee_key
+    (по всему ClickUp), "empw"/employee_key (только WEEKLY TASKS этого человека),
+    "ws"/command_key (WEEKLY TASKS по статусу) — короткие, чтобы не упереться в лимит
+    Telegram на длину callback_data (64 байта)."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✏️ Править", callback_data=f"rpt:edit:{kind}:{key}"),
+                InlineKeyboardButton("➡️ Переслать", callback_data=f"rpt:fwd:{kind}:{key}"),
+            ]
+        ]
+    )
+
+
+async def _send_compact_report(
+    context: ContextTypes.DEFAULT_TYPE,
+    kind: str,
+    key: str,
+    label: str,
+    scope_note: str,
+    tasks: list[dict],
+    include_weekly_button: bool = False,
+) -> None:
+    """Новый вид отчёта по умолчанию (по прямой просьбе владелицы, часть 29, заменяет
+    прежний "по сообщению на задачу с кнопками" из части 28 — теперь ТАК выглядит только
+    режим правки, см. _send_edit_mode_report): просто пронумерованный список задач с
+    пометками 🔴/🔥 (см. _format_employee_task_lines), БЕЗ кнопок под каждой строкой, а под
+    ВСЕМ списком — 2 кнопки, "✏️ Править" и "➡️ Переслать" (см. _report_action_keyboard).
+    Список может не поместиться в одно Telegram-сообщение (лимит 4096 символов) — тогда
+    режется на несколько (см. _split_for_telegram), а кнопки навешиваются только на
+    последнее сообщение (Telegram не даёт кнопки нескольким сообщениям сразу).
+    include_weekly_button передаётся дальше, в _send_edit_mode_report, если нажмут
+    "Править" — сам компактный список кнопок под задачами не показывает."""
+    if not tasks:
+        try:
+            await context.bot.send_message(
+                chat_id=config.OWNER_USER_ID, text=f"👤 {label} — открытых задач {scope_note} не нашла.",
+            )
+        except Exception:
+            logger.exception("Не удалось отправить отчёт по сотруднику (%s) владелице", label)
+        return
+
+    tasks = _sort_tasks_fire_first(tasks)
+    total = len(tasks)
+    header = f"👤 {label} — {scope_note} ({total}):"
+    text = header + "\n" + "\n".join(_format_employee_task_lines(tasks, start_index=1))
+    chunks = _split_for_telegram(text)
+    keyboard = _report_action_keyboard(kind, key)
+    try:
+        for i, chunk in enumerate(chunks):
+            await context.bot.send_message(
+                chat_id=config.OWNER_USER_ID,
+                text=chunk,
+                reply_markup=keyboard if i == len(chunks) - 1 else None,
+            )
+    except Exception:
+        logger.exception("Не удалось отправить отчёт по сотруднику (%s) владелице", label)
+
+
+async def _send_edit_mode_report(
     context: ContextTypes.DEFAULT_TYPE,
     label: str,
     scope_note: str,
     tasks: list[dict],
     include_weekly_button: bool = False,
 ) -> None:
-    """Общая "хвостовая" часть _send_employee_report, _send_employee_weekly_report (часть
-    24) и _send_weekly_status_report (часть 27) — присылает заголовок отчёта, а затем
-    КАЖДУЮ задачу отдельным Telegram-сообщением сразу со своими кнопками-действиями под
-    ней (см. _employee_task_keyboard/handle_employee_task_callback) — по прямой просьбе
-    владелицы, часть 28: раньше кнопки шли одной пачкой под текстом сразу нескольких
-    задач (до 15 в одном сообщении), теперь у каждой задачи свои кнопки прямо под её
-    текстом. Задачи, помеченные "🔥 Горит", показываются первыми (см.
-    _sort_tasks_fire_first). Между сообщениями — небольшая пауза
+    """Режим правки (кнопка "✏️ Править" под компактным списком, см.
+    _send_compact_report/handle_report_action_callback) — по прямой просьбе владелицы,
+    часть 29: список разбивается на партии по _EDIT_MODE_BATCH_SIZE (10) задач, перед
+    каждой партией — заголовок ("часть N/M"), и КАЖДАЯ задача внутри партии уходит
+    отдельным Telegram-сообщением сразу со своими кнопками-действиями под ней (см.
+    _employee_task_keyboard/handle_employee_task_callback) — так у каждой задачи буквально
+    свои кнопки прямо под её текстом (было заведено в части 28, здесь только переехало из
+    отчёта по умолчанию в отдельный режим правки). Задачи, помеченные "🔥 Горит",
+    показываются первыми (см. _sort_tasks_fire_first). Между сообщениями — небольшая пауза
     (_TASK_MESSAGE_DELAY_SECONDS) во избежание лимита Telegram на сообщения в один чат
-    (см. _send_owner_message_with_retry). scope_note — короткая приписка в заголовке
-    отчёта, откуда именно эти задачи ("по всему ClickUp" / "из WEEKLY TASKS" / "из WEEKLY
-    TASKS · статус «Понедельник»"), чтобы было понятно, какую именно команду вызвали.
-    include_weekly_button — см. _employee_task_keyboard."""
+    (см. _send_owner_message_with_retry)."""
     if not tasks:
         try:
             await context.bot.send_message(
@@ -1926,15 +2021,64 @@ async def _send_task_button_report(
     tasks = _sort_tasks_fire_first(tasks)
     total = len(tasks)
     lines = _format_employee_task_lines(tasks, start_index=1)
+    batches = [
+        list(zip(tasks[i : i + _EDIT_MODE_BATCH_SIZE], lines[i : i + _EDIT_MODE_BATCH_SIZE]))
+        for i in range(0, total, _EDIT_MODE_BATCH_SIZE)
+    ]
     try:
-        await _send_owner_message_with_retry(context, f"👤 {label} — {scope_note} ({total}):")
-        for offset, (task, line) in enumerate(zip(tasks, lines)):
-            keyboard = _employee_task_keyboard(task, include_weekly_button)
-            await _send_owner_message_with_retry(context, line, reply_markup=keyboard)
-            if offset < total - 1:
-                await asyncio.sleep(_TASK_MESSAGE_DELAY_SECONDS)
+        for batch_num, batch in enumerate(batches, start=1):
+            header = f"✏️ Правка: {label} — {scope_note} ({total})"
+            if len(batches) > 1:
+                header += f", часть {batch_num}/{len(batches)}"
+            await _send_owner_message_with_retry(context, header)
+            await asyncio.sleep(_TASK_MESSAGE_DELAY_SECONDS)
+            for offset, (task, line) in enumerate(batch):
+                keyboard = _employee_task_keyboard(task, include_weekly_button)
+                await _send_owner_message_with_retry(context, line, reply_markup=keyboard)
+                is_last_message = batch_num == len(batches) and offset == len(batch) - 1
+                if not is_last_message:
+                    await asyncio.sleep(_TASK_MESSAGE_DELAY_SECONDS)
     except Exception:
         logger.exception("Не удалось отправить отчёт по сотруднику (%s) владелице", label)
+
+
+async def _forward_report_to_employee(
+    context: ContextTypes.DEFAULT_TYPE, label: str, scope_note: str, tasks: list[dict], recipient_key: str
+) -> None:
+    """Пересылает ВЕСЬ список задач (тот же формат, что и компактный отчёт, см.
+    _format_employee_task_lines) конкретному сотруднику в Telegram — по прямой просьбе
+    владелицы, часть 29 (кнопка "➡️ Переслать" под компактным списком, см.
+    handle_report_action_callback). recipient_key — ключ config.EMPLOYEE_COMMANDS, у
+    которого уже проверено (см. _available_forward_recipients), что задан
+    telegram_user_id."""
+    recipient = config.EMPLOYEE_COMMANDS.get(recipient_key)
+    recipient_chat_id = recipient.get("telegram_user_id") if recipient else None
+    if not recipient or not recipient_chat_id:
+        await context.bot.send_message(
+            chat_id=config.OWNER_USER_ID, text="У этого человека пока не настроен Telegram id."
+        )
+        return
+    if not tasks:
+        await context.bot.send_message(
+            chat_id=config.OWNER_USER_ID, text=f"«{label}» — открытых задач {scope_note} нет, пересылать нечего."
+        )
+        return
+    tasks = _sort_tasks_fire_first(tasks)
+    header = f"📤 Марина переслала: {label} — {scope_note} ({len(tasks)}):"
+    text = header + "\n" + "\n".join(_format_employee_task_lines(tasks, start_index=1))
+    try:
+        for chunk in _split_for_telegram(text):
+            await context.bot.send_message(chat_id=recipient_chat_id, text=chunk)
+    except Exception:
+        logger.exception("Не удалось переслать отчёт «%s» пользователю %s", label, recipient_key)
+        await context.bot.send_message(
+            chat_id=config.OWNER_USER_ID,
+            text=f"Не смогла переслать «{label}» — проверь, писал ли этот человек боту раньше.",
+        )
+        return
+    await context.bot.send_message(
+        chat_id=config.OWNER_USER_ID, text=f"✅ Переслала «{label}» — {recipient['label']}."
+    )
 
 
 async def _send_employee_report(context: ContextTypes.DEFAULT_TYPE, employee_key: str) -> None:
@@ -1951,11 +2095,32 @@ async def _send_employee_report(context: ContextTypes.DEFAULT_TYPE, employee_key
     этом случае приходится тянуть ВСЕ открытые задачи workspace без серверного фильтра и
     отфильтровывать по префиксу уже на своей стороне.
 
-    С 06.09 (часть 24) каждая задача сопровождается рядом кнопок-действий; с части 28
-    (по прямой просьбе владелицы) — отдельным Telegram-сообщением на каждую задачу, кнопки
-    прямо под ней (см. _send_task_button_report)."""
+    С 06.09 (часть 24) каждая задача сопровождается кнопками-действиями, но только в
+    режиме правки (часть 29, по прямой просьбе владелицы) — по умолчанию теперь присылаю
+    компактный пронумерованный список без кнопок под каждой строкой, а кнопки "Править"/
+    "Переслать" — под всем списком (см. _send_compact_report/_fetch_employee_report_data)."""
     if config.OWNER_USER_ID is None:
         return
+    data = _fetch_employee_report_data(employee_key)
+    if data is None:
+        label = config.EMPLOYEE_COMMANDS[employee_key]["label"]
+        text = f"Не смогла получить задачи «{label}» из ClickUp — попробую в следующий раз."
+        try:
+            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text)
+        except Exception:
+            logger.exception("Не удалось отправить отчёт по сотруднику %s владелице", employee_key)
+        return
+    label, scope_note, tasks, include_weekly_button = data
+    await _send_compact_report(context, "emp", employee_key, label, scope_note, tasks, include_weekly_button)
+
+
+def _fetch_employee_report_data(employee_key: str) -> tuple[str, str, list[dict], bool] | None:
+    """Живьём тянет данные для _send_employee_report — вынесено отдельно от отправки,
+    чтобы дёрнуть те же самые свежие данные из ClickUp повторно, когда владелица нажимает
+    "✏️ Править"/"➡️ Переслать" под уже присланным компактным списком (см.
+    handle_report_action_callback, часть 29), без дублирования этой логики в двух местах.
+    Возвращает (label, scope_note, tasks, include_weekly_button) или None при ошибке
+    ClickUp (сообщение об ошибке в этом случае формирует вызывающий код)."""
     employee = config.EMPLOYEE_COMMANDS[employee_key]
     label = employee["label"]
     assignee_id = employee.get("assignee_id")
@@ -1964,17 +2129,10 @@ async def _send_employee_report(context: ContextTypes.DEFAULT_TYPE, employee_key
         tasks = clickup_client.get_open_tasks_team_wide(assignee_id=assignee_id)
     except Exception:
         logger.exception("Не удалось получить задачи «%s» по всему ClickUp", label)
-        text = f"Не смогла получить задачи «{label}» из ClickUp — попробую в следующий раз."
-        try:
-            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text)
-        except Exception:
-            logger.exception("Не удалось отправить отчёт по сотруднику %s владелице", employee_key)
-        return
+        return None
     if name_prefix:
         tasks = [t for t in tasks if t["name"].strip().lower().startswith(name_prefix)]
-    await _send_task_button_report(
-        context, label, "открытые задачи по всему ClickUp", tasks, include_weekly_button=True
-    )
+    return label, "открытые задачи по всему ClickUp", tasks, True
 
 
 async def _send_employee_weekly_report(context: ContextTypes.DEFAULT_TYPE, employee_key: str) -> None:
@@ -1988,6 +2146,22 @@ async def _send_employee_weekly_report(context: ContextTypes.DEFAULT_TYPE, emplo
     get_open_tasks_team_wide."""
     if config.OWNER_USER_ID is None:
         return
+    data = _fetch_employee_weekly_report_data(employee_key)
+    if data is None:
+        label = config.EMPLOYEE_COMMANDS[employee_key]["label"]
+        text = f"Не смогла получить задачи «{label}» из WEEKLY TASKS — попробую в следующий раз."
+        try:
+            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text)
+        except Exception:
+            logger.exception("Не удалось отправить weekly-отчёт по сотруднику %s владелице", employee_key)
+        return
+    label, scope_note, tasks, include_weekly_button = data
+    await _send_compact_report(context, "empw", employee_key, label, scope_note, tasks, include_weekly_button)
+
+
+def _fetch_employee_weekly_report_data(employee_key: str) -> tuple[str, str, list[dict], bool] | None:
+    """Живьём тянет данные для _send_employee_weekly_report — см.
+    _fetch_employee_report_data (тот же смысл, для weekly-версии команды)."""
     employee = config.EMPLOYEE_COMMANDS[employee_key]
     label = employee["label"]
     assignee_id = employee.get("assignee_id")
@@ -1996,15 +2170,10 @@ async def _send_employee_weekly_report(context: ContextTypes.DEFAULT_TYPE, emplo
         tasks = clickup_client.get_open_tasks(config.CLICKUP_LIST_WEEKLY, assignee_id=assignee_id)
     except Exception:
         logger.exception("Не удалось получить задачи «%s» из WEEKLY TASKS", label)
-        text = f"Не смогла получить задачи «{label}» из WEEKLY TASKS — попробую в следующий раз."
-        try:
-            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text)
-        except Exception:
-            logger.exception("Не удалось отправить weekly-отчёт по сотруднику %s владелице", employee_key)
-        return
+        return None
     if name_prefix:
         tasks = [t for t in tasks if t["name"].strip().lower().startswith(name_prefix)]
-    await _send_task_button_report(context, label, "открытые задачи из WEEKLY TASKS", tasks)
+    return label, "открытые задачи из WEEKLY TASKS", tasks, False
 
 
 async def _send_weekly_status_report(context: ContextTypes.DEFAULT_TYPE, command_key: str) -> None:
@@ -2014,10 +2183,27 @@ async def _send_weekly_status_report(context: ContextTypes.DEFAULT_TYPE, command
     TASKS с конкретным статусом (фильтр на стороне ClickUp API, см.
     clickup_client.get_open_tasks/statuses), по всем ответственным сразу — в отличие от
     персональных команд по сотрудникам (/lili /olga ...), эти НЕ привязаны к одному
-    человеку. Кнопки под задачами те же 4, что и у остальных отчётов (без 5-й "📆 Weekly»
-    — задача и так уже в WEEKLY TASKS, переносить её ещё раз некуда)."""
+    человеку. Кнопки под задачами (в режиме правки, часть 29) те же 4, что и у остальных
+    отчётов (без 5-й "📆 Weekly» — задача и так уже в WEEKLY TASKS, переносить её ещё раз
+    некуда)."""
     if config.OWNER_USER_ID is None:
         return
+    data = _fetch_weekly_status_report_data(command_key)
+    if data is None:
+        label = config.CLICKUP_WEEKLY_STATUS_COMMANDS[command_key]["label"]
+        text = f"Не смогла получить задачи «{label}» из WEEKLY TASKS — попробую в следующий раз."
+        try:
+            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text)
+        except Exception:
+            logger.exception("Не удалось отправить отчёт по статусу WEEKLY TASKS %s владелице", command_key)
+        return
+    label, scope_note, tasks, include_weekly_button = data
+    await _send_compact_report(context, "ws", command_key, label, scope_note, tasks, include_weekly_button)
+
+
+def _fetch_weekly_status_report_data(command_key: str) -> tuple[str, str, list[dict], bool] | None:
+    """Живьём тянет данные для _send_weekly_status_report — см.
+    _fetch_employee_report_data (тот же смысл, для команд по статусам WEEKLY TASKS)."""
     command = config.CLICKUP_WEEKLY_STATUS_COMMANDS[command_key]
     label = command["label"]
     status = command["status"]
@@ -2025,16 +2211,34 @@ async def _send_weekly_status_report(context: ContextTypes.DEFAULT_TYPE, command
         tasks = clickup_client.get_open_tasks(config.CLICKUP_LIST_WEEKLY, statuses=[status])
     except Exception:
         logger.exception("Не удалось получить задачи WEEKLY TASKS со статусом «%s»", status)
-        text = f"Не смогла получить задачи «{label}» из WEEKLY TASKS — попробую в следующий раз."
-        try:
-            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text)
-        except Exception:
-            logger.exception("Не удалось отправить отчёт по статусу WEEKLY TASKS %s владелице", command_key)
-        return
-    await _send_task_button_report(context, label, f"из WEEKLY TASKS · статус «{label}»", tasks)
+        return None
+    return label, f"из WEEKLY TASKS · статус «{label}»", tasks, False
 
 
-_EMPLOYEE_TASK_ACTIONS = ("done", "urgent", "fire", "weekly", "delask", "delyes", "delno")
+_REPORT_KIND_FETCHERS = {
+    "emp": _fetch_employee_report_data,
+    "empw": _fetch_employee_weekly_report_data,
+    "ws": _fetch_weekly_status_report_data,
+}
+
+
+def _fetch_report_data(kind: str, key: str) -> tuple[str, str, list[dict], bool] | None:
+    """Общая точка входа для handle_report_action_callback ("✏️ Править"/"➡️ Переслать",
+    часть 29) — по kind/key (см. _report_action_keyboard) находит нужную живую функцию из
+    _REPORT_KIND_FETCHERS и вызывает её. Неизвестный kind/key (например, старое
+    callback_data от уже неактуальной кнопки) — просто None, как и обычная ошибка ClickUp."""
+    fetcher = _REPORT_KIND_FETCHERS.get(kind)
+    if fetcher is None:
+        return None
+    try:
+        return fetcher(key)
+    except KeyError:
+        return None
+
+
+_EMPLOYEE_TASK_ACTIONS = (
+    "done", "urgent", "fire", "weekly", "delask", "delyes", "delno", "fwdask", "fwdto", "fwdcancel",
+)
 
 
 async def handle_employee_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2057,6 +2261,9 @@ async def handle_employee_task_callback(update: Update, context: ContextTypes.DE
     удаляет задачу из ClickUp НАСОВСЕМ — шаг подтверждения добавлен по прямой просьбе
     владелицы (риск случайного нажатия на маленькой кнопке в телефоне на необратимое
     действие).
+    "➡️ Переслать" (часть 29) — тоже двухшаговое: "fwdask" показывает список сотрудников,
+    у кого известен Telegram id (см. _available_forward_recipients), "fwdto" пересылает
+    ИМЕННО ЭТУ задачу выбранному сотруднику, "fwdcancel" — отмена.
     Только для владелицы — тот же общий паттерн проверки, что и у остальных callback-
     кнопок бота (см. handle_escalation_callback)."""
     query = update.callback_query
@@ -2065,7 +2272,10 @@ async def handle_employee_task_callback(update: Update, context: ContextTypes.DE
         return
 
     _, _, rest = (query.data or "").partition(":")
-    action, _, task_id = rest.partition(":")
+    rest_parts = rest.split(":")
+    action = rest_parts[0] if rest_parts else ""
+    task_id = rest_parts[1] if len(rest_parts) > 1 else ""
+    extra = rest_parts[2] if len(rest_parts) > 2 else ""
     if action not in _EMPLOYEE_TASK_ACTIONS or not task_id:
         await query.answer()
         return
@@ -2133,6 +2343,52 @@ async def handle_employee_task_callback(update: Update, context: ContextTypes.DE
         await query.answer("📆 Перенесла в WEEKLY TASKS, статус Unsorted")
         return
 
+    if action == "fwdask":
+        await query.answer()
+        recipients = _available_forward_recipients()
+        if not recipients:
+            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=_no_forward_recipients_text())
+            return
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(rlabel, callback_data=f"emp:fwdto:{task_id}:{rk}")] for rk, rlabel in recipients]
+            + [[InlineKeyboardButton("Отмена", callback_data=f"emp:fwdcancel:{task_id}")]]
+        )
+        await context.bot.send_message(
+            chat_id=config.OWNER_USER_ID, text="Кому переслать эту задачу?", reply_markup=keyboard
+        )
+        return
+
+    if action == "fwdto":
+        await query.answer()
+        recipient = config.EMPLOYEE_COMMANDS.get(extra)
+        recipient_chat_id = recipient.get("telegram_user_id") if recipient else None
+        if not recipient or not recipient_chat_id:
+            await query.edit_message_text("У этого человека пока не настроен Telegram id.")
+            return
+        try:
+            task = clickup_client.get_task(task_id)
+        except Exception:
+            logger.exception("Не удалось прочитать задачу %s перед пересылкой", task_id)
+            await query.edit_message_text("Не смогла получить задачу для пересылки — проверь в ClickUp.")
+            return
+        if not task:
+            await query.edit_message_text("Задача не найдена (возможно, уже удалена).")
+            return
+        line = _format_employee_task_lines([task], start_index=1)[0]
+        try:
+            await context.bot.send_message(chat_id=recipient_chat_id, text=f"📤 Марина переслала задачу:\n{line}")
+        except Exception:
+            logger.exception("Не удалось переслать задачу %s пользователю %s", task_id, extra)
+            await query.edit_message_text("Не смогла переслать — проверь, писал ли этот человек боту раньше.")
+            return
+        await query.edit_message_text(f"✅ Переслала задачу — {recipient['label']}.")
+        return
+
+    if action == "fwdcancel":
+        await query.answer()
+        await query.edit_message_text("Отменила пересылку.")
+        return
+
     if action == "delask":
         await query.answer()
         try:
@@ -2172,6 +2428,80 @@ async def handle_employee_task_callback(update: Update, context: ContextTypes.DE
         await query.answer()
         await query.edit_message_text("Отменила, задача осталась в ClickUp.")
         return
+
+
+async def handle_report_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопки "✏️ Править"/"➡️ Переслать" под компактным списком задач (см.
+    _send_compact_report/_report_action_keyboard) — по прямой просьбе владелицы, часть 29.
+    callback_data: "rpt:edit:<kind>:<key>" / "rpt:fwd:<kind>:<key>" /
+    "rpt:fwdto:<kind>:<key>:<recipient_key>" / "rpt:fwdcancel:<kind>:<key>".
+    "edit" — заново тянет живые данные (см. _fetch_report_data) и открывает режим правки
+    (см. _send_edit_mode_report, задачи партиями по 10 с кнопками под каждой).
+    "fwd" — показывает список сотрудников с известным Telegram id (см.
+    _available_forward_recipients), "fwdto" пересылает ВЕСЬ список выбранному сотруднику
+    (см. _forward_report_to_employee), "fwdcancel" — отмена. Только для владелицы — тот же
+    общий паттерн проверки, что и у handle_employee_task_callback."""
+    query = update.callback_query
+    if config.OWNER_USER_ID is not None and query.from_user.id != config.OWNER_USER_ID:
+        await query.answer()
+        return
+
+    parts = (query.data or "").split(":")
+    if len(parts) < 4 or parts[0] != "rpt":
+        await query.answer()
+        return
+    action, kind, key = parts[1], parts[2], parts[3]
+    recipient_key = parts[4] if len(parts) > 4 else ""
+
+    if action == "edit":
+        await query.answer()
+        data = _fetch_report_data(kind, key)
+        if data is None:
+            await context.bot.send_message(
+                chat_id=config.OWNER_USER_ID, text="Не смогла получить свежие задачи из ClickUp — попробуй ещё раз."
+            )
+            return
+        label, scope_note, tasks, include_weekly_button = data
+        await _send_edit_mode_report(context, label, scope_note, tasks, include_weekly_button)
+        return
+
+    if action == "fwd":
+        await query.answer()
+        recipients = _available_forward_recipients()
+        if not recipients:
+            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=_no_forward_recipients_text())
+            return
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(rlabel, callback_data=f"rpt:fwdto:{kind}:{key}:{rk}")]
+                for rk, rlabel in recipients
+            ]
+            + [[InlineKeyboardButton("Отмена", callback_data=f"rpt:fwdcancel:{kind}:{key}")]]
+        )
+        await context.bot.send_message(chat_id=config.OWNER_USER_ID, text="Кому переслать список?", reply_markup=keyboard)
+        return
+
+    if action == "fwdto":
+        await query.answer()
+        if not recipient_key:
+            return
+        await query.edit_message_text("Пересылаю…")
+        data = _fetch_report_data(kind, key)
+        if data is None:
+            await context.bot.send_message(
+                chat_id=config.OWNER_USER_ID, text="Не смогла получить свежие задачи из ClickUp — попробуй ещё раз."
+            )
+            return
+        label, scope_note, tasks, _ = data
+        await _forward_report_to_employee(context, label, scope_note, tasks, recipient_key)
+        return
+
+    if action == "fwdcancel":
+        await query.answer()
+        await query.edit_message_text("Отменила пересылку.")
+        return
+
+    await query.answer()
 
 
 def _make_employee_command_handler(employee_key: str):
@@ -2382,7 +2712,7 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
         for key, e in config.EMPLOYEE_COMMANDS.items()
     ]
     sections.append(
-        "👤 Задачи по сотрудникам (весь ClickUp, с кнопками ✅/🗑/🔴/🔥/📆 под каждой):\n"
+        "👤 Задачи по сотрудникам (весь ClickUp, список + кнопки «Править»/«Переслать» внизу):\n"
         + "\n".join(employee_lines)
     )
 
@@ -2397,7 +2727,7 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
         for key, c in config.CLICKUP_WEEKLY_STATUS_COMMANDS.items()
     ]
     sections.append(
-        "📆 Задачи WEEKLY TASKS по статусу (с кнопками ✅/🗑/🔴/🔥 под каждой):\n"
+        "📆 Задачи WEEKLY TASKS по статусу (список + кнопки «Править»/«Переслать» внизу):\n"
         + "\n".join(weekly_status_lines)
     )
 
@@ -2466,15 +2796,19 @@ def build_application() -> Application:
     # /commands — только в личке, только владелице: краткая справка по всем командам бота
     # (см. handle_commands_command).
     app.add_handler(CommandHandler("commands", handle_commands_command))
-    # Кнопки под задачами в отчётах по сотрудникам (✅/🗑/🔴/🔥, плюс 📆 Weekly в
-    # командах по сотрудникам без "weekly" — см. _employee_task_keyboard/
-    # handle_employee_task_callback).
+    # Кнопки под задачами в РЕЖИМЕ ПРАВКИ отчётов по сотрудникам (✅/🗑/➡️/🔴/🔥, плюс
+    # 📆 Weekly в командах по сотрудникам без "weekly" — см. _employee_task_keyboard/
+    # handle_employee_task_callback; "➡️ Переслать" — часть 29).
     app.add_handler(
         CallbackQueryHandler(
             handle_employee_task_callback,
-            pattern=r"^emp:(done|urgent|fire|weekly|delask|delyes|delno):",
+            pattern=r"^emp:(done|urgent|fire|weekly|delask|delyes|delno|fwdask|fwdto|fwdcancel):",
         )
     )
+    # Кнопки "✏️ Править"/"➡️ Переслать" под компактным списком задач по умолчанию (по
+    # прямой просьбе владелицы, часть 29, см. _send_compact_report/
+    # handle_report_action_callback).
+    app.add_handler(CallbackQueryHandler(handle_report_action_callback, pattern=r"^rpt:"))
     # Кнопки "❌ Отменить"/"✅ Создать" под превью явной команды на постановку задачи в
     # конкретный список/статус (см. _propose_explicit_task_command/handle_manual_task_callback,
     # по прямой просьбе владелицы, 06.09).
