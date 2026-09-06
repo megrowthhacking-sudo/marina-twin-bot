@@ -213,6 +213,23 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    # "Горит" (часть 24, по прямой просьбе владелицы) — задачи из отчётов по сотрудникам
+    # (/lili /olga ...), помеченные кнопкой "🔥 Горит" под соответствующей строкой отчёта
+    # (см. bot.py::handle_employee_task_callback). ЭТО ЧИСТО ЛОКАЛЬНАЯ пометка бота — в
+    # самом ClickUp никакого поля/тега не создаётся (так подтвердила владелица при
+    # уточнении перед реализацией: в ClickUp нет отдельного поля "горит", только
+    # приоритет и теги, а заводить теги под это — лишняя сложность). Используется только
+    # чтобы при следующем вызове той же команды поднять эти задачи в начало списка и
+    # показать значок 🔥 вместо обычного 🔴 у срочных. task_id — строковый id задачи
+    # ClickUp (в ClickUp id задач текстовые, не числа).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fire_tasks (
+            task_id TEXT PRIMARY KEY,
+            marked_at REAL NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -387,6 +404,41 @@ def save_chat_memory(chat_id: int, chat_title: str, summary: str, last_message_i
         (chat_id, chat_title, summary, last_message_id, time.time()),
     )
     _conn.commit()
+
+
+# --- "Горит" — локальная пометка задач в отчётах по сотрудникам (см. chat_memory ---
+# таблицу выше — не связано, просто соседний раздел; см. bot.py::handle_employee_task_callback) ---
+
+def mark_task_fire(task_id: str) -> None:
+    _conn.execute(
+        """
+        INSERT INTO fire_tasks (task_id, marked_at) VALUES (?, ?)
+        ON CONFLICT(task_id) DO UPDATE SET marked_at = excluded.marked_at
+        """,
+        (task_id, time.time()),
+    )
+    _conn.commit()
+
+
+def unmark_task_fire(task_id: str) -> None:
+    _conn.execute("DELETE FROM fire_tasks WHERE task_id = ?", (task_id,))
+    _conn.commit()
+
+
+def is_task_fire(task_id: str) -> bool:
+    row = _conn.execute("SELECT 1 FROM fire_tasks WHERE task_id = ?", (task_id,)).fetchone()
+    return row is not None
+
+
+def get_fire_task_ids() -> set[str]:
+    """Все id задач, когда-либо помеченных "🔥 Горит" — включая, возможно, уже закрытые/
+    удалённые/переставшие быть открытыми задачи (сюда никто не подчищает записи, кроме
+    явного unmark_task_fire при "✅ Сделано"/"🗑 Удалить" через кнопки бота). Не проблема:
+    вызывающий код (bot.py::_sort_tasks_fire_first) всё равно пересекает это множество с
+    реально полученным от ClickUp списком открытых задач, так что "осиротевшие" записи
+    просто никогда ни на что не влияют."""
+    rows = _conn.execute("SELECT task_id FROM fire_tasks").fetchall()
+    return {r[0] for r in rows}
 
 
 def log_pushed_task(chat_id: int, chat_title: str, clickup_task_id: str, title: str, project: str | None = None) -> None:

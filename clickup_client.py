@@ -217,6 +217,99 @@ def get_open_tasks_team_wide(assignee_id: int | None = None) -> list[dict]:
     return tasks
 
 
+def get_task(task_id: str) -> dict | None:
+    """Читает одну задачу по id — нужна кнопкам под отчётами по сотрудникам (см.
+    bot.py::handle_employee_task_callback), когда на руках только task_id из
+    callback_data и нужно узнать актуальное имя (для подтверждения удаления) или id её
+    списка (чтобы понять, каким статусом закрывать при "✅ Сделано" — см.
+    get_list_closed_status/mark_task_done ниже). None, если задача не найдена (уже
+    удалена — например, кто-то удалил её напрямую в ClickUp между отправкой отчёта и
+    нажатием кнопки)."""
+    if not config.CLICKUP_API_TOKEN:
+        raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
+    resp = requests.get(f"{BASE_URL}/task/{task_id}", headers=_headers(), timeout=15)
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    data = resp.json()
+    list_field = data.get("list") or {}
+    return {"id": data.get("id"), "name": data.get("name") or "(без названия)", "list_id": list_field.get("id")}
+
+
+def get_list_closed_status(list_id: str) -> str | None:
+    """Имя статуса с типом "closed" (реально закрывающего задачу) для конкретного
+    списка ClickUp. Нужно отдельной функцией, а не жёстко захардкоженным именем вроде
+    "Done"/"Готово", потому что персональные команды по сотрудникам с 06.09 ищут задачи
+    по ВСЕМУ workspace (см. get_open_tasks_team_wide) — а в разных пространствах/списках
+    ClickUp набор кастомных статусов может называться по-разному ("Готово", "Закрыто",
+    "Complete" и т.п.), общего для всех статуса не существует. None, если у списка
+    почему-то нет статуса с type == "closed" (в норме такого не бывает — у любого списка
+    ClickUp есть хотя бы один закрывающий статус, но лучше явно обработать, чем упасть)."""
+    if not config.CLICKUP_API_TOKEN:
+        raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
+    resp = requests.get(f"{BASE_URL}/list/{list_id}", headers=_headers(), timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    for status in data.get("statuses") or []:
+        if (status.get("type") or "").lower() == "closed":
+            return status.get("status")
+    return None
+
+
+def set_task_status(task_id: str, status_name: str) -> None:
+    """Ставит задаче статус по имени (как он называется в списке этой конкретной
+    задачи — см. get_list_closed_status). Бросает исключение при ошибке сети/API."""
+    if not config.CLICKUP_API_TOKEN:
+        raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
+    resp = requests.put(
+        f"{BASE_URL}/task/{task_id}", headers=_headers(), json={"status": status_name}, timeout=20,
+    )
+    resp.raise_for_status()
+
+
+def mark_task_done(task_id: str) -> None:
+    """Закрывает задачу — по кнопке "✅ Сделано" под отчётом по сотруднику (по прямой
+    просьбе владелицы, 06.09). Сначала узнаёт задачу и id её списка (get_task), затем
+    закрывающий статус этого списка (get_list_closed_status), и только потом ставит его
+    (set_task_status) — чтобы задача реально попала в "выполненные" именно этого списка,
+    а не осталась в каком-то промежуточном кастомном статусе. Бросает исключение, если
+    задача не найдена (уже удалена) или у её списка почему-то нет closed-статуса —
+    вызывающий код (bot.py) сам решает, как это показать владелице."""
+    task = get_task(task_id)
+    if not task or not task.get("list_id"):
+        raise RuntimeError("Задача не найдена в ClickUp (возможно, уже удалена или закрыта)")
+    closed_status = get_list_closed_status(task["list_id"])
+    if not closed_status:
+        raise RuntimeError(f"Не нашла статус \"выполнено\" для списка {task['list_id']}")
+    set_task_status(task_id, closed_status)
+
+
+def set_task_priority(task_id: str, priority: str) -> None:
+    """Ставит задаче приоритет (urgent/high/normal/low, см. PRIORITY_MAP) — по кнопке
+    "🔴 Срочная" под отчётом по сотруднику (по прямой просьбе владелицы, 06.09)."""
+    if not config.CLICKUP_API_TOKEN:
+        raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
+    priority_num = PRIORITY_MAP.get((priority or "").lower())
+    if not priority_num:
+        raise ValueError(f"Неизвестный приоритет: {priority!r}")
+    resp = requests.put(
+        f"{BASE_URL}/task/{task_id}", headers=_headers(), json={"priority": priority_num}, timeout=20,
+    )
+    resp.raise_for_status()
+
+
+def delete_task(task_id: str) -> None:
+    """Удаляет задачу из ClickUp БЕЗВОЗВРАТНО — по кнопке "🗑 Удалить" под отчётом по
+    сотруднику, только после явного подтверждения владелицей (см.
+    bot.py::handle_employee_task_callback, действие "delyes" — шаг подтверждения
+    добавлен по её же прямой просьбе, риск случайного нажатия на маленькой кнопке в
+    телефоне на необратимое действие)."""
+    if not config.CLICKUP_API_TOKEN:
+        raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
+    resp = requests.delete(f"{BASE_URL}/task/{task_id}", headers=_headers(), timeout=20)
+    resp.raise_for_status()
+
+
 def test_connection(list_id: str) -> tuple[bool, str]:
     """Простая проверка токена/списка — дергает конкретный список, ничего не создавая.
     Удобно для ручной диагностики после деплоя (см. DEPLOY.md)."""
