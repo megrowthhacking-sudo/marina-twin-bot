@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -1807,13 +1807,12 @@ async def handle_tasksall_command(update: Update, context: ContextTypes.DEFAULT_
         await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
 
 
-# Сколько задач умещаем в одно сообщение отчёта по сотруднику вместе с кнопками (по
-# прямой просьбе владелицы, 06.09-часть 24: у каждой задачи 4 кнопки-действия, см.
-# _employee_task_keyboard) — при большом числе задач (например, у Лили их около 80)
-# один Telegram-message с сотнями inline-кнопок технически ненадёжен/неюзабелен, поэтому
-# длинные отчёты режутся на несколько сообщений подряд, а не на одно (согласовано с
-# владелицей заранее, см. AskUserQuestion в истории части 24).
-_EMPLOYEE_TASKS_PAGE_SIZE = 15
+# Небольшая пауза между сообщениями отчёта по сотруднику (по прямой просьбе владелицы,
+# часть 28: теперь на каждую задачу отдельное Telegram-сообщение со своими кнопками —
+# см. _send_task_button_report) — при большом числе задач (например, у Лили их около 80)
+# рассылка десятков сообщений подряд без паузы рискует упереться в лимит Telegram на
+# сообщения в один чат (см. также RetryAfter-обработку в _send_owner_message_with_retry).
+_TASK_MESSAGE_DELAY_SECONDS = 0.35
 
 
 def _sort_tasks_fire_first(tasks: list[dict]) -> list[dict]:
@@ -1831,10 +1830,13 @@ def _format_employee_task_lines(tasks: list[dict], start_index: int = 1) -> list
     clickup_client.get_open_tasks_team_wide), поэтому в конце строки, если известно,
     дописывается местоположение задачи (пространство / папка / список — см.
     _format_task_location; по прямой просьбе владелицы, часть 27). start_index — чтобы
-    нумерация была сквозной между несколькими сообщениями одного отчёта (см.
-    _EMPLOYEE_TASKS_PAGE_SIZE) — номер строки в тексте специально совпадает с номером на
-    кнопках под ней (см. _employee_task_keyboard), это и есть привязка кнопок "к каждой
-    задаче" в интерфейсе, где сами кнопки физически не могут стоять внутри строки текста.
+    сквозная нумерация не сбивалась, если этот список задач — часть большего отчёта.
+    С части 28 каждая строка уходит отдельным Telegram-сообщением сразу со своими
+    кнопками под ней (см. _send_task_button_report/_employee_task_keyboard) — раньше
+    (часть 24-27) номер строки специально совпадал с номером на кнопках, потому что много
+    задач с кнопками шли пачкой в одном сообщении и Telegram не даёт вставить кнопку
+    внутрь строки текста; теперь, когда на сообщение ровно одна задача, эта привязка не
+    нужна, но сама нумерация остаётся — просто для читаемости длинного списка.
     Задачи, помеченные "🔥 Горит" (см. _is_fire), получают значок 🔥 вместо обычного 🔴 у
     срочных — визуально понятно, что задача поднята вручную, а не просто высокий
     приоритет в ClickUp."""
@@ -1849,36 +1851,47 @@ def _format_employee_task_lines(tasks: list[dict], start_index: int = 1) -> list
     return lines
 
 
-def _employee_task_keyboard(
-    tasks: list[dict], start_index: int = 1, include_weekly_button: bool = False
-) -> InlineKeyboardMarkup:
-    """Строит ряд кнопок-действий под каждой задачей отчёта по сотруднику (по прямой
-    просьбе владелицы, 06.09-часть 24, кнопка "📆 Weekly" добавлена в части 27, см.
-    handle_employee_task_callback): "✅ Сделано" (закрывает задачу в ClickUp), "🗑 Удалить"
-    (удаляет из ClickUp насовсем, с шагом подтверждения), "🔴 Срочная" (ставит приоритет
-    Urgent в ClickUp), "🔥 Горит" (ставит/снимает настоящий тег ClickUp "кричащая задача»,
-    см. _is_fire — поднимает задачу наверх списка при следующем вызове команды), и, если
-    include_weekly_button — 5-я кнопка "📆 Weekly" (переносит задачу в список WEEKLY TASKS
-    со статусом Unsorted; только там, где задачи и так ищутся по всему ClickUp — см.
-    _send_employee_report — переносить в weekly-отчётах, которые и так уже из WEEKLY
-    TASKS, бессмысленно). Номер на кнопках специально совпадает с номером строки в тексте
-    отчёта (см. _format_employee_task_lines, тот же start_index) — Telegram не даёт
-    разместить inline-кнопку буквально внутри строки текста, поэтому визуальная привязка
-    кнопки к конкретной задаче держится на совпадении номеров."""
-    rows = []
-    for offset, t in enumerate(tasks):
-        i = start_index + offset
-        task_id = t["id"]
-        row = [
-            InlineKeyboardButton(f"{i}.✅", callback_data=f"emp:done:{task_id}"),
-            InlineKeyboardButton(f"{i}.🗑", callback_data=f"emp:delask:{task_id}"),
-            InlineKeyboardButton(f"{i}.🔴", callback_data=f"emp:urgent:{task_id}"),
-            InlineKeyboardButton(f"{i}.🔥", callback_data=f"emp:fire:{task_id}"),
-        ]
-        if include_weekly_button:
-            row.append(InlineKeyboardButton(f"{i}.📆", callback_data=f"emp:weekly:{task_id}"))
-        rows.append(row)
-    return InlineKeyboardMarkup(rows)
+def _employee_task_keyboard(task: dict, include_weekly_button: bool = False) -> InlineKeyboardMarkup:
+    """Строит ряд кнопок-действий под ОДНОЙ задачей отчёта по сотруднику (по прямой
+    просьбе владелицы, 06.09-часть 24, кнопка "📆 Weekly" добавлена в части 27, реальный
+    текст вместо номеров-значков — часть 28, см. handle_employee_task_callback):
+    "✅ Готово" (закрывает задачу в ClickUp), "🗑 Удалить" (удаляет из ClickUp насовсем, с
+    шагом подтверждения), "🔴 Срочно" (ставит приоритет Urgent в ClickUp), "🔥 Горит"
+    (ставит/снимает настоящий тег ClickUp "кричащая задача", см. _is_fire — поднимает
+    задачу наверх списка при следующем вызове команды), и, если include_weekly_button —
+    5-я кнопка "📆 Weekly" (переносит задачу в список WEEKLY TASKS со статусом Unsorted;
+    только там, где задачи и так ищутся по всему ClickUp — см. _send_employee_report —
+    переносить в weekly-отчётах, которые и так уже из WEEKLY TASKS, бессмысленно).
+    С части 28 каждая задача — отдельное Telegram-сообщение (см.
+    _send_task_button_report), поэтому кнопки больше не нужно подписывать номером задачи —
+    сама привязка "кнопка под своей задачей" теперь физическая, а не через совпадение
+    номеров."""
+    task_id = task["id"]
+    row = [
+        InlineKeyboardButton("✅ Готово", callback_data=f"emp:done:{task_id}"),
+        InlineKeyboardButton("🗑 Удалить", callback_data=f"emp:delask:{task_id}"),
+        InlineKeyboardButton("🔴 Срочно", callback_data=f"emp:urgent:{task_id}"),
+        InlineKeyboardButton("🔥 Горит", callback_data=f"emp:fire:{task_id}"),
+    ]
+    if include_weekly_button:
+        row.append(InlineKeyboardButton("📆 Weekly", callback_data=f"emp:weekly:{task_id}"))
+    return InlineKeyboardMarkup([row])
+
+
+async def _send_owner_message_with_retry(
+    context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: InlineKeyboardMarkup | None = None
+) -> None:
+    """Шлёт одно сообщение владелице в личку с одной попыткой повтора при HTTP 429 от
+    Telegram (RetryAfter) — по прямой просьбе владелицы, часть 28: с переходом на "одно
+    сообщение на задачу" в _send_task_button_report сообщений в один чат подряд стало
+    ощутимо больше (например, у Лили ~80 задач), и Telegram иногда просит подождать между
+    сообщениями в один и тот же чат. Любая другая ошибка отправки просто поднимается
+    дальше — вызывающий код сам решает, как её залогировать/остановить рассылку."""
+    try:
+        await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text, reply_markup=reply_markup)
+    except RetryAfter as e:
+        await asyncio.sleep(e.retry_after + 0.1)
+        await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text, reply_markup=reply_markup)
 
 
 async def _send_task_button_report(
@@ -1889,12 +1902,17 @@ async def _send_task_button_report(
     include_weekly_button: bool = False,
 ) -> None:
     """Общая "хвостовая" часть _send_employee_report, _send_employee_weekly_report (часть
-    24) и _send_weekly_status_report (часть 27) — раскладывает уже готовый список задач по
-    страницам с кнопками-действиями (см. _employee_task_keyboard/
-    handle_employee_task_callback), задачи, помеченные "🔥 Горит", показываются первыми
-    (см. _sort_tasks_fire_first). scope_note — короткая приписка в заголовке отчёта, откуда
-    именно эти задачи ("по всему ClickUp" / "из WEEKLY TASKS" / "из WEEKLY TASKS · статус
-    «Понедельник»"), чтобы было понятно, какую именно команду вызвали.
+    24) и _send_weekly_status_report (часть 27) — присылает заголовок отчёта, а затем
+    КАЖДУЮ задачу отдельным Telegram-сообщением сразу со своими кнопками-действиями под
+    ней (см. _employee_task_keyboard/handle_employee_task_callback) — по прямой просьбе
+    владелицы, часть 28: раньше кнопки шли одной пачкой под текстом сразу нескольких
+    задач (до 15 в одном сообщении), теперь у каждой задачи свои кнопки прямо под её
+    текстом. Задачи, помеченные "🔥 Горит", показываются первыми (см.
+    _sort_tasks_fire_first). Между сообщениями — небольшая пауза
+    (_TASK_MESSAGE_DELAY_SECONDS) во избежание лимита Telegram на сообщения в один чат
+    (см. _send_owner_message_with_retry). scope_note — короткая приписка в заголовке
+    отчёта, откуда именно эти задачи ("по всему ClickUp" / "из WEEKLY TASKS" / "из WEEKLY
+    TASKS · статус «Понедельник»"), чтобы было понятно, какую именно команду вызвали.
     include_weekly_button — см. _employee_task_keyboard."""
     if not tasks:
         try:
@@ -1907,19 +1925,14 @@ async def _send_task_button_report(
 
     tasks = _sort_tasks_fire_first(tasks)
     total = len(tasks)
-    pages = [
-        tasks[i : i + _EMPLOYEE_TASKS_PAGE_SIZE]
-        for i in range(0, total, _EMPLOYEE_TASKS_PAGE_SIZE)
-    ]
+    lines = _format_employee_task_lines(tasks, start_index=1)
     try:
-        for page_num, page_tasks in enumerate(pages, start=1):
-            start_index = (page_num - 1) * _EMPLOYEE_TASKS_PAGE_SIZE + 1
-            header = f"👤 {label} — {scope_note} ({total})"
-            if len(pages) > 1:
-                header += f", часть {page_num}/{len(pages)}"
-            text = header + ":\n" + "\n".join(_format_employee_task_lines(page_tasks, start_index))
-            keyboard = _employee_task_keyboard(page_tasks, start_index, include_weekly_button)
-            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text, reply_markup=keyboard)
+        await _send_owner_message_with_retry(context, f"👤 {label} — {scope_note} ({total}):")
+        for offset, (task, line) in enumerate(zip(tasks, lines)):
+            keyboard = _employee_task_keyboard(task, include_weekly_button)
+            await _send_owner_message_with_retry(context, line, reply_markup=keyboard)
+            if offset < total - 1:
+                await asyncio.sleep(_TASK_MESSAGE_DELAY_SECONDS)
     except Exception:
         logger.exception("Не удалось отправить отчёт по сотруднику (%s) владелице", label)
 
@@ -1938,9 +1951,9 @@ async def _send_employee_report(context: ContextTypes.DEFAULT_TYPE, employee_key
     этом случае приходится тянуть ВСЕ открытые задачи workspace без серверного фильтра и
     отфильтровывать по префиксу уже на своей стороне.
 
-    С 06.09 (часть 24) каждая задача сопровождается рядом из 4 кнопок-действий, отчёт при
-    этом режется на несколько сообщений подряд при большом числе задач (см.
-    _send_task_button_report/_EMPLOYEE_TASKS_PAGE_SIZE)."""
+    С 06.09 (часть 24) каждая задача сопровождается рядом кнопок-действий; с части 28
+    (по прямой просьбе владелицы) — отдельным Telegram-сообщением на каждую задачу, кнопки
+    прямо под ней (см. _send_task_button_report)."""
     if config.OWNER_USER_ID is None:
         return
     employee = config.EMPLOYEE_COMMANDS[employee_key]
