@@ -54,6 +54,49 @@ def _is_allowed(user_id: int) -> bool:
     return user_id in config.ALLOWED_USER_IDS
 
 
+# {telegram_username_в_нижнем_регистре: employee_key, ...} — построено один раз из
+# config.EMPLOYEE_COMMANDS[...]["telegram_username"] (часть 30, по прямой просьбе
+# владелицы: она прислала @username шести сотрудников, а не числовой telegram_user_id —
+# см. _maybe_capture_employee_telegram_id ниже, где это используется для автоматического
+# распознавания).
+_EMPLOYEE_USERNAME_TO_KEY = {
+    employee["telegram_username"].lower(): key
+    for key, employee in config.EMPLOYEE_COMMANDS.items()
+    if employee.get("telegram_username")
+}
+
+
+def _maybe_capture_employee_telegram_id(update: Update) -> None:
+    """Подглядывает @username в КАЖДОМ сообщении, которое бот и так получает (личка и
+    группы — см. вызовы в handle_start/handle_message/handle_group_message), и если он
+    совпадает (без учёта регистра) с одним из config.EMPLOYEE_COMMANDS[...]
+    ["telegram_username"] — сохраняет настоящий telegram_user_id этого сотрудника в
+    storage (см. storage.save_employee_telegram_id), после чего кнопка "➡️ Переслать"
+    (см. _resolve_employee_telegram_id/_available_forward_recipients) сама начинает
+    работать для него, без нового деплоя. По прямой просьбе владелицы, часть 30: она
+    прислала @username сотрудников, а не числовой id — Telegram не даёт боту написать
+    первым тому, кто ему никогда не писал, поэтому нужен именно этот обходной путь,
+    а не мгновенная настройка. Тихая операция — ничего не отвечает и не может сломать
+    обычную обработку сообщения, вызывается "между делом", в начале обработчика."""
+    user = update.effective_user
+    if user is None or not user.username:
+        return
+    employee_key = _EMPLOYEE_USERNAME_TO_KEY.get(user.username.lower())
+    if not employee_key:
+        return
+    if storage.get_employee_telegram_id(employee_key) == user.id:
+        return  # уже сохранён этот же id — не дёргаем базу заново на каждое сообщение
+    try:
+        storage.save_employee_telegram_id(employee_key, user.id, user.username)
+        logger.info(
+            "Распознан telegram_user_id сотрудника «%s» по @%s — пересылка теперь доступна",
+            config.EMPLOYEE_COMMANDS[employee_key]["label"],
+            user.username,
+        )
+    except Exception:
+        logger.exception("Не удалось сохранить telegram_user_id для %s (@%s)", employee_key, user.username)
+
+
 def _split_for_telegram(text: str) -> list[str]:
     """Режет длинный ответ на куски под лимит Telegram, стараясь резать по абзацам."""
     if len(text) <= TELEGRAM_MESSAGE_LIMIT:
@@ -166,6 +209,7 @@ async def _is_addressed_to_marina(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _maybe_capture_employee_telegram_id(update)
     storage.reset_chat(update.effective_chat.id)
     await update.message.reply_text(
         "Привет! Я на связи 🙂 Пиши, с чем помочь — я тут же подключусь."
@@ -565,6 +609,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id
     text = update.message.text or ""
 
+    _maybe_capture_employee_telegram_id(update)
+
     if not _is_allowed(user.id):
         logger.warning("Отклонён неразрешённый пользователь %s (%s)", user.id, user.username)
         await update.message.reply_text(
@@ -699,6 +745,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     msg = update.effective_message
     if msg is None:
         return
+    _maybe_capture_employee_telegram_id(update)
     text = msg.text or ""
     if not text.strip():
         return
@@ -1881,16 +1928,31 @@ def _employee_task_keyboard(task: dict, include_weekly_button: bool = False) -> 
     return InlineKeyboardMarkup([row1, row2])
 
 
+def _resolve_employee_telegram_id(employee_key: str) -> int | None:
+    """Настоящий telegram_user_id сотрудника, если он уже известен — сначала смотрим
+    ручную настройку (env-переменная TELEGRAM_ID_*, см.
+    config._EMPLOYEE_TELEGRAM_ID_ENV — считается более авторитетной, раз задана явно
+    владелицей), иначе — автоматически распознанный по @username (часть 30, см.
+    _maybe_capture_employee_telegram_id/storage.get_employee_telegram_id). None — если
+    ни то, ни другое неизвестно."""
+    employee = config.EMPLOYEE_COMMANDS.get(employee_key)
+    manual_id = employee.get("telegram_user_id") if employee else None
+    if manual_id:
+        return manual_id
+    return storage.get_employee_telegram_id(employee_key)
+
+
 def _available_forward_recipients() -> list[tuple[str, str]]:
-    """Возвращает [(employee_key, label), ...] только для тех сотрудников, у кого задан
-    telegram_user_id (см. config._EMPLOYEE_TELEGRAM_ID_ENV) — по прямой просьбе
-    владелицы, часть 29: пересылка технически возможна только тем, чей Telegram user_id
+    """Возвращает [(employee_key, label), ...] только для тех сотрудников, у кого уже
+    известен telegram_user_id — вручную (config._EMPLOYEE_TELEGRAM_ID_ENV) или
+    автоматически по @username (часть 30, см. _resolve_employee_telegram_id) — по прямой
+    просьбе владелицы: пересылка технически возможна только тем, чей Telegram user_id
     уже известен (человек должен был хоть раз сам написать боту), поэтому список
     получателей строится из уже настроенных, а не из всех config.EMPLOYEE_COMMANDS."""
     return [
         (key, employee["label"])
         for key, employee in config.EMPLOYEE_COMMANDS.items()
-        if employee.get("telegram_user_id")
+        if _resolve_employee_telegram_id(key)
     ]
 
 
@@ -2049,10 +2111,10 @@ async def _forward_report_to_employee(
     _format_employee_task_lines) конкретному сотруднику в Telegram — по прямой просьбе
     владелицы, часть 29 (кнопка "➡️ Переслать" под компактным списком, см.
     handle_report_action_callback). recipient_key — ключ config.EMPLOYEE_COMMANDS, у
-    которого уже проверено (см. _available_forward_recipients), что задан
-    telegram_user_id."""
+    которого уже проверено (см. _available_forward_recipients), что известен
+    telegram_user_id (см. _resolve_employee_telegram_id)."""
     recipient = config.EMPLOYEE_COMMANDS.get(recipient_key)
-    recipient_chat_id = recipient.get("telegram_user_id") if recipient else None
+    recipient_chat_id = _resolve_employee_telegram_id(recipient_key) if recipient else None
     if not recipient or not recipient_chat_id:
         await context.bot.send_message(
             chat_id=config.OWNER_USER_ID, text="У этого человека пока не настроен Telegram id."
@@ -2361,7 +2423,7 @@ async def handle_employee_task_callback(update: Update, context: ContextTypes.DE
     if action == "fwdto":
         await query.answer()
         recipient = config.EMPLOYEE_COMMANDS.get(extra)
-        recipient_chat_id = recipient.get("telegram_user_id") if recipient else None
+        recipient_chat_id = _resolve_employee_telegram_id(extra) if recipient else None
         if not recipient or not recipient_chat_id:
             await query.edit_message_text("У этого человека пока не настроен Telegram id.")
             return
