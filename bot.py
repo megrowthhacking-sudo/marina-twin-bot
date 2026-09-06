@@ -1549,6 +1549,78 @@ async def handle_tasksall_command(update: Update, context: ContextTypes.DEFAULT_
         await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
 
 
+async def _send_employee_report(context: ContextTypes.DEFAULT_TYPE, employee_key: str) -> None:
+    """/lili /olga /sveta /ilya /nazgul /alex /ub — по каждому из 4 проектных списков
+    (config.CLICKUP_LIST_IDS, та же зона ответственности бота, что и у /tasksX/
+    /tasksall — НЕ личные папки ClickUp вроде "Саша"/"Ник" в иерархии воркспейса)
+    тянет живые открытые задачи этого конкретного человека и собирает единый отчёт с
+    разделом на каждый проект, как /tasksall (см. _send_tasksall_report). У шести из
+    семи команд есть реальный ClickUp-аккаунт (assignee_id, config.EMPLOYEE_COMMANDS) —
+    фильтрация идёт на стороне ClickUp API. У Саши (/alex) реального аккаунта нет —
+    вместо этого задачи находятся по буквальному текстовому префиксу "Саша:" в начале
+    названия (так их заводит task_extractor.py, когда не может сопоставить имя с
+    реальным ClickUp-аккаунтом)."""
+    if config.OWNER_USER_ID is None:
+        return
+    employee = config.EMPLOYEE_COMMANDS[employee_key]
+    label = employee["label"]
+    assignee_id = employee.get("assignee_id")
+    name_prefix = employee.get("name_prefix")
+    sections = []
+    total = 0
+    for project_key, project in config.CLICKUP_PROJECTS.items():
+        plabel = project["label"]
+        list_id = config.CLICKUP_LIST_IDS.get(project_key)
+        if not list_id:
+            sections.append(f"«{plabel}»: не настроено.")
+            continue
+        try:
+            tasks = clickup_client.get_open_tasks(list_id, assignee_id=assignee_id)
+        except Exception:
+            logger.exception("Не удалось получить задачи «%s» в проекте %s", label, project_key)
+            sections.append(f"«{plabel}»: не смогла получить задачи из ClickUp.")
+            continue
+        if name_prefix:
+            tasks = [t for t in tasks if t["name"].strip().lower().startswith(name_prefix)]
+        if not tasks:
+            sections.append(f"«{plabel}»: нет задач.")
+        else:
+            total += len(tasks)
+            sections.append("\n".join([f"«{plabel}» ({len(tasks)}):"] + _format_task_lines(tasks)))
+    text = f"👤 {label} — открытые задачи ({total}):\n\n" + "\n\n".join(sections)
+    try:
+        for chunk in _split_for_telegram(text):
+            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
+    except Exception:
+        logger.exception("Не удалось отправить отчёт по сотруднику %s владелице", employee_key)
+
+
+def _make_employee_command_handler(employee_key: str):
+    """Команды /lili /olga /sveta /ilya /nazgul /alex /ub — каждая для своего человека
+    (см. config.EMPLOYEE_COMMANDS). Только в личке, только для владелицы — мгновенно
+    присылает живой отчёт по открытым задачам этого человека (см.
+    _send_employee_report)."""
+    label = config.EMPLOYEE_COMMANDS[employee_key]["label"]
+
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        if chat.type != "private":
+            await update.message.reply_text("Эта команда работает только в личке.")
+            return
+        if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+            await update.message.reply_text("Эта команда только для владелицы.")
+            return
+        if not config.CLICKUP_ENABLED:
+            await update.message.reply_text(
+                f"ClickUp пока не настроен — задачи «{label}» выгружать неоткуда."
+            )
+            return
+        await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+        await _send_employee_report(context, employee_key)
+
+    return handler
+
+
 async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Утренний дайджест (время/часовой пояс — DAILY_DIGEST_HOUR/DAILY_DIGEST_MINUTE/
     MARINATWIN_TIMEZONE в config.py): по каждому проекту шлёт владелице отдельным
@@ -1651,6 +1723,10 @@ def build_application() -> Application:
     # handle_calendar_view_callback).
     app.add_handler(CommandHandler("calendar", handle_calendar_command))
     app.add_handler(CallbackQueryHandler(handle_calendar_view_callback, pattern=r"^calview:"))
+    # Персональные команды по сотрудникам: /lili /olga /sveta /ilya /nazgul /alex /ub —
+    # только в личке, только владелице (см. config.EMPLOYEE_COMMANDS / _send_employee_report).
+    for employee_key in config.EMPLOYEE_COMMANDS:
+        app.add_handler(CommandHandler(employee_key, _make_employee_command_handler(employee_key)))
     # Личка — обычный разговор с персоной Marina Twin.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     # Группы — тихий сбор переписки, без ответов.
