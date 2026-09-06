@@ -1607,6 +1607,40 @@ def _is_urgent(task: dict) -> bool:
     return (task.get("priority") or "") in _URGENT_PRIORITIES
 
 
+def _is_fire(task: dict) -> bool:
+    """Задача помечена "🔥 Горит», если среди её тегов ClickUp есть
+    config.CLICKUP_FIRE_TAG_NAME (по прямой просьбе владелицы, часть 27 — с этой части
+    это настоящий тег ClickUp, а не локальная пометка внутри бота, как раньше в части 24,
+    см. clickup_client.ensure_tag_on_task). Сравнение без учёта регистра — на случай, если
+    тег в ClickUp когда-то создан/переименован с другим регистром букв."""
+    fire_name = config.CLICKUP_FIRE_TAG_NAME.lower()
+    return any((tg or "").lower() == fire_name for tg in task.get("tags") or [])
+
+
+def _format_task_location(task: dict) -> str:
+    """Строит короткую строку "где стоит задача" — пространство / папка / список ClickUp
+    (по прямой просьбе владелицы, часть 27: команды по сотрудникам ищут задачи по всему
+    workspace, и не всегда очевидно, из какого именно места они пришли). Использует только
+    то, что реально известно (см. clickup_client.get_open_tasks_team_wide) — пропускает
+    отсутствующие части, а не подставляет заглушки. Пространство разрешается по
+    config.CLICKUP_SPACE_NAMES (сам ClickUp API не отдаёт имя пространства в объекте
+    задачи, только id) — если id незнаком (новое пространство завели после последнего
+    обновления этого словаря), просто пропускается, а не показывается как "?"."""
+    parts = []
+    space_id = task.get("space_id")
+    if space_id:
+        space_name = config.CLICKUP_SPACE_NAMES.get(str(space_id))
+        if space_name:
+            parts.append(space_name)
+    folder_name = task.get("folder_name")
+    if folder_name:
+        parts.append(folder_name)
+    list_name = task.get("list_name")
+    if list_name:
+        parts.append(list_name)
+    return " / ".join(parts)
+
+
 def _format_due_suffix(due_date: float | None) -> str:
     """Возвращает суффикс со сроком «(до ДД.ММ.ГГГГ)» для строки отчёта, если у задачи
     задан срок в ClickUp, иначе пустую строку."""
@@ -1782,73 +1816,86 @@ async def handle_tasksall_command(update: Update, context: ContextTypes.DEFAULT_
 _EMPLOYEE_TASKS_PAGE_SIZE = 15
 
 
-def _sort_tasks_fire_first(tasks: list[dict], fire_ids: set[str]) -> list[dict]:
-    """Задачи, помеченные кнопкой "🔥 Горит" (см. handle_employee_task_callback), идут
-    первыми (в своём относительном порядке между собой), остальные — как были получены
-    от ClickUp. Это ЧИСТО отображение внутри бота — никакого поля/тега в самом ClickUp
-    не меняется (так по прямой просьбе владелицы: заводить теги под это в ClickUp —
-    лишняя сложность, ей достаточно видеть это только здесь)."""
-    fire = [t for t in tasks if t["id"] in fire_ids]
-    rest = [t for t in tasks if t["id"] not in fire_ids]
+def _sort_tasks_fire_first(tasks: list[dict]) -> list[dict]:
+    """Задачи, помеченные тегом ClickUp "кричащая задача" (кнопка "🔥 Горит», см.
+    _is_fire/handle_employee_task_callback), идут первыми (в своём относительном порядке
+    между собой), остальные — как были получены от ClickUp."""
+    fire = [t for t in tasks if _is_fire(t)]
+    rest = [t for t in tasks if not _is_fire(t)]
     return fire + rest
 
 
-def _format_employee_task_lines(tasks: list[dict], fire_ids: set[str], start_index: int = 1) -> list[str]:
+def _format_employee_task_lines(tasks: list[dict], start_index: int = 1) -> list[str]:
     """Как _format_task_lines, но для отчёта по сотруднику (см. _send_employee_report) —
     задачи теперь могут быть из любого места ClickUp (см.
     clickup_client.get_open_tasks_team_wide), поэтому в конце строки, если известно,
-    дописывается название списка/проекта, откуда задача. start_index — чтобы нумерация
-    была сквозной между несколькими сообщениями одного отчёта (см.
+    дописывается местоположение задачи (пространство / папка / список — см.
+    _format_task_location; по прямой просьбе владелицы, часть 27). start_index — чтобы
+    нумерация была сквозной между несколькими сообщениями одного отчёта (см.
     _EMPLOYEE_TASKS_PAGE_SIZE) — номер строки в тексте специально совпадает с номером на
     кнопках под ней (см. _employee_task_keyboard), это и есть привязка кнопок "к каждой
     задаче" в интерфейсе, где сами кнопки физически не могут стоять внутри строки текста.
-    Задачи, помеченные "🔥 Горит" (fire_ids), получают значок 🔥 вместо обычного 🔴 у
+    Задачи, помеченные "🔥 Горит" (см. _is_fire), получают значок 🔥 вместо обычного 🔴 у
     срочных — визуально понятно, что задача поднята вручную, а не просто высокий
     приоритет в ClickUp."""
     lines = []
     for offset, t in enumerate(tasks):
         i = start_index + offset
-        marker = "🔥 " if t["id"] in fire_ids else ("🔴 " if _is_urgent(t) else "")
+        marker = "🔥 " if _is_fire(t) else ("🔴 " if _is_urgent(t) else "")
         due_suffix = _format_due_suffix(t.get("due_date"))
-        list_name = t.get("list_name")
-        location_suffix = f" [{list_name}]" if list_name else ""
+        location = _format_task_location(t)
+        location_suffix = f" [{location}]" if location else ""
         lines.append(f"{i}. {marker}{t['name']}{due_suffix}{location_suffix}")
     return lines
 
 
-def _employee_task_keyboard(tasks: list[dict], start_index: int = 1) -> InlineKeyboardMarkup:
-    """Строит ряд из 4 кнопок-действий под каждой задачей отчёта по сотруднику (по
-    прямой просьбе владелицы, 06.09-часть 24, см. handle_employee_task_callback):
-    "✅ Сделано" (закрывает задачу в ClickUp), "🗑 Удалить" (удаляет из ClickUp насовсем,
-    с шагом подтверждения), "🔴 Срочная" (ставит приоритет Urgent в ClickUp), "🔥 Горит"
-    (локальная пометка только в боте — поднимает наверх списка при следующем вызове
-    команды). Номер на кнопках специально совпадает с номером строки в тексте отчёта
-    (см. _format_employee_task_lines, тот же start_index) — Telegram не даёт разместить
-    inline-кнопку буквально внутри строки текста, поэтому визуальная привязка кнопки к
-    конкретной задаче держится на совпадении номеров."""
+def _employee_task_keyboard(
+    tasks: list[dict], start_index: int = 1, include_weekly_button: bool = False
+) -> InlineKeyboardMarkup:
+    """Строит ряд кнопок-действий под каждой задачей отчёта по сотруднику (по прямой
+    просьбе владелицы, 06.09-часть 24, кнопка "📆 Weekly" добавлена в части 27, см.
+    handle_employee_task_callback): "✅ Сделано" (закрывает задачу в ClickUp), "🗑 Удалить"
+    (удаляет из ClickUp насовсем, с шагом подтверждения), "🔴 Срочная" (ставит приоритет
+    Urgent в ClickUp), "🔥 Горит" (ставит/снимает настоящий тег ClickUp "кричащая задача»,
+    см. _is_fire — поднимает задачу наверх списка при следующем вызове команды), и, если
+    include_weekly_button — 5-я кнопка "📆 Weekly" (переносит задачу в список WEEKLY TASKS
+    со статусом Unsorted; только там, где задачи и так ищутся по всему ClickUp — см.
+    _send_employee_report — переносить в weekly-отчётах, которые и так уже из WEEKLY
+    TASKS, бессмысленно). Номер на кнопках специально совпадает с номером строки в тексте
+    отчёта (см. _format_employee_task_lines, тот же start_index) — Telegram не даёт
+    разместить inline-кнопку буквально внутри строки текста, поэтому визуальная привязка
+    кнопки к конкретной задаче держится на совпадении номеров."""
     rows = []
     for offset, t in enumerate(tasks):
         i = start_index + offset
         task_id = t["id"]
-        rows.append(
-            [
-                InlineKeyboardButton(f"{i}.✅", callback_data=f"emp:done:{task_id}"),
-                InlineKeyboardButton(f"{i}.🗑", callback_data=f"emp:delask:{task_id}"),
-                InlineKeyboardButton(f"{i}.🔴", callback_data=f"emp:urgent:{task_id}"),
-                InlineKeyboardButton(f"{i}.🔥", callback_data=f"emp:fire:{task_id}"),
-            ]
-        )
+        row = [
+            InlineKeyboardButton(f"{i}.✅", callback_data=f"emp:done:{task_id}"),
+            InlineKeyboardButton(f"{i}.🗑", callback_data=f"emp:delask:{task_id}"),
+            InlineKeyboardButton(f"{i}.🔴", callback_data=f"emp:urgent:{task_id}"),
+            InlineKeyboardButton(f"{i}.🔥", callback_data=f"emp:fire:{task_id}"),
+        ]
+        if include_weekly_button:
+            row.append(InlineKeyboardButton(f"{i}.📆", callback_data=f"emp:weekly:{task_id}"))
+        rows.append(row)
     return InlineKeyboardMarkup(rows)
 
 
-async def _send_task_button_report(context: ContextTypes.DEFAULT_TYPE, label: str, scope_note: str, tasks: list[dict]) -> None:
-    """Общая "хвостовая" часть _send_employee_report и _send_employee_weekly_report (часть
-    24) — раскладывает уже готовый (отфильтрованный по нужному человеку) список задач по
+async def _send_task_button_report(
+    context: ContextTypes.DEFAULT_TYPE,
+    label: str,
+    scope_note: str,
+    tasks: list[dict],
+    include_weekly_button: bool = False,
+) -> None:
+    """Общая "хвостовая" часть _send_employee_report, _send_employee_weekly_report (часть
+    24) и _send_weekly_status_report (часть 27) — раскладывает уже готовый список задач по
     страницам с кнопками-действиями (см. _employee_task_keyboard/
     handle_employee_task_callback), задачи, помеченные "🔥 Горит", показываются первыми
     (см. _sort_tasks_fire_first). scope_note — короткая приписка в заголовке отчёта, откуда
-    именно эти задачи ("по всему ClickUp" / "из WEEKLY TASKS"), чтобы было понятно, какую
-    именно команду вызвали."""
+    именно эти задачи ("по всему ClickUp" / "из WEEKLY TASKS" / "из WEEKLY TASKS · статус
+    «Понедельник»"), чтобы было понятно, какую именно команду вызвали.
+    include_weekly_button — см. _employee_task_keyboard."""
     if not tasks:
         try:
             await context.bot.send_message(
@@ -1858,8 +1905,7 @@ async def _send_task_button_report(context: ContextTypes.DEFAULT_TYPE, label: st
             logger.exception("Не удалось отправить отчёт по сотруднику (%s) владелице", label)
         return
 
-    fire_ids = storage.get_fire_task_ids()
-    tasks = _sort_tasks_fire_first(tasks, fire_ids)
+    tasks = _sort_tasks_fire_first(tasks)
     total = len(tasks)
     pages = [
         tasks[i : i + _EMPLOYEE_TASKS_PAGE_SIZE]
@@ -1871,8 +1917,8 @@ async def _send_task_button_report(context: ContextTypes.DEFAULT_TYPE, label: st
             header = f"👤 {label} — {scope_note} ({total})"
             if len(pages) > 1:
                 header += f", часть {page_num}/{len(pages)}"
-            text = header + ":\n" + "\n".join(_format_employee_task_lines(page_tasks, fire_ids, start_index))
-            keyboard = _employee_task_keyboard(page_tasks, start_index)
+            text = header + ":\n" + "\n".join(_format_employee_task_lines(page_tasks, start_index))
+            keyboard = _employee_task_keyboard(page_tasks, start_index, include_weekly_button)
             await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text, reply_markup=keyboard)
     except Exception:
         logger.exception("Не удалось отправить отчёт по сотруднику (%s) владелице", label)
@@ -1913,7 +1959,9 @@ async def _send_employee_report(context: ContextTypes.DEFAULT_TYPE, employee_key
         return
     if name_prefix:
         tasks = [t for t in tasks if t["name"].strip().lower().startswith(name_prefix)]
-    await _send_task_button_report(context, label, "открытые задачи по всему ClickUp", tasks)
+    await _send_task_button_report(
+        context, label, "открытые задачи по всему ClickUp", tasks, include_weekly_button=True
+    )
 
 
 async def _send_employee_weekly_report(context: ContextTypes.DEFAULT_TYPE, employee_key: str) -> None:
@@ -1946,20 +1994,51 @@ async def _send_employee_weekly_report(context: ContextTypes.DEFAULT_TYPE, emplo
     await _send_task_button_report(context, label, "открытые задачи из WEEKLY TASKS", tasks)
 
 
-_EMPLOYEE_TASK_ACTIONS = ("done", "urgent", "fire", "delask", "delyes", "delno")
+async def _send_weekly_status_report(context: ContextTypes.DEFAULT_TYPE, command_key: str) -> None:
+    """/unsorted /atlas /altyn /approval /docsdev /monday /tuesday /wednesday /thursday
+    /friday /saturday /sunday (по прямой просьбе владелицы, часть 27, см.
+    config.CLICKUP_WEEKLY_STATUS_COMMANDS) — тянет ВСЕ открытые задачи списка WEEKLY
+    TASKS с конкретным статусом (фильтр на стороне ClickUp API, см.
+    clickup_client.get_open_tasks/statuses), по всем ответственным сразу — в отличие от
+    персональных команд по сотрудникам (/lili /olga ...), эти НЕ привязаны к одному
+    человеку. Кнопки под задачами те же 4, что и у остальных отчётов (без 5-й "📆 Weekly»
+    — задача и так уже в WEEKLY TASKS, переносить её ещё раз некуда)."""
+    if config.OWNER_USER_ID is None:
+        return
+    command = config.CLICKUP_WEEKLY_STATUS_COMMANDS[command_key]
+    label = command["label"]
+    status = command["status"]
+    try:
+        tasks = clickup_client.get_open_tasks(config.CLICKUP_LIST_WEEKLY, statuses=[status])
+    except Exception:
+        logger.exception("Не удалось получить задачи WEEKLY TASKS со статусом «%s»", status)
+        text = f"Не смогла получить задачи «{label}» из WEEKLY TASKS — попробую в следующий раз."
+        try:
+            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text)
+        except Exception:
+            logger.exception("Не удалось отправить отчёт по статусу WEEKLY TASKS %s владелице", command_key)
+        return
+    await _send_task_button_report(context, label, f"из WEEKLY TASKS · статус «{label}»", tasks)
+
+
+_EMPLOYEE_TASK_ACTIONS = ("done", "urgent", "fire", "weekly", "delask", "delyes", "delno")
 
 
 async def handle_employee_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Кнопки под задачами в отчётах по сотрудникам (см. _send_employee_report,
-    _employee_task_keyboard) — по прямой просьбе владелицы, 06.09-часть 24:
+    _employee_task_keyboard) — по прямой просьбе владелицы, 06.09-часть 24 (кнопка
+    "📆 Weekly" и тег вместо локальной пометки у "🔥 Горит" — часть 27):
     "✅ Сделано" — закрывает задачу в ClickUp (см. clickup_client.mark_task_done —
     сама разбирается, каким именно статусом закрывать конкретный список задачи).
     "🔴 Срочная" — ставит приоритет Urgent в ClickUp (тот же 🔴, что уже используется в
     остальных отчётах для срочных/высокоприоритетных задач).
-    "🔥 Горит" — переключатель ЧИСТО внутри бота (см. storage.mark_task_fire/
-    unmark_task_fire) — ничего не меняет в самом ClickUp, только поднимает задачу в
-    начало списка и меняет значок при следующем вызове той же команды (согласовано с
-    владелицей заранее — заводить под это тег в ClickUp она не захотела).
+    "🔥 Горит" — переключатель, ставящий/снимающий НАСТОЯЩИЙ тег ClickUp
+    config.CLICKUP_FIRE_TAG_NAME ("кричащая задача», см. _is_fire/
+    clickup_client.ensure_tag_on_task) — виден и в веб-интерфейсе ClickUp, не только в
+    боте (с части 27; в части 24 это была чисто локальная пометка внутри бота).
+    "📆 Weekly" (только там, где включена — см. _employee_task_keyboard) — переносит
+    задачу в список WEEKLY TASKS и ставит статус Unsorted (clickup_client.move_task_to_list
+    + set_task_status).
     "🗑 Удалить" — двухшаговое действие: сначала "delask" присылает отдельное
     сообщение-подтверждение с именем задачи ("delyes"/"delno"), и только "delyes" реально
     удаляет задачу из ClickUp НАСОВСЕМ — шаг подтверждения добавлен по прямой просьбе
@@ -1985,7 +2064,6 @@ async def handle_employee_task_callback(update: Update, context: ContextTypes.DE
             logger.exception("Не удалось закрыть задачу %s из отчёта по сотруднику", task_id)
             await query.answer("Не смогла отметить как сделано — проверь в ClickUp.", show_alert=True)
             return
-        storage.unmark_task_fire(task_id)
         await query.answer("✅ Отмечено как сделано в ClickUp")
         return
 
@@ -2000,12 +2078,46 @@ async def handle_employee_task_callback(update: Update, context: ContextTypes.DE
         return
 
     if action == "fire":
-        if storage.is_task_fire(task_id):
-            storage.unmark_task_fire(task_id)
-            await query.answer("Сняла пометку 🔥")
+        try:
+            task = clickup_client.get_task(task_id)
+        except Exception:
+            logger.exception("Не удалось прочитать задачу %s перед пометкой «горит»", task_id)
+            await query.answer("Не смогла проверить тег в ClickUp.", show_alert=True)
+            return
+        if not task:
+            await query.answer("Задача не найдена (возможно, уже удалена).", show_alert=True)
+            return
+        tag_name = config.CLICKUP_FIRE_TAG_NAME
+        has_fire = any((tg or "").lower() == tag_name.lower() for tg in task.get("tags") or [])
+        try:
+            if has_fire:
+                clickup_client.remove_tag_from_task(task_id, tag_name)
+            else:
+                clickup_client.ensure_tag_on_task(task_id, tag_name, space_id=task.get("space_id"))
+        except Exception:
+            logger.exception(
+                "Не удалось %s тег «%s» задаче %s", "снять" if has_fire else "поставить", tag_name, task_id
+            )
+            await query.answer("Не смогла обновить тег в ClickUp.", show_alert=True)
+            return
+        if has_fire:
+            await query.answer("Сняла тег 🔥")
         else:
-            storage.mark_task_fire(task_id)
-            await query.answer("🔥 Пометила — поднимется наверх при следующем вызове команды")
+            await query.answer(f"🔥 Поставила тег «{tag_name}» в ClickUp")
+        return
+
+    if action == "weekly":
+        if not config.CLICKUP_WEEKLY_ENABLED:
+            await query.answer("Список WEEKLY TASKS пока не настроен.", show_alert=True)
+            return
+        try:
+            clickup_client.move_task_to_list(task_id, config.CLICKUP_LIST_WEEKLY)
+            clickup_client.set_task_status(task_id, "unsorted")
+        except Exception:
+            logger.exception("Не удалось перенести задачу %s в WEEKLY TASKS", task_id)
+            await query.answer("Не смогла перенести задачу — проверь в ClickUp.", show_alert=True)
+            return
+        await query.answer("📆 Перенесла в WEEKLY TASKS, статус Unsorted")
         return
 
     if action == "delask":
@@ -2039,7 +2151,6 @@ async def handle_employee_task_callback(update: Update, context: ContextTypes.DE
             await query.answer()
             await query.edit_message_text("Не смогла удалить — проверь в ClickUp.")
             return
-        storage.unmark_task_fire(task_id)
         await query.answer()
         await query.edit_message_text("🗑 Удалено насовсем.")
         return
@@ -2101,6 +2212,34 @@ def _make_employee_weekly_command_handler(employee_key: str):
             return
         await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
         await _send_employee_weekly_report(context, employee_key)
+
+    return handler
+
+
+def _make_weekly_status_command_handler(command_key: str):
+    """Команды /unsorted /atlas /altyn /approval /docsdev /monday ... /sunday (по прямой
+    просьбе владелицы, часть 27, см. config.CLICKUP_WEEKLY_STATUS_COMMANDS) — каждая для
+    своего статуса списка WEEKLY TASKS, по всем ответственным сразу. Только в личке,
+    только для владелицы — тот же паттерн гейтинга, что у персональных команд по
+    сотрудникам."""
+    label = config.CLICKUP_WEEKLY_STATUS_COMMANDS[command_key]["label"]
+
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        if chat.type != "private":
+            await update.message.reply_text("Эта команда работает только в личке.")
+            return
+        if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+            await update.message.reply_text("Эта команда только для владелицы.")
+            return
+        if not config.CLICKUP_WEEKLY_ENABLED:
+            await update.message.reply_text(
+                "Список WEEKLY TASKS пока не настроен (CLICKUP_LIST_WEEKLY) — "
+                f"задачи «{label}» из него выгружать не могу."
+            )
+            return
+        await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+        await _send_weekly_status_report(context, command_key)
 
     return handler
 
@@ -2230,7 +2369,7 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
         for key, e in config.EMPLOYEE_COMMANDS.items()
     ]
     sections.append(
-        "👤 Задачи по сотрудникам (весь ClickUp, с кнопками ✅/🗑/🔴/🔥 под каждой):\n"
+        "👤 Задачи по сотрудникам (весь ClickUp, с кнопками ✅/🗑/🔴/🔥/📆 под каждой):\n"
         + "\n".join(employee_lines)
     )
 
@@ -2239,6 +2378,15 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
         for key in config.EMPLOYEE_COMMANDS
     ]
     sections.append("📅 Те же люди, но только недельные задачи (список WEEKLY TASKS):\n" + "\n".join(weekly_lines))
+
+    weekly_status_lines = [
+        f"/{key} — задачи WEEKLY TASKS со статусом «{c['label']}», по всем сразу"
+        for key, c in config.CLICKUP_WEEKLY_STATUS_COMMANDS.items()
+    ]
+    sections.append(
+        "📆 Задачи WEEKLY TASKS по статусу (с кнопками ✅/🗑/🔴/🔥 под каждой):\n"
+        + "\n".join(weekly_status_lines)
+    )
 
     sections.append(
         "🗓 Календарь и прочее:\n"
@@ -2296,15 +2444,22 @@ def build_application() -> Application:
         app.add_handler(
             CommandHandler(f"{employee_key}weekly", _make_employee_weekly_command_handler(employee_key))
         )
+    # /unsorted /atlas /altyn /approval /docsdev /monday ... /sunday — по прямой просьбе
+    # владелицы, часть 27 (см. config.CLICKUP_WEEKLY_STATUS_COMMANDS/
+    # _send_weekly_status_report): задачи списка WEEKLY TASKS по конкретному статусу, по
+    # всем ответственным сразу.
+    for command_key in config.CLICKUP_WEEKLY_STATUS_COMMANDS:
+        app.add_handler(CommandHandler(command_key, _make_weekly_status_command_handler(command_key)))
     # /commands — только в личке, только владелице: краткая справка по всем командам бота
     # (см. handle_commands_command).
     app.add_handler(CommandHandler("commands", handle_commands_command))
-    # Кнопки под задачами в отчётах по сотрудникам (✅/🗑/🔴/🔥, см.
-    # _employee_task_keyboard/handle_employee_task_callback).
+    # Кнопки под задачами в отчётах по сотрудникам (✅/🗑/🔴/🔥, плюс 📆 Weekly в
+    # командах по сотрудникам без "weekly" — см. _employee_task_keyboard/
+    # handle_employee_task_callback).
     app.add_handler(
         CallbackQueryHandler(
             handle_employee_task_callback,
-            pattern=r"^emp:(done|urgent|fire|delask|delyes|delno):",
+            pattern=r"^emp:(done|urgent|fire|weekly|delask|delyes|delno):",
         )
     )
     # Кнопки "❌ Отменить"/"✅ Создать" под превью явной команды на постановку задачи в
