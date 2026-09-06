@@ -74,7 +74,9 @@ def create_task(
     return resp.json()
 
 
-def get_open_tasks(list_id: str, assignee_id: int | None = None) -> list[dict]:
+def get_open_tasks(
+    list_id: str, assignee_id: int | None = None, statuses: list[str] | None = None
+) -> list[dict]:
     """Тянет реальные ОТКРЫТЫЕ (незавершённые) задачи списка прямо из ClickUp — источник
     истины для отчётов по проектам (/tasksX, /tasksall, /urgent, утренний дайджест —
     все они сознательно ограничены 4 официальными проектными списками), в отличие от
@@ -86,9 +88,16 @@ def get_open_tasks(list_id: str, assignee_id: int | None = None) -> list[dict]:
     assignee_id — если задан, фильтрует на стороне ClickUp API (параметр
     "assignees[]») и возвращает только задачи, назначенные на этого человека
     (config.CLICKUP_ASSIGNEE_MAP); без него — все открытые задачи списка, как раньше.
+    statuses — если задан, фильтрует на стороне ClickUp API (параметр "statuses[]») и
+    возвращает только задачи с одним из этих статусов (используется командами по
+    статусам списка WEEKLY TASKS — /unsorted /atlas /monday и т.д., см.
+    config.CLICKUP_WEEKLY_STATUS_COMMANDS/bot.py::_send_weekly_status_report); без него —
+    все открытые задачи списка, как раньше.
     Возвращает список словарей {"id", "name", "priority" (urgent/high/normal/low/None),
     "date_created" (unix-время в секундах), "due_date" (unix-время в секундах или None,
-    если срок не задан в ClickUp), "url"}, по возрастанию даты создания. Бросает
+    если срок не задан в ClickUp), "url", "tags" (список имён тегов задачи — нужно, чтобы
+    отличать задачи, помеченные "🔥 Горит», см. bot.py::_is_fire)}, по возрастанию даты
+    создания. Бросает
     исключение при ошибке сети/API — вызывающий код сам решает, как это залогировать и
     что ответить пользователю."""
     if not config.CLICKUP_API_TOKEN:
@@ -99,6 +108,8 @@ def get_open_tasks(list_id: str, assignee_id: int | None = None) -> list[dict]:
         params = {"archived": "false", "page": page, "order_by": "created", "reverse": "false"}
         if assignee_id is not None:
             params["assignees[]"] = [assignee_id]
+        if statuses:
+            params["statuses[]"] = statuses
         resp = requests.get(
             f"{BASE_URL}/list/{list_id}/task",
             headers=_headers(),
@@ -128,6 +139,7 @@ def get_open_tasks(list_id: str, assignee_id: int | None = None) -> list[dict]:
                     "date_created": created,
                     "due_date": due_date,
                     "url": t.get("url"),
+                    "tags": [tg.get("name") for tg in t.get("tags") or [] if tg.get("name")],
                 }
             )
         if data.get("last_page", True) or not batch:
@@ -159,10 +171,18 @@ def get_open_tasks_team_wide(assignee_id: int | None = None) -> list[dict]:
     предупреждение, но накопленное уже возвращается, а не теряется.
 
     Возвращает список словарей {"id", "name", "priority", "date_created", "due_date",
-    "url", "list_name"} — "list_name" (может быть None) добавлен специально для этой
-    функции, чтобы в отчёте по сотруднику было видно, из какого списка/проекта задача,
-    раз теперь они могут быть откуда угодно. Бросает исключение при ошибке сети/API —
-    вызывающий код сам решает, как это залогировать и что ответить пользователю."""
+    "url", "tags", "list_name", "folder_name", "space_id"} — "list_name"/"folder_name"
+    (могут быть None) и "space_id" добавлены специально для этой функции, чтобы в отчёте
+    по сотруднику было видно, из какого пространства/папки/списка задача (по прямой
+    просьбе владелицы, часть 27 — см. bot.py::_format_task_location), раз теперь они
+    могут быть откуда угодно; ClickUp подставляет "folder": {"name": "hidden"} у списков
+    без реальной папки (лежащих прямо в пространстве) — такое имя отфильтровывается в
+    None, это не настоящее название папки. "space_id" — сам ClickUp API не отдаёт имя
+    пространства прямо в объекте задачи, только id (см. config.CLICKUP_SPACE_NAMES —
+    сопоставление сделано вручную по данным живого запроса
+    clickup_get_workspace_hierarchy, а не через отдельный API-вызов на каждую задачу).
+    Бросает исключение при ошибке сети/API — вызывающий код сам решает, как это
+    залогировать и что ответить пользователю."""
     if not config.CLICKUP_API_TOKEN:
         raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
     if not config.CLICKUP_TEAM_ID:
@@ -202,6 +222,11 @@ def get_open_tasks_team_wide(assignee_id: int | None = None) -> list[dict]:
             except (TypeError, ValueError):
                 due_date = None
             list_field = t.get("list") or {}
+            folder_field = t.get("folder") or {}
+            space_field = t.get("space") or {}
+            folder_name = folder_field.get("name")
+            if folder_name and folder_name.strip().lower() == "hidden":
+                folder_name = None
             tasks.append(
                 {
                     "id": t.get("id"),
@@ -210,7 +235,10 @@ def get_open_tasks_team_wide(assignee_id: int | None = None) -> list[dict]:
                     "date_created": created,
                     "due_date": due_date,
                     "url": t.get("url"),
+                    "tags": [tg.get("name") for tg in t.get("tags") or [] if tg.get("name")],
                     "list_name": list_field.get("name"),
+                    "folder_name": folder_name,
+                    "space_id": space_field.get("id"),
                 }
             )
         if len(batch) < 100:
@@ -229,11 +257,13 @@ def get_open_tasks_team_wide(assignee_id: int | None = None) -> list[dict]:
 def get_task(task_id: str) -> dict | None:
     """Читает одну задачу по id — нужна кнопкам под отчётами по сотрудникам (см.
     bot.py::handle_employee_task_callback), когда на руках только task_id из
-    callback_data и нужно узнать актуальное имя (для подтверждения удаления) или id её
+    callback_data и нужно узнать актуальное имя (для подтверждения удаления), id её
     списка (чтобы понять, каким статусом закрывать при "✅ Сделано" — см.
-    get_list_closed_status/mark_task_done ниже). None, если задача не найдена (уже
-    удалена — например, кто-то удалил её напрямую в ClickUp между отправкой отчёта и
-    нажатием кнопки)."""
+    get_list_closed_status/mark_task_done ниже), id её пространства (чтобы завести тег
+    "кричащая задача", если его ещё нет в этом пространстве — см. ensure_tag_on_task) или
+    её текущие теги (чтобы понять, стоит ли уже пометка "🔥 Горит» — см. bot.py::_is_fire).
+    None, если задача не найдена (уже удалена — например, кто-то удалил её напрямую в
+    ClickUp между отправкой отчёта и нажатием кнопки)."""
     if not config.CLICKUP_API_TOKEN:
         raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
     resp = requests.get(f"{BASE_URL}/task/{task_id}", headers=_headers(), timeout=15)
@@ -242,7 +272,14 @@ def get_task(task_id: str) -> dict | None:
     resp.raise_for_status()
     data = resp.json()
     list_field = data.get("list") or {}
-    return {"id": data.get("id"), "name": data.get("name") or "(без названия)", "list_id": list_field.get("id")}
+    space_field = data.get("space") or {}
+    return {
+        "id": data.get("id"),
+        "name": data.get("name") or "(без названия)",
+        "list_id": list_field.get("id"),
+        "space_id": space_field.get("id"),
+        "tags": [tg.get("name") for tg in data.get("tags") or [] if tg.get("name")],
+    }
 
 
 def get_list_closed_status(list_id: str) -> str | None:
@@ -334,6 +371,93 @@ def delete_task(task_id: str) -> None:
         raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
     resp = requests.delete(f"{BASE_URL}/task/{task_id}", headers=_headers(), timeout=20)
     resp.raise_for_status()
+
+
+def move_task_to_list(task_id: str, list_id: str) -> None:
+    """Переносит задачу в другой список ClickUp — по прямой просьбе владелицы (5-я кнопка
+    "📆 Weekly" под отчётами по сотрудникам, см. bot.py::handle_employee_task_callback,
+    действие "weekly"): формально это "Add Task To List" (POST
+    /v2/list/{list_id}/task/{task_id}) — эндпоинт ClickUp для мульти-списковой функции
+    "Tasks in Multiple Lists" (добавляет задачу ДОПОЛНИТЕЛЬНО в другой список, не убирая
+    из исходного). Живой тест в реальном рабочем пространстве Марины (эта функция ClickApp
+    там не включена) подтвердил, что при отключённой мульти-списковости этот же вызов
+    реально ПЕРЕНОСИТ задачу — "родной" список задачи становится list_id, дублирования не
+    происходит. Если в будущем в workspace включат многосписочность, поведение может
+    измениться на настоящее мультисписковое добавление — тогда потребуется отдельно убирать
+    задачу из старого списка. Бросает исключение при ошибке сети/API."""
+    if not config.CLICKUP_API_TOKEN:
+        raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
+    resp = requests.post(f"{BASE_URL}/list/{list_id}/task/{task_id}", headers=_headers(), timeout=20)
+    resp.raise_for_status()
+
+
+def add_tag_to_task(task_id: str, tag_name: str) -> None:
+    """Ставит существующий тег на задачу. ClickUp требует, чтобы тег с таким именем уже
+    существовал в ПРОСТРАНСТВЕ (space) этой задачи — иначе вызов падает с ошибкой (см.
+    ensure_tag_on_task ниже, которая сама заводит тег при необходимости). Бросает
+    исключение при ошибке сети/API."""
+    if not config.CLICKUP_API_TOKEN:
+        raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
+    resp = requests.post(f"{BASE_URL}/task/{task_id}/tag/{tag_name}", headers=_headers(), timeout=15)
+    resp.raise_for_status()
+
+
+def remove_tag_from_task(task_id: str, tag_name: str) -> None:
+    """Снимает тег с задачи (сам тег в пространстве при этом не удаляется, только связь
+    с этой конкретной задачей). Бросает исключение при ошибке сети/API."""
+    if not config.CLICKUP_API_TOKEN:
+        raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
+    resp = requests.delete(f"{BASE_URL}/task/{task_id}/tag/{tag_name}", headers=_headers(), timeout=15)
+    resp.raise_for_status()
+
+
+def create_space_tag(space_id: str, tag_name: str, fg: str = "#ffffff", bg: str = "#e50000") -> None:
+    """Заводит новый тег в пространстве ClickUp (нужен один раз на каждое пространство —
+    см. ensure_tag_on_task ниже). fg/bg — цвет текста/фона тега в ClickUp UI, по умолчанию
+    белым по красному (визуально соответствует "🔥 Горит»/срочности). Бросает исключение
+    при ошибке сети/API — в т.ч. если тег с таким именем в этом пространстве уже есть
+    (вызывающий код должен считать это неопасным и просто повторить добавление тега на
+    задачу, см. ensure_tag_on_task)."""
+    if not config.CLICKUP_API_TOKEN:
+        raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
+    resp = requests.post(
+        f"{BASE_URL}/space/{space_id}/tag",
+        headers=_headers(),
+        json={"tag": {"name": tag_name, "tag_fg": fg, "tag_bg": bg}},
+        timeout=15,
+    )
+    resp.raise_for_status()
+
+
+def ensure_tag_on_task(task_id: str, tag_name: str, space_id: str | None = None) -> None:
+    """Ставит тег на задачу, при необходимости заранее заведя его в пространстве этой
+    задачи — по прямой просьбе владелицы (часть 27, кнопка "🔥 Горит» теперь ставит
+    настоящий ClickUp-тег "кричащая задача», см. config.CLICKUP_FIRE_TAG_NAME, а не только
+    локальную пометку внутри бота, как раньше в части 24). ClickUp не заводит
+    отсутствующий тег автоматически при добавлении на задачу (add_tag_to_task падает с
+    ошибкой) — здесь это на первый неудачный вызов ловится, тег заводится в пространстве
+    задачи (create_space_tag) и добавление повторяется. space_id можно передать заранее,
+    если уже известен (см. bot.py::handle_employee_task_callback — там задача уже прочитана
+    целиком через get_task), иначе функция сама прочитает задачу, чтобы его узнать. Бросает
+    исключение, если задача не найдена, у неё не определить пространство, или создание
+    тега/повторное добавление тоже не удалось."""
+    try:
+        add_tag_to_task(task_id, tag_name)
+        return
+    except requests.HTTPError:
+        pass
+    if space_id is None:
+        task = get_task(task_id)
+        space_id = task.get("space_id") if task else None
+    if not space_id:
+        raise RuntimeError(f"Не удалось определить пространство задачи {task_id} для тега «{tag_name}»")
+    try:
+        create_space_tag(space_id, tag_name)
+    except requests.HTTPError:
+        # Скорее всего тег уже существует (создан раньше или гонка одновременных нажатий) —
+        # не страшно, дальше просто пробуем добавить его на задачу ещё раз.
+        pass
+    add_tag_to_task(task_id, tag_name)
 
 
 def test_connection(list_id: str) -> tuple[bool, str]:
