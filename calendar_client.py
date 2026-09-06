@@ -67,3 +67,46 @@ def create_event(
     event = service.events().insert(calendarId=config.GOOGLE_CALENDAR_ID, body=body).execute()
     logger.info("Событие создано в Google Calendar: %s (%s)", title, event.get("id"))
     return event["id"]
+
+
+def list_events(time_min_iso: str, time_max_iso: str) -> list[dict]:
+    """Тянет события из личного календаря Марины (config.GOOGLE_CALENDAR_ID) за
+    полуоткрытый интервал [time_min_iso, time_max_iso) — используется командой
+    /calendar (см. bot.py::handle_calendar_view_callback) для показа списка событий
+    за выбранный период (сегодня/завтра/неделя/месяц). Оба аргумента — ISO 8601
+    datetime со смещением (см. bot.py::_calendar_period_bounds). singleEvents=True
+    разворачивает повторяющиеся события в отдельные экземпляры, отсортированные по
+    времени начала. Возвращает список словарей {"title", "start", "end", "location",
+    "all_day"} — "start"/"end" остаются ISO-строками как их вернул Google (с таймзоной
+    для обычных событий, только дата "YYYY-MM-DD" для событий на весь день, см.
+    "all_day"). Читает ВСЕ события календаря за период, не только созданные ботом —
+    это осознанно: команда задумана как полноценный обзор расписания, а не только
+    зеркало собственных встреч бота. Бросает исключение при ошибке сети/API —
+    вызывающий код сам решает, как это залогировать и что ответить."""
+    service = _get_service()
+    response = (
+        service.events()
+        .list(
+            calendarId=config.GOOGLE_CALENDAR_ID,
+            timeMin=time_min_iso,
+            timeMax=time_max_iso,
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=250,
+        )
+        .execute()
+    )
+    events = []
+    for item in response.get("items", []):
+        start = item.get("start", {})
+        end = item.get("end", {})
+        events.append(
+            {
+                "title": item.get("summary") or "(без названия)",
+                "start": start.get("dateTime") or start.get("date"),
+                "end": end.get("dateTime") or end.get("date"),
+                "all_day": "dateTime" not in start,
+                "location": item.get("location") or "",
+            }
+        )
+    return events

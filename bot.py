@@ -11,7 +11,7 @@ import asyncio
 import logging
 import re
 import time
-from datetime import datetime, time as digest_time
+from datetime import datetime, time as digest_time, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -875,6 +875,9 @@ async def _log_owner_dm_tasks(user, text: str) -> None:
         logger.info("Из личного сообщения владелицы занесено задач в ClickUp: %s", created)
 
 
+_WEEKDAYS_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+
 def _format_meeting_time(iso_str: str) -> str:
     """ISO 8601 → человекочитаемо для превью черновика встречи, например
     "08.09 (вт) 15:00". При ошибке разбора возвращает исходную строку как есть —
@@ -883,8 +886,7 @@ def _format_meeting_time(iso_str: str) -> str:
         dt = datetime.fromisoformat(iso_str)
     except ValueError:
         return iso_str
-    weekday_short = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"][dt.weekday()]
-    return dt.strftime(f"%d.%m ({weekday_short}) %H:%M")
+    return dt.strftime(f"%d.%m ({_WEEKDAYS_SHORT[dt.weekday()]}) %H:%M")
 
 
 def _meeting_confirm_keyboard(meeting_id: int):
@@ -1057,6 +1059,159 @@ async def handle_calendar_callback(update: Update, context: ContextTypes.DEFAULT
         storage.resolve_meeting(meeting_id, event_id)
         _mirror_meeting_to_clickup(meeting)
         await query.edit_message_text(f"Готово, добавила в календарь: «{meeting['title']}» 📅")
+
+
+_CALENDAR_PERIOD_LABELS = {
+    "today": "Сегодня",
+    "tomorrow": "Завтра",
+    "this_week": "Текущая неделя",
+    "next_week": "Следующая неделя",
+    "this_month": "Текущий месяц",
+}
+
+
+def _calendar_period_bounds(period: str) -> tuple[datetime, datetime] | None:
+    """Возвращает полуоткрытый интервал [начало, конец) для одной из пяти кнопок
+    команды /calendar (см. handle_calendar_view_callback), в часовом поясе
+    config.MARINATWIN_TIMEZONE — тот же пояс, что используется для постановки
+    встреч (meeting_extractor), а не часовой пояс самого календаря (m@altyn.one
+    настроен на Asia/Dubai) — чтобы "сегодня"/"эта неделя" совпадали с тем, как
+    Марина сама мыслит о времени. Неделя считается с понедельника (российское
+    бытовое соглашение), месяц — с 1 числа по 1 число следующего месяца. Возвращает
+    None для неизвестного ключа периода (не должно происходить при обычном
+    использовании кнопок, но защищает от неожиданного callback_data)."""
+    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+    today_start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "today":
+        return today_start, today_start + timedelta(days=1)
+    if period == "tomorrow":
+        start = today_start + timedelta(days=1)
+        return start, start + timedelta(days=1)
+    if period == "this_week":
+        monday = today_start - timedelta(days=today_start.weekday())
+        return monday, monday + timedelta(days=7)
+    if period == "next_week":
+        monday = today_start - timedelta(days=today_start.weekday()) + timedelta(days=7)
+        return monday, monday + timedelta(days=7)
+    if period == "this_month":
+        start = today_start.replace(day=1)
+        end = start.replace(year=start.year + 1, month=1) if start.month == 12 else start.replace(month=start.month + 1)
+        return start, end
+    return None
+
+
+def _calendar_period_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Сегодня", callback_data="calview:today"),
+                InlineKeyboardButton("Завтра", callback_data="calview:tomorrow"),
+            ],
+            [
+                InlineKeyboardButton("Текущая неделя", callback_data="calview:this_week"),
+                InlineKeyboardButton("Следующая неделя", callback_data="calview:next_week"),
+            ],
+            [InlineKeyboardButton("Текущий месяц", callback_data="calview:this_month")],
+        ]
+    )
+
+
+def _format_calendar_event_line(event: dict, tz: ZoneInfo) -> str:
+    """Одна строка списка /calendar: "DD.MM (пн) HH:MM–HH:MM — Название 📍место".
+    Для событий на весь день (event["all_day"]) время не показываем. При ошибке
+    разбора даты показывает исходную строку как есть — лучше сырое значение, чем
+    падение на форматировании целого списка из-за одного кривого события."""
+    if event["all_day"]:
+        try:
+            d = datetime.fromisoformat(event["start"])
+            time_part = f"{d.strftime('%d.%m')} ({_WEEKDAYS_SHORT[d.weekday()]}), весь день"
+        except ValueError:
+            time_part = event["start"]
+    else:
+        try:
+            start_dt = datetime.fromisoformat(event["start"]).astimezone(tz)
+            end_dt = datetime.fromisoformat(event["end"]).astimezone(tz)
+            time_part = (
+                f"{start_dt.strftime('%d.%m')} ({_WEEKDAYS_SHORT[start_dt.weekday()]}) "
+                f"{start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')}"
+            )
+        except ValueError:
+            time_part = f"{event['start']} – {event['end']}"
+    location_part = f" 📍{event['location']}" if event.get("location") else ""
+    return f"{time_part} — {event['title']}{location_part}"
+
+
+async def handle_calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/calendar — только в личке, только для владелицы: предлагает выбрать период
+    кнопками (Сегодня/Завтра/Текущая неделя/Следующая неделя/Текущий месяц), см.
+    handle_calendar_view_callback — там и происходит реальный запрос к Google Calendar
+    по нажатию кнопки."""
+    chat = update.effective_chat
+    if chat.type != "private":
+        await update.message.reply_text("Эта команда работает только в личке.")
+        return
+    if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+        await update.message.reply_text("Эта команда только для владелицы.")
+        return
+    if not config.GOOGLE_CALENDAR_ENABLED:
+        await update.message.reply_text("Google Calendar пока не настроен.")
+        return
+    await update.message.reply_text("Какой период показать?", reply_markup=_calendar_period_keyboard())
+
+
+async def handle_calendar_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает кнопки периода под /calendar (см. handle_calendar_command и
+    _calendar_period_keyboard) — тянет события ЖИВЬЁМ из Google Calendar API
+    (calendar_client.list_events, весь календарь config.GOOGLE_CALENDAR_ID за период,
+    не только встречи, поставленные самим ботом) и заменяет текст того же сообщения
+    списком, оставляя те же кнопки — можно переключать период дальше, не вызывая
+    /calendar заново. Список обрезается под лимит сообщения Telegram, если событий
+    очень много (см. TELEGRAM_MESSAGE_LIMIT) — это команда просмотра одним
+    сообщением, а не постраничный отчёт."""
+    query = update.callback_query
+    await query.answer()
+
+    if config.OWNER_USER_ID is not None and query.from_user.id != config.OWNER_USER_ID:
+        return
+
+    _, _, period = (query.data or "").partition(":")
+    bounds = _calendar_period_bounds(period)
+    if not bounds:
+        return
+    start, end = bounds
+    label = _CALENDAR_PERIOD_LABELS.get(period, period)
+
+    try:
+        events = calendar_client.list_events(start.isoformat(), end.isoformat())
+    except Exception:
+        logger.exception("Не удалось получить события календаря за период %s", period)
+        await query.edit_message_text(
+            f"Не смогла получить события календаря ({label}) — попробуй ещё раз чуть позже.",
+            reply_markup=_calendar_period_keyboard(),
+        )
+        return
+
+    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+    if not events:
+        text = f"📅 {label}: событий нет."
+    else:
+        lines = [_format_calendar_event_line(e, tz) for e in events]
+        header = f"📅 {label} ({len(events)}):\n\n"
+        body = "\n".join(lines)
+        if len(header) + len(body) > TELEGRAM_MESSAGE_LIMIT:
+            # Слишком много событий для одного сообщения-превью — показываем сколько
+            # влезает и честно говорим, что список неполный, а не режем список молча
+            # или падаем на превышении лимита Telegram.
+            budget = TELEGRAM_MESSAGE_LIMIT - len(header) - 80
+            truncated = body[:budget]
+            cut = truncated.rfind("\n")
+            if cut != -1:
+                truncated = truncated[:cut]
+            shown = truncated.count("\n") + 1 if truncated else 0
+            body = f"{truncated}\n\n…и ещё {len(events) - shown} событий, не поместились — сузь период."
+        text = header + body
+
+    await query.edit_message_text(text, reply_markup=_calendar_period_keyboard())
 
 
 async def _ask_classification_question(
@@ -1491,6 +1646,11 @@ def build_application() -> Application:
     app.add_handler(
         CallbackQueryHandler(handle_calendar_callback, pattern=r"^cal_(confirm|cancel|edit):")
     )
+    # /calendar — только в личке, только владелице: кнопки периода + живой список
+    # событий из Google Calendar за выбранный период (см. handle_calendar_command /
+    # handle_calendar_view_callback).
+    app.add_handler(CommandHandler("calendar", handle_calendar_command))
+    app.add_handler(CallbackQueryHandler(handle_calendar_view_callback, pattern=r"^calview:"))
     # Личка — обычный разговор с персоной Marina Twin.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     # Группы — тихий сбор переписки, без ответов.
