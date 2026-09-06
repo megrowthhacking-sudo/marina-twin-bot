@@ -1629,26 +1629,60 @@ def _employee_task_keyboard(tasks: list[dict], start_index: int = 1) -> InlineKe
     return InlineKeyboardMarkup(rows)
 
 
-async def _send_employee_report(context: ContextTypes.DEFAULT_TYPE, employee_key: str) -> None:
-    """/lili /olga /sveta /ilya /nazgul /alex /ub /marina — тянет живые открытые задачи
-    этого конкретного человека ПО ВСЕМУ ClickUp (все пространства/папки/списки, см.
-    clickup_client.get_open_tasks_team_wide), а не только из 4 официальных проектных
-    списков (config.CLICKUP_LIST_IDS) — по прямой просьбе владелицы (06.09): сотрудники
-    нередко ведут задачи и в личных папках/пространствах вне этих 4 проектов (например
-    "Саша"/"Ник" в иерархии воркспейса). У семи из восьми команд есть реальный
-    ClickUp-аккаунт (assignee_id, config.EMPLOYEE_COMMANDS) — фильтрация идёт на
-    стороне ClickUp API. У Саши (/alex) реального аккаунта нет — вместо этого задачи
-    находятся по буквальному текстовому префиксу "Саша:" в начале названия (так их
-    заводит task_extractor.py, когда не может сопоставить имя с реальным
-    ClickUp-аккаунтом) — в этом случае приходится тянуть ВСЕ открытые задачи workspace
-    без серверного фильтра и отфильтровывать по префиксу уже на своей стороне.
+async def _send_task_button_report(context: ContextTypes.DEFAULT_TYPE, label: str, scope_note: str, tasks: list[dict]) -> None:
+    """Общая "хвостовая" часть _send_employee_report и _send_employee_weekly_report (часть
+    24) — раскладывает уже готовый (отфильтрованный по нужному человеку) список задач по
+    страницам с кнопками-действиями (см. _employee_task_keyboard/
+    handle_employee_task_callback), задачи, помеченные "🔥 Горит", показываются первыми
+    (см. _sort_tasks_fire_first). scope_note — короткая приписка в заголовке отчёта, откуда
+    именно эти задачи ("по всему ClickUp" / "из WEEKLY TASKS"), чтобы было понятно, какую
+    именно команду вызвали."""
+    if not tasks:
+        try:
+            await context.bot.send_message(
+                chat_id=config.OWNER_USER_ID, text=f"👤 {label} — открытых задач {scope_note} не нашла.",
+            )
+        except Exception:
+            logger.exception("Не удалось отправить отчёт по сотруднику (%s) владелице", label)
+        return
 
-    С 06.09 (часть 24) каждая задача сопровождается рядом из 4 кнопок-действий (см.
-    _employee_task_keyboard/handle_employee_task_callback) — отчёт при этом режется на
-    несколько сообщений подряд (см. _EMPLOYEE_TASKS_PAGE_SIZE), а не остаётся одним, как
-    раньше: с кнопками под сотней с лишним задач (см. случай Лили) одно сообщение
-    технически ненадёжно. Задачи, помеченные кнопкой "🔥 Горит" (storage.get_fire_task_ids),
-    показываются первыми (см. _sort_tasks_fire_first)."""
+    fire_ids = storage.get_fire_task_ids()
+    tasks = _sort_tasks_fire_first(tasks, fire_ids)
+    total = len(tasks)
+    pages = [
+        tasks[i : i + _EMPLOYEE_TASKS_PAGE_SIZE]
+        for i in range(0, total, _EMPLOYEE_TASKS_PAGE_SIZE)
+    ]
+    try:
+        for page_num, page_tasks in enumerate(pages, start=1):
+            start_index = (page_num - 1) * _EMPLOYEE_TASKS_PAGE_SIZE + 1
+            header = f"👤 {label} — {scope_note} ({total})"
+            if len(pages) > 1:
+                header += f", часть {page_num}/{len(pages)}"
+            text = header + ":\n" + "\n".join(_format_employee_task_lines(page_tasks, fire_ids, start_index))
+            keyboard = _employee_task_keyboard(page_tasks, start_index)
+            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text, reply_markup=keyboard)
+    except Exception:
+        logger.exception("Не удалось отправить отчёт по сотруднику (%s) владелице", label)
+
+
+async def _send_employee_report(context: ContextTypes.DEFAULT_TYPE, employee_key: str) -> None:
+    """/lili /olga /sveta /ilya /nazgul /alex /ub /marina /nikolay /nick — тянет живые
+    открытые задачи этого конкретного человека ПО ВСЕМУ ClickUp (все пространства/папки/
+    списки, см. clickup_client.get_open_tasks_team_wide), а не только из 4 официальных
+    проектных списков (config.CLICKUP_LIST_IDS) — по прямой просьбе владелицы (06.09):
+    сотрудники нередко ведут задачи и в личных папках/пространствах вне этих 4 проектов
+    (например "Саша"/"Ник" в иерархии воркспейса). У большинства команд есть реальный
+    ClickUp-аккаунт (assignee_id, config.EMPLOYEE_COMMANDS) — фильтрация идёт на стороне
+    ClickUp API. У Саши (/alex) реального аккаунта нет — вместо этого задачи находятся по
+    буквальному текстовому префиксу "Саша:" в начале названия (так их заводит
+    task_extractor.py, когда не может сопоставить имя с реальным ClickUp-аккаунтом) — в
+    этом случае приходится тянуть ВСЕ открытые задачи workspace без серверного фильтра и
+    отфильтровывать по префиксу уже на своей стороне.
+
+    С 06.09 (часть 24) каждая задача сопровождается рядом из 4 кнопок-действий, отчёт при
+    этом режется на несколько сообщений подряд при большом числе задач (см.
+    _send_task_button_report/_EMPLOYEE_TASKS_PAGE_SIZE)."""
     if config.OWNER_USER_ID is None:
         return
     employee = config.EMPLOYEE_COMMANDS[employee_key]
@@ -1667,34 +1701,37 @@ async def _send_employee_report(context: ContextTypes.DEFAULT_TYPE, employee_key
         return
     if name_prefix:
         tasks = [t for t in tasks if t["name"].strip().lower().startswith(name_prefix)]
+    await _send_task_button_report(context, label, "открытые задачи по всему ClickUp", tasks)
 
-    if not tasks:
-        try:
-            await context.bot.send_message(
-                chat_id=config.OWNER_USER_ID, text=f"👤 {label} — открытых задач нигде в ClickUp не нашла.",
-            )
-        except Exception:
-            logger.exception("Не удалось отправить отчёт по сотруднику %s владелице", employee_key)
+
+async def _send_employee_weekly_report(context: ContextTypes.DEFAULT_TYPE, employee_key: str) -> None:
+    """/liliweekly /olgaweekly /svetaweekly /ilyaweekly /nazgulweekly /alexweekly /ubweekly
+    /marinaweekly /nikolayweekly /nickweekly — по прямой просьбе владелицы (06.09, часть
+    24): та же логика, что у _send_employee_report, но ищет задачи этого человека ТОЛЬКО в
+    одном конкретном списке ClickUp — "WEEKLY TASKS" в пространстве "РАСПИСАНИЕ" (см.
+    config.CLICKUP_LIST_WEEKLY), а не по всему workspace. Список ровно один и заранее
+    известен, поэтому используется обычный список-ориентированный
+    clickup_client.get_open_tasks (как у /tasksatlas и остальных проектных команд), а не
+    get_open_tasks_team_wide."""
+    if config.OWNER_USER_ID is None:
         return
-
-    fire_ids = storage.get_fire_task_ids()
-    tasks = _sort_tasks_fire_first(tasks, fire_ids)
-    total = len(tasks)
-    pages = [
-        tasks[i : i + _EMPLOYEE_TASKS_PAGE_SIZE]
-        for i in range(0, total, _EMPLOYEE_TASKS_PAGE_SIZE)
-    ]
+    employee = config.EMPLOYEE_COMMANDS[employee_key]
+    label = employee["label"]
+    assignee_id = employee.get("assignee_id")
+    name_prefix = employee.get("name_prefix")
     try:
-        for page_num, page_tasks in enumerate(pages, start=1):
-            start_index = (page_num - 1) * _EMPLOYEE_TASKS_PAGE_SIZE + 1
-            header = f"👤 {label} — открытые задачи по всему ClickUp ({total})"
-            if len(pages) > 1:
-                header += f", часть {page_num}/{len(pages)}"
-            text = header + ":\n" + "\n".join(_format_employee_task_lines(page_tasks, fire_ids, start_index))
-            keyboard = _employee_task_keyboard(page_tasks, start_index)
-            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text, reply_markup=keyboard)
+        tasks = clickup_client.get_open_tasks(config.CLICKUP_LIST_WEEKLY, assignee_id=assignee_id)
     except Exception:
-        logger.exception("Не удалось отправить отчёт по сотруднику %s владелице", employee_key)
+        logger.exception("Не удалось получить задачи «%s» из WEEKLY TASKS", label)
+        text = f"Не смогла получить задачи «{label}» из WEEKLY TASKS — попробую в следующий раз."
+        try:
+            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text)
+        except Exception:
+            logger.exception("Не удалось отправить weekly-отчёт по сотруднику %s владелице", employee_key)
+        return
+    if name_prefix:
+        tasks = [t for t in tasks if t["name"].strip().lower().startswith(name_prefix)]
+    await _send_task_button_report(context, label, "открытые задачи из WEEKLY TASKS", tasks)
 
 
 _EMPLOYEE_TASK_ACTIONS = ("done", "urgent", "fire", "delask", "delyes", "delno")
@@ -1802,10 +1839,10 @@ async def handle_employee_task_callback(update: Update, context: ContextTypes.DE
 
 
 def _make_employee_command_handler(employee_key: str):
-    """Команды /lili /olga /sveta /ilya /nazgul /alex /ub /marina — каждая для своего
-    человека (см. config.EMPLOYEE_COMMANDS). Только в личке, только для владелицы —
-    мгновенно присылает живой отчёт по открытым задачам этого человека по всему
-    ClickUp (см. _send_employee_report)."""
+    """Команды /lili /olga /sveta /ilya /nazgul /alex /ub /marina /nikolay /nick — каждая
+    для своего человека (см. config.EMPLOYEE_COMMANDS). Только в личке, только для
+    владелицы — мгновенно присылает живой отчёт по открытым задачам этого человека по
+    всему ClickUp (см. _send_employee_report)."""
     label = config.EMPLOYEE_COMMANDS[employee_key]["label"]
 
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1824,6 +1861,34 @@ def _make_employee_command_handler(employee_key: str):
             return
         await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
         await _send_employee_report(context, employee_key)
+
+    return handler
+
+
+def _make_employee_weekly_command_handler(employee_key: str):
+    """Команды /liliweekly /olgaweekly /svetaweekly /ilyaweekly /nazgulweekly /alexweekly
+    /ubweekly /marinaweekly /nikolayweekly /nickweekly (по прямой просьбе владелицы,
+    06.09, часть 24) — та же связка, что и _make_employee_command_handler, но для
+    weekly-версии отчёта (см. _send_employee_weekly_report, только список WEEKLY TASKS,
+    а не весь ClickUp)."""
+    label = config.EMPLOYEE_COMMANDS[employee_key]["label"]
+
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        if chat.type != "private":
+            await update.message.reply_text("Эта команда работает только в личке.")
+            return
+        if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+            await update.message.reply_text("Эта команда только для владелицы.")
+            return
+        if not config.CLICKUP_WEEKLY_ENABLED:
+            await update.message.reply_text(
+                "Список WEEKLY TASKS пока не настроен (CLICKUP_LIST_WEEKLY) — "
+                f"задачи «{label}» из него выгружать не могу."
+            )
+            return
+        await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+        await _send_employee_weekly_report(context, employee_key)
 
     return handler
 
@@ -1912,6 +1977,68 @@ async def periodic_memory_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.exception("Не удалось обновить память чата %s («%s»)", chat_id, chat_title)
 
 
+async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/commands — по прямой просьбе владелицы (06.09, часть 24): краткая справка по ВСЕМ
+    командам бота со сжатым описанием, что каждая делает. Собирается по большей части
+    динамически из config.CLICKUP_PROJECTS/config.EMPLOYEE_COMMANDS, чтобы список сам
+    оставался в курсе, если позже добавятся новые проекты/сотрудники — не нужно отдельно
+    помнить про обновление этой справки. Только в личке, только для владелицы, как и
+    почти все остальные "технические" команды бота."""
+    chat = update.effective_chat
+    if chat.type != "private":
+        await update.message.reply_text("Эта команда работает только в личке.")
+        return
+    if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+        await update.message.reply_text("Эта команда только для владелицы.")
+        return
+
+    sections = [
+        "📋 Список команд Marina Twin\n\n"
+        "🤖 Личное:\n"
+        "/start — поздороваться / перезапустить бота\n"
+        "/reset — сбросить историю личного разговора с ботом\n"
+        "/commands — этот список"
+    ]
+
+    project_lines = [
+        f"/{p['command']} — открытые задачи проекта «{p['label']}» (плюс закрепляет чат за проектом)"
+        for p in config.CLICKUP_PROJECTS.values()
+        if p.get("command")
+    ]
+    sections.append(
+        "📋 Задачи по проектам ClickUp (вызывать в групповом чате):\n"
+        + "\n".join(project_lines)
+        + "\n\n(эти же — из личных сообщений, живой отчёт владелице):\n"
+        "/tasksall — все проекты одним отчётом\n"
+        "/urgent — только срочные задачи по всем проектам"
+    )
+
+    employee_lines = [
+        f"/{key} — открытые задачи «{e['label']}» по всему ClickUp"
+        for key, e in config.EMPLOYEE_COMMANDS.items()
+    ]
+    sections.append(
+        "👤 Задачи по сотрудникам (весь ClickUp, с кнопками ✅/🗑/🔴/🔥 под каждой):\n"
+        + "\n".join(employee_lines)
+    )
+
+    weekly_lines = [
+        f"/{key}weekly — то же самое, но только из списка WEEKLY TASKS"
+        for key in config.EMPLOYEE_COMMANDS
+    ]
+    sections.append("📅 Те же люди, но только недельные задачи (список WEEKLY TASKS):\n" + "\n".join(weekly_lines))
+
+    sections.append(
+        "🗓 Календарь и прочее:\n"
+        "/calendar — события календаря по периодам (сегодня/завтра/неделя/месяц)\n"
+        "/cancelall — снять все висящие вопросы из групповых чатов, на которые ещё не ответила"
+    )
+
+    text = "\n\n".join(sections)
+    for chunk in _split_for_telegram(text):
+        await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
+
+
 def build_application() -> Application:
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_start))
@@ -1947,10 +2074,19 @@ def build_application() -> Application:
     # handle_calendar_view_callback).
     app.add_handler(CommandHandler("calendar", handle_calendar_command))
     app.add_handler(CallbackQueryHandler(handle_calendar_view_callback, pattern=r"^calview:"))
-    # Персональные команды по сотрудникам: /lili /olga /sveta /ilya /nazgul /alex /ub —
-    # только в личке, только владелице (см. config.EMPLOYEE_COMMANDS / _send_employee_report).
+    # Персональные команды по сотрудникам: /lili /olga /sveta /ilya /nazgul /alex /ub /marina
+    # /nikolay /nick — только в личке, только владелице (см. config.EMPLOYEE_COMMANDS /
+    # _send_employee_report). Плюс для каждого — "weekly"-версия (например
+    # "/nikolayweekly", см. _send_employee_weekly_report) — задачи только из списка
+    # WEEKLY TASKS (config.CLICKUP_LIST_WEEKLY), а не по всему workspace.
     for employee_key in config.EMPLOYEE_COMMANDS:
         app.add_handler(CommandHandler(employee_key, _make_employee_command_handler(employee_key)))
+        app.add_handler(
+            CommandHandler(f"{employee_key}weekly", _make_employee_weekly_command_handler(employee_key))
+        )
+    # /commands — только в личке, только владелице: краткая справка по всем командам бота
+    # (см. handle_commands_command).
+    app.add_handler(CommandHandler("commands", handle_commands_command))
     # Кнопки под задачами в отчётах по сотрудникам (✅/🗑/🔴/🔥, см.
     # _employee_task_keyboard/handle_employee_task_callback).
     app.add_handler(
