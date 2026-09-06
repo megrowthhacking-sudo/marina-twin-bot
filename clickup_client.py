@@ -65,25 +65,34 @@ def create_task(
     return resp.json()
 
 
-def get_open_tasks(list_id: str) -> list[dict]:
+def get_open_tasks(list_id: str, assignee_id: int | None = None) -> list[dict]:
     """Тянет реальные ОТКРЫТЫЕ (незавершённые) задачи списка прямо из ClickUp — источник
-    истины для отчётов (/tasksX, /urgent, утренний дайджест), в отличие от локального
-    журнала когда-либо созданных ботом задач (тот не узнаёт о том, что задачу закрыли
-    или поменяли напрямую в ClickUp, минуя бота). Возвращает список словарей
-    {"id", "name", "priority" (urgent/high/normal/low/None), "date_created" (unix-время
-    в секундах), "due_date" (unix-время в секундах или None, если срок не задан в ClickUp),
-    "url"}, по возрастанию даты создания. Бросает исключение при ошибке
-    сети/API — вызывающий код сам решает, как это залогировать и что ответить
-    пользователю."""
+    истины для отчётов (/tasksX, /urgent, утренний дайджест, персональные команды
+    /lili /olga /sveta /ilya /nazgul /alex /ub — см. bot.py::_send_employee_report), в
+    отличие от локального журнала когда-либо созданных ботом задач (тот не узнаёт о
+    том, что задачу закрыли или поменяли напрямую в ClickUp, минуя бота).
+    assignee_id — если задан, фильтрует на стороне ClickUp API (параметр
+    "assignees[]") и возвращает только задачи, назначенные на этого человека
+    (config.CLICKUP_ASSIGNEE_MAP); без него — все открытые задачи списка, как раньше
+    (используется, например, для последующей фильтрации по текстовому префиксу имени
+    у сотрудников без реального ClickUp-аккаунта, см. config.EMPLOYEE_COMMANDS).
+    Возвращает список словарей {"id", "name", "priority" (urgent/high/normal/low/None),
+    "date_created" (unix-время в секундах), "due_date" (unix-время в секундах или None,
+    если срок не задан в ClickUp), "url"}, по возрастанию даты создания. Бросает
+    исключение при ошибке сети/API — вызывающий код сам решает, как это залогировать и
+    что ответить пользователю."""
     if not config.CLICKUP_API_TOKEN:
         raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
     tasks: list[dict] = []
     page = 0
     while True:
+        params = {"archived": "false", "page": page, "order_by": "created", "reverse": "false"}
+        if assignee_id is not None:
+            params["assignees[]"] = [assignee_id]
         resp = requests.get(
             f"{BASE_URL}/list/{list_id}/task",
             headers=_headers(),
-            params={"archived": "false", "page": page, "order_by": "created", "reverse": "false"},
+            params=params,
             timeout=20,
         )
         resp.raise_for_status()
