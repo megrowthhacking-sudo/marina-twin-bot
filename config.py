@@ -141,6 +141,7 @@ EMPLOYEE_COMMANDS = {
     "nazgul": {"label": "Назгул", "assignee_id": 113538036},
     "ub": {"label": "Юрий Борисович", "assignee_id": 113538374},
     "alex": {"label": "Саша", "assignee_id": None, "name_prefix": "саша:"},
+    "marina": {"label": "Марина", "assignee_id": 113538088},
 }
 
 # Часовой пояс утреннего дайджеста (IANA-имя, например "Europe/Moscow" или
