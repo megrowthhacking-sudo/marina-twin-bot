@@ -76,6 +76,18 @@ CLICKUP_FLUSH_INTERVAL_MINUTES = int(os.environ.get("CLICKUP_FLUSH_INTERVAL_MINU
 CLICKUP_CLASSIFICATION_TIMEOUT_MINUTES = int(os.environ.get("CLICKUP_CLASSIFICATION_TIMEOUT_MINUTES", "1440"))
 # Интеграция с ClickUp включена, если задан токен и хотя бы один список проекта.
 CLICKUP_ENABLED = bool(CLICKUP_API_TOKEN and CLICKUP_LIST_IDS)
+
+# ID workspace (team) в ClickUp — нужен персональным командам по сотрудникам
+# (/lili /olga /sveta /ilya /nazgul /alex /ub /marina, см. EMPLOYEE_COMMANDS ниже и
+# bot.py::_send_employee_report), которые по прямой просьбе владелицы (06.09) ищут
+# задачи ПО ВСЕМУ ClickUp (все пространства/папки/списки), а не только в 4 проектных
+# списках (CLICKUP_LIST_IDS выше) — сотрудники нередко ведут задачи и в личных
+# папках/пространствах вне этих 4 официальных проектов. Значение — числовой id
+# воркспейса верхнего уровня (виден в URL ClickUp сразу после app.clickup.com/, или
+# через ClickUp API GET /team). Команды по сотрудникам работают только если задан и
+# CLICKUP_API_TOKEN, и это значение — см. CLICKUP_TEAM_WIDE_ENABLED ниже.
+CLICKUP_TEAM_ID = os.environ.get("CLICKUP_TEAM_ID", "").strip() or None
+CLICKUP_TEAM_WIDE_ENABLED = bool(CLICKUP_API_TOKEN and CLICKUP_TEAM_ID)
 # Сопоставление имени ответственного (как его называют в переписке — см. task_extractor.py,
 # поле assignee_name) с ClickUp user_id, чтобы автоматически проставлять Assignee на
 # созданной задаче (см. _resolve_assignee_id в bot.py). Если имени нет в словаре —

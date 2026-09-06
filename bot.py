@@ -1549,45 +1549,60 @@ async def handle_tasksall_command(update: Update, context: ContextTypes.DEFAULT_
         await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
 
 
+def _format_employee_task_lines(tasks: list[dict]) -> list[str]:
+    """Как _format_task_lines, но для отчёта по сотруднику (см. _send_employee_report) —
+    задачи теперь могут быть из любого места ClickUp (см.
+    clickup_client.get_open_tasks_team_wide), поэтому в конце строки, если известно,
+    дописывается название списка/проекта, откуда задача — иначе Марине было бы неясно,
+    к какому из многих пространств ClickUp она относится."""
+    lines = []
+    for i, t in enumerate(tasks, start=1):
+        marker = "🔴 " if _is_urgent(t) else ""
+        due_suffix = _format_due_suffix(t.get("due_date"))
+        list_name = t.get("list_name")
+        location_suffix = f" [{list_name}]" if list_name else ""
+        lines.append(f"{i}. {marker}{t['name']}{due_suffix}{location_suffix}")
+    return lines
+
+
 async def _send_employee_report(context: ContextTypes.DEFAULT_TYPE, employee_key: str) -> None:
-    """/lili /olga /sveta /ilya /nazgul /alex /ub — по каждому из 4 проектных списков
-    (config.CLICKUP_LIST_IDS, та же зона ответственности бота, что и у /tasksX/
-    /tasksall — НЕ личные папки ClickUp вроде "Саша"/"Ник" в иерархии воркспейса)
-    тянет живые открытые задачи этого конкретного человека и собирает единый отчёт с
-    разделом на каждый проект, как /tasksall (см. _send_tasksall_report). У шести из
-    семи команд есть реальный ClickUp-аккаунт (assignee_id, config.EMPLOYEE_COMMANDS) —
-    фильтрация идёт на стороне ClickUp API. У Саши (/alex) реального аккаунта нет —
-    вместо этого задачи находятся по буквальному текстовому префиксу "Саша:" в начале
-    названия (так их заводит task_extractor.py, когда не может сопоставить имя с
-    реальным ClickUp-аккаунтом)."""
+    """/lili /olga /sveta /ilya /nazgul /alex /ub /marina — тянет живые открытые задачи
+    этого конкретного человека ПО ВСЕМУ ClickUp (все пространства/папки/списки, см.
+    clickup_client.get_open_tasks_team_wide), а не только из 4 официальных проектных
+    списков (config.CLICKUP_LIST_IDS) — по прямой просьбе владелицы (06.09): сотрудники
+    нередко ведут задачи и в личных папках/пространствах вне этих 4 проектов (например
+    "Саша"/"Ник" в иерархии воркспейса). У семи из восьми команд есть реальный
+    ClickUp-аккаунт (assignee_id, config.EMPLOYEE_COMMANDS) — фильтрация идёт на
+    стороне ClickUp API. У Саши (/alex) реального аккаунта нет — вместо этого задачи
+    находятся по буквальному текстовому префиксу "Саша:" в начале названия (так их
+    заводит task_extractor.py, когда не может сопоставить имя с реальным
+    ClickUp-аккаунтом) — в этом случае приходится тянуть ВСЕ открытые задачи workspace
+    без серверного фильтра и отфильтровывать по префиксу уже на своей стороне."""
     if config.OWNER_USER_ID is None:
         return
     employee = config.EMPLOYEE_COMMANDS[employee_key]
     label = employee["label"]
     assignee_id = employee.get("assignee_id")
     name_prefix = employee.get("name_prefix")
-    sections = []
-    total = 0
-    for project_key, project in config.CLICKUP_PROJECTS.items():
-        plabel = project["label"]
-        list_id = config.CLICKUP_LIST_IDS.get(project_key)
-        if not list_id:
-            sections.append(f"«{plabel}»: не настроено.")
-            continue
+    try:
+        tasks = clickup_client.get_open_tasks_team_wide(assignee_id=assignee_id)
+    except Exception:
+        logger.exception("Не удалось получить задачи «%s» по всему ClickUp", label)
+        text = f"Не смогла получить задачи «{label}» из ClickUp — попробую в следующий раз."
         try:
-            tasks = clickup_client.get_open_tasks(list_id, assignee_id=assignee_id)
+            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text)
         except Exception:
-            logger.exception("Не удалось получить задачи «%s» в проекте %s", label, project_key)
-            sections.append(f"«{plabel}»: не смогла получить задачи из ClickUp.")
-            continue
-        if name_prefix:
-            tasks = [t for t in tasks if t["name"].strip().lower().startswith(name_prefix)]
-        if not tasks:
-            sections.append(f"«{plabel}»: нет задач.")
-        else:
-            total += len(tasks)
-            sections.append("\n".join([f"«{plabel}» ({len(tasks)}):"] + _format_task_lines(tasks)))
-    text = f"👤 {label} — открытые задачи ({total}):\n\n" + "\n\n".join(sections)
+            logger.exception("Не удалось отправить отчёт по сотруднику %s владелице", employee_key)
+        return
+    if name_prefix:
+        tasks = [t for t in tasks if t["name"].strip().lower().startswith(name_prefix)]
+    if not tasks:
+        text = f"👤 {label} — открытых задач нигде в ClickUp не нашла."
+    else:
+        text = (
+            f"👤 {label} — открытые задачи по всему ClickUp ({len(tasks)}):\n"
+            + "\n".join(_format_employee_task_lines(tasks))
+        )
     try:
         for chunk in _split_for_telegram(text):
             await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
@@ -1596,10 +1611,10 @@ async def _send_employee_report(context: ContextTypes.DEFAULT_TYPE, employee_key
 
 
 def _make_employee_command_handler(employee_key: str):
-    """Команды /lili /olga /sveta /ilya /nazgul /alex /ub — каждая для своего человека
-    (см. config.EMPLOYEE_COMMANDS). Только в личке, только для владелицы — мгновенно
-    присылает живой отчёт по открытым задачам этого человека (см.
-    _send_employee_report)."""
+    """Команды /lili /olga /sveta /ilya /nazgul /alex /ub /marina — каждая для своего
+    человека (см. config.EMPLOYEE_COMMANDS). Только в личке, только для владелицы —
+    мгновенно присылает живой отчёт по открытым задачам этого человека по всему
+    ClickUp (см. _send_employee_report)."""
     label = config.EMPLOYEE_COMMANDS[employee_key]["label"]
 
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1610,9 +1625,10 @@ def _make_employee_command_handler(employee_key: str):
         if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
             await update.message.reply_text("Эта команда только для владелицы.")
             return
-        if not config.CLICKUP_ENABLED:
+        if not config.CLICKUP_TEAM_WIDE_ENABLED:
             await update.message.reply_text(
-                f"ClickUp пока не настроен — задачи «{label}» выгружать неоткуда."
+                f"ClickUp workspace-id пока не настроен (CLICKUP_TEAM_ID) — задачи «{label}» "
+                f"по всему ClickUp выгружать не могу."
             )
             return
         await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)

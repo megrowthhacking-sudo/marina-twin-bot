@@ -67,15 +67,16 @@ def create_task(
 
 def get_open_tasks(list_id: str, assignee_id: int | None = None) -> list[dict]:
     """Тянет реальные ОТКРЫТЫЕ (незавершённые) задачи списка прямо из ClickUp — источник
-    истины для отчётов (/tasksX, /urgent, утренний дайджест, персональные команды
-    /lili /olga /sveta /ilya /nazgul /alex /ub — см. bot.py::_send_employee_report), в
-    отличие от локального журнала когда-либо созданных ботом задач (тот не узнаёт о
-    том, что задачу закрыли или поменяли напрямую в ClickUp, минуя бота).
+    истины для отчётов по проектам (/tasksX, /tasksall, /urgent, утренний дайджест —
+    все они сознательно ограничены 4 официальными проектными списками), в отличие от
+    локального журнала когда-либо созданных ботом задач (тот не узнаёт о том, что
+    задачу закрыли или поменяли напрямую в ClickUp, минуя бота). Персональные команды
+    по сотрудникам (/lili /olga ... — см. bot.py::_send_employee_report) с 06.09
+    используют НЕ эту функцию, а get_open_tasks_team_wide ниже (по всему ClickUp, не
+    только эти 4 списка) — эта функция осталась только для проектных команд.
     assignee_id — если задан, фильтрует на стороне ClickUp API (параметр
-    "assignees[]") и возвращает только задачи, назначенные на этого человека
-    (config.CLICKUP_ASSIGNEE_MAP); без него — все открытые задачи списка, как раньше
-    (используется, например, для последующей фильтрации по текстовому префиксу имени
-    у сотрудников без реального ClickUp-аккаунта, см. config.EMPLOYEE_COMMANDS).
+    "assignees[]») и возвращает только задачи, назначенные на этого человека
+    (config.CLICKUP_ASSIGNEE_MAP); без него — все открытые задачи списка, как раньше.
     Возвращает список словарей {"id", "name", "priority" (urgent/high/normal/low/None),
     "date_created" (unix-время в секундах), "due_date" (unix-время в секундах или None,
     если срок не задан в ClickUp), "url"}, по возрастанию даты создания. Бросает
@@ -123,6 +124,95 @@ def get_open_tasks(list_id: str, assignee_id: int | None = None) -> list[dict]:
         if data.get("last_page", True) or not batch:
             break
         page += 1
+    tasks.sort(key=lambda t: t["date_created"])
+    return tasks
+
+
+def get_open_tasks_team_wide(assignee_id: int | None = None) -> list[dict]:
+    """Тянет ОТКРЫТЫЕ задачи по ВСЕМУ workspace ClickUp (config.CLICKUP_TEAM_ID) — все
+    пространства/папки/списки, а не только 4 официальных проектных списка (см.
+    get_open_tasks выше). Добавлено 06.09 по прямой просьбе владелицы: персональные
+    команды по сотрудникам (/lili /olga /sveta /ilya /nazgul /alex /ub /marina — см.
+    bot.py::_send_employee_report) должны находить задачи человека ГДЕ БЫ они ни были
+    заведены, включая личные папки/пространства вне 4 официальных проектов.
+
+    Использует ClickUp "Get Filtered Team Tasks" (`GET /team/{team_id}/task`) —
+    в отличие от списочного `GET /list/{list_id}/task`, этот эндпоинт ищет по всему
+    workspace сразу. assignee_id — тот же смысл, что в get_open_tasks (серверная
+    фильтрация ClickUp API через "assignees[]»); без него возвращает вообще ВСЕ
+    открытые задачи workspace (используется для последующей клиентской фильтрации по
+    текстовому префиксу имени — см. config.EMPLOYEE_COMMANDS, случай Саши, у которого
+    нет реального ClickUp-аккаунта). include_closed=false — как и у get_open_tasks,
+    закрытые задачи не возвращаются. Постранично, 100 задач за раз; у этого эндпоинта
+    ClickUp не отдаёт явный флаг "последняя страница" (в отличие от списочного) —
+    признак конца пагинации: страница вернула меньше 100 задач. Захардкожен потолок в
+    50 страниц (5000 задач) на случай сбоя пагинации — при его достижении в лог пишется
+    предупреждение, но накопленное уже возвращается, а не теряется.
+
+    Возвращает список словарей {"id", "name", "priority", "date_created", "due_date",
+    "url", "list_name"} — "list_name" (может быть None) добавлен специально для этой
+    функции, чтобы в отчёте по сотруднику было видно, из какого списка/проекта задача,
+    раз теперь они могут быть откуда угодно. Бросает исключение при ошибке сети/API —
+    вызывающий код сам решает, как это залогировать и что ответить пользователю."""
+    if not config.CLICKUP_API_TOKEN:
+        raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
+    if not config.CLICKUP_TEAM_ID:
+        raise RuntimeError("ClickUp workspace-id не настроен (нет CLICKUP_TEAM_ID)")
+    tasks: list[dict] = []
+    page = 0
+    _MAX_PAGES = 50
+    while page < _MAX_PAGES:
+        params = {
+            "page": page,
+            "order_by": "created",
+            "reverse": "false",
+            "include_closed": "false",
+            "subtasks": "true",
+        }
+        if assignee_id is not None:
+            params["assignees[]"] = [assignee_id]
+        resp = requests.get(
+            f"{BASE_URL}/team/{config.CLICKUP_TEAM_ID}/task",
+            headers=_headers(),
+            params=params,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        batch = data.get("tasks") or []
+        for t in batch:
+            priority_field = t.get("priority") or {}
+            priority = (priority_field.get("priority") or "").lower() or None
+            try:
+                created = float(t.get("date_created") or 0) / 1000
+            except (TypeError, ValueError):
+                created = 0.0
+            raw_due = t.get("due_date")
+            try:
+                due_date = float(raw_due) / 1000 if raw_due else None
+            except (TypeError, ValueError):
+                due_date = None
+            list_field = t.get("list") or {}
+            tasks.append(
+                {
+                    "id": t.get("id"),
+                    "name": t.get("name") or "(без названия)",
+                    "priority": priority,
+                    "date_created": created,
+                    "due_date": due_date,
+                    "url": t.get("url"),
+                    "list_name": list_field.get("name"),
+                }
+            )
+        if len(batch) < 100:
+            break
+        page += 1
+    else:
+        logger.warning(
+            "get_open_tasks_team_wide: остановлено на потолке в %d страниц — возможно, "
+            "получены не все задачи workspace",
+            _MAX_PAGES,
+        )
     tasks.sort(key=lambda t: t["date_created"])
     return tasks
 
