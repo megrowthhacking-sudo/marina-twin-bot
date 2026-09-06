@@ -28,6 +28,7 @@ from telegram.ext import (
 )
 
 import calendar_client
+import chat_memory
 import claude_client
 import clickup_client
 import config
@@ -329,9 +330,17 @@ async def _propose_initial_draft(
     question: str,
     project_key: str | None = None,
     asker_username: str | None = None,
+    chat_id: int | None = None,
 ) -> None:
+    # "Память" чата (по прямой просьбе владелицы, 06.09) — сжатая сводка более ранней
+    # переписки этого группового чата, если она уже накоплена (см. chat_memory.py,
+    # periodic_memory_job ниже); лучшим усилием — если чат неизвестен (chat_id не
+    # передали, например esc_retry ниже) или памяти ещё нет, просто продолжаем без неё.
+    chat_summary = chat_memory.get_summary_for_draft(chat_id) if chat_id is not None else None
     try:
-        draft = escalation.draft_initial_answer(group_title, asker_name, question, project_key)
+        draft = escalation.draft_initial_answer(
+            group_title, asker_name, question, project_key, chat_summary=chat_summary
+        )
     except Exception:
         logger.exception("Не удалось составить черновик ответа для эскалации #%s", esc_id)
         draft = ""
@@ -450,8 +459,11 @@ async def handle_escalation_callback(update: Update, context: ContextTypes.DEFAU
 
     if action == "esc_retry":
         await query.edit_message_text("Секунду, предложу другой вариант...")
+        chat_summary = chat_memory.get_summary_for_draft(esc["group_chat_id"])
         try:
-            draft = escalation.draft_initial_answer(esc["group_title"], esc["asker_name"], esc["question"])
+            draft = escalation.draft_initial_answer(
+                esc["group_title"], esc["asker_name"], esc["question"], chat_summary=chat_summary
+            )
         except Exception:
             logger.exception("Не удалось составить повторный черновик для эскалации #%s", esc_id)
             draft = ""
@@ -765,7 +777,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
             project_key = storage.get_chat_project(chat.id)
             await _propose_initial_draft(
-                context, esc_id, group_title, asker_name, question_text, project_key, asker_username
+                context, esc_id, group_title, asker_name, question_text, project_key, asker_username, chat.id
             )
             return
         logger.warning(
@@ -1704,6 +1716,23 @@ async def periodic_flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     await _sweep_stale_classifications(context)
 
 
+async def periodic_memory_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фоновое обновление "памяти" групповых чатов (по расписанию
+    MEMORY_UPDATE_INTERVAL_MINUTES, см. config.py) — по прямой просьбе владелицы (06.09),
+    чтобы черновики ответов (см. escalation.draft_initial_answer, chat_memory.py)
+    учитывали более раннюю переписку каждого чата. Не зависит от config.CLICKUP_ENABLED —
+    память нужна для эскалаций (draft_initial_answer), а не для выгрузки в ClickUp, так
+    что работает даже если ClickUp вообще не настроен. Обходит только чаты, где реально
+    накопились новые сообщения с прошлого обновления (см.
+    storage.get_chats_with_new_messages_for_memory), лучшим усилием — сбой по одному чату
+    (сеть, лимиты Claude) не прерывает обработку остальных."""
+    for chat_id, chat_title in storage.get_chats_with_new_messages_for_memory():
+        try:
+            chat_memory.update_chat_memory(chat_id, chat_title)
+        except Exception:
+            logger.exception("Не удалось обновить память чата %s («%s»)", chat_id, chat_title)
+
+
 def build_application() -> Application:
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_start))
@@ -1747,6 +1776,13 @@ def build_application() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     # Группы — тихий сбор переписки, без ответов.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, handle_group_message))
+
+    # Память групповых чатов (см. chat_memory.py, periodic_memory_job) обновляется всегда,
+    # независимо от того, включён ли ClickUp — она нужна для черновиков ответов
+    # (escalation.draft_initial_answer), а не для выгрузки задач.
+    memory_interval = config.MEMORY_UPDATE_INTERVAL_MINUTES * 60
+    app.job_queue.run_repeating(periodic_memory_job, interval=memory_interval, first=memory_interval)
+    logger.info("Память групповых чатов включена, обновление каждые %d мин.", config.MEMORY_UPDATE_INTERVAL_MINUTES)
 
     if config.CLICKUP_ENABLED:
         interval = config.CLICKUP_FLUSH_INTERVAL_MINUTES * 60
