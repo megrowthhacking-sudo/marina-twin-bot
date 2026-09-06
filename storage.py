@@ -230,6 +230,34 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    # Явная постановка задачи в конкретный список/статус (по прямой просьбе владелицы,
+    # 06.09: "поставь Свете задачу в WEEKLY в статус Понедельник ..." — см.
+    # task_command.py, bot.py::_propose_explicit_task_command). Черновик ждёт
+    # подтверждения кнопкой ("❌ Отменить"/"✅ Создать", см.
+    # bot.py::handle_manual_task_callback), прежде чем реально создать задачу в ClickUp
+    # (clickup_client.create_task) — тот же принцип, что и у pending_meetings выше.
+    # target_key/list_id — уже разрешённый список (см. config.CLICKUP_TASK_TARGETS),
+    # status_name — точное имя статуса ClickUp (уже сверенное с реальным списком, см.
+    # clickup_client.get_list_statuses) либо NULL, если статус не был назван явно.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_manual_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_user_id INTEGER NOT NULL,
+            raw_text TEXT NOT NULL,
+            target_key TEXT NOT NULL,
+            list_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            status_name TEXT,
+            priority TEXT,
+            assignee_id INTEGER,
+            assignee_label TEXT,
+            created_at REAL NOT NULL,
+            resolved INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -860,6 +888,60 @@ def update_meeting_details(
         """,
         (title, start_iso, end_iso, location, meeting_id),
     )
+    _conn.commit()
+
+
+# --- Явная постановка задачи в конкретный список/статус (см. task_command.py,
+# bot.py::_propose_explicit_task_command/handle_manual_task_callback) ---
+
+_MANUAL_TASK_COLUMNS = (
+    "id", "owner_user_id", "raw_text", "target_key", "list_id", "title", "description",
+    "status_name", "priority", "assignee_id", "assignee_label", "created_at", "resolved",
+)
+
+
+def add_pending_manual_task(
+    owner_user_id: int,
+    raw_text: str,
+    target_key: str,
+    list_id: str,
+    title: str,
+    description: str,
+    status_name: str | None,
+    priority: str | None,
+    assignee_id: int | None,
+    assignee_label: str | None,
+) -> int:
+    cur = _conn.execute(
+        """
+        INSERT INTO pending_manual_tasks (
+            owner_user_id, raw_text, target_key, list_id, title, description,
+            status_name, priority, assignee_id, assignee_label, created_at, resolved
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        """,
+        (
+            owner_user_id, raw_text, target_key, list_id, title, description,
+            status_name, priority, assignee_id, assignee_label, time.time(),
+        ),
+    )
+    _conn.commit()
+    return cur.lastrowid
+
+
+def get_pending_manual_task(manual_task_id: int) -> dict | None:
+    row = _conn.execute(
+        f"SELECT {', '.join(_MANUAL_TASK_COLUMNS)} FROM pending_manual_tasks WHERE id = ?",
+        (manual_task_id,),
+    ).fetchone()
+    return dict(zip(_MANUAL_TASK_COLUMNS, row)) if row else None
+
+
+def resolve_pending_manual_task(manual_task_id: int) -> None:
+    """Черновик обработан (создан в ClickUp по "✅ Создать" либо отклонён по
+    "❌ Отменить") — снимаем с рассмотрения, повторно нажать кнопку под тем же
+    сообщением больше нельзя (см. handle_manual_task_callback)."""
+    _conn.execute("UPDATE pending_manual_tasks SET resolved = 1 WHERE id = ?", (manual_task_id,))
     _conn.commit()
 
 

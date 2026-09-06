@@ -173,6 +173,29 @@ EMPLOYEE_COMMANDS = {
 CLICKUP_LIST_WEEKLY = os.environ.get("CLICKUP_LIST_WEEKLY", "").strip() or None
 CLICKUP_WEEKLY_ENABLED = bool(CLICKUP_API_TOKEN and CLICKUP_LIST_WEEKLY)
 
+# "Явная постановка задачи" (по прямой просьбе владелицы, 06.09): "Поставь Свете задачу
+# в WEEKLY в статус Понедельник с пометкой срочно ...". Чтобы понять, в какой ИМЕННО
+# ClickUp-список положить такую задачу, бот сопоставляет названное владелицей
+# пространство/список с одной из уже существующих записей — теми же 4 официальными
+# проектами (CLICKUP_LIST_IDS/CLICKUP_PROJECTS выше), плюс отдельно списком WEEKLY TASKS
+# (CLICKUP_LIST_WEEKLY) под ключом "weekly". Сознательно не отдельный источник истины —
+# собран из уже существующих структур, чтобы новый проектный список не пришлось заводить
+# дважды (см. bot.py::_resolve_task_target, task_command.py).
+CLICKUP_TASK_TARGETS = {
+    key: {
+        "list_id": list_id,
+        "label": CLICKUP_PROJECTS[key]["label"],
+        "keywords": CLICKUP_PROJECTS[key]["keywords"],
+    }
+    for key, list_id in CLICKUP_LIST_IDS.items()
+}
+if CLICKUP_LIST_WEEKLY:
+    CLICKUP_TASK_TARGETS["weekly"] = {
+        "list_id": CLICKUP_LIST_WEEKLY,
+        "label": "Weekly (Расписание)",
+        "keywords": ("weekly", "виикли", "расписание", "неделя", "недельные"),
+    }
+
 # Часовой пояс утреннего дайджеста (IANA-имя, например "Europe/Moscow" или
 # "Asia/Almaty") и время, во сколько его слать владелице — по каждому проекту
 # отдельным сообщением полный список открытых задач из ClickUp, срочные помечены 🔴

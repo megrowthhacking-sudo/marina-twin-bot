@@ -36,6 +36,7 @@ import escalation
 import kb
 import meeting_extractor
 import storage
+import task_command
 import task_extractor
 
 logging.basicConfig(
@@ -609,13 +610,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if esc:
                 await _handle_owner_escalation_message(update, context, esc, text)
                 return
-        # Обычное сообщение владелицы в личке (не reply на эскалацию) — помимо ответа
-        # Twin ниже, заодно проверяем, не задача ли это, и если да — заносим в ClickUp
-        # (см. _log_owner_dm_tasks), и не похоже ли сообщение на просьбу поставить встречу
-        # (см. _propose_meeting_draft). Только для самой владелицы: у остальных
-        # пользователей в личке — просто разговор с Twin, их сообщения в ClickUp/календарь
-        # не идут.
-        await _log_owner_dm_tasks(user, text)
+        # Обычное сообщение владелицы в личке (не reply на эскалацию) — сперва проверяем,
+        # не явная ли это осознанная команда поставить задачу в конкретный список/статус
+        # (см. _propose_explicit_task_command, по прямой просьбе владелицы, 06.09) — если
+        # да, обычное фоновое логирование (_log_owner_dm_tasks) для этого же сообщения уже
+        # не запускаем (иначе задача задвоится). Плюс, независимо от этого, проверяем, не
+        # похоже ли сообщение на просьбу поставить встречу (см. _propose_meeting_draft).
+        # Только для самой владелицы: у остальных пользователей в личке — просто разговор
+        # с Twin, их сообщения в ClickUp/календарь не идут.
+        handled_as_task_command = await _propose_explicit_task_command(context, user, text)
+        if not handled_as_task_command:
+            await _log_owner_dm_tasks(user, text)
         await _propose_meeting_draft(context, user, text)
 
     state = storage.get_chat(chat_id)
@@ -809,6 +814,49 @@ def _resolve_assignee_id(name: str | None) -> int | None:
     return config.CLICKUP_ASSIGNEE_MAP.get(name.strip().lower())
 
 
+def _resolve_task_target(name: str | None) -> tuple[str, dict] | None:
+    """Сопоставляет названный владелицей список/пространство (например "WEEKLY", "Атлас",
+    как его вернул task_command.extract_task_command в поле target_name) с одним из
+    config.CLICKUP_TASK_TARGETS — по точному совпадению с ключом/label или по тем же
+    ключевым словам, что использует kb.detect для автоматической классификации чатов по
+    проекту (см. config.CLICKUP_PROJECTS), плюс отдельная запись "weekly" для списка
+    WEEKLY TASKS (config.CLICKUP_LIST_WEEKLY). None, если название не удалось сопоставить
+    ни с одним известным списком — тогда _propose_explicit_task_command прямо спросит
+    владелицу уточнить, а не будет гадать."""
+    if not name:
+        return None
+    lowered = name.strip().lower()
+    if not lowered:
+        return None
+    for key, target in config.CLICKUP_TASK_TARGETS.items():
+        if lowered == key or lowered == target["label"].lower():
+            return key, target
+    for key, target in config.CLICKUP_TASK_TARGETS.items():
+        if any(kw in lowered for kw in target["keywords"]):
+            return key, target
+    return None
+
+
+def _resolve_task_status(list_id: str, status_name_raw: str) -> tuple[str | None, list[str]]:
+    """Сверяет названный владелицей статус (например "Понедельник") с реальными статусами
+    списка ClickUp (clickup_client.get_list_statuses) — сравнение без учёта регистра,
+    потому что в разговоре статус пишется как удобно, а в ClickUp хранится в своём
+    регистре. Возвращает (имя_статуса_как_в_ClickUp_или_None, список_всех_статусов) —
+    первое None, если статус не назван (status_name_raw пусто — задача создастся с
+    дефолтным статусом списка) ИЛИ назван, но не нашёлся среди реальных статусов (тогда
+    вызывающий код должен показать владелице второй элемент — реальные варианты — а не
+    создавать задачу с выдуманным именем статуса). Может бросить исключение (сеть/API) —
+    вызывающий код сам решает, как это показать."""
+    statuses = clickup_client.get_list_statuses(list_id)
+    if not status_name_raw:
+        return None, statuses
+    lowered = status_name_raw.strip().lower()
+    for s in statuses:
+        if s.lower() == lowered:
+            return s, statuses
+    return None, statuses
+
+
 def _create_and_log_task(
     chat_id: int,
     chat_title: str,
@@ -885,6 +933,170 @@ async def _log_owner_dm_tasks(user, text: str) -> None:
     created = _push_tasks(user.id, chat_title, tasks, lambda t: t.get("project") or "unsorted")
     if created:
         logger.info("Из личного сообщения владелицы занесено задач в ClickUp: %s", created)
+
+
+_PRIORITY_LABELS = {"urgent": "🔴 Срочно", "high": "🟠 Высокий приоритет", "normal": "Обычный приоритет", "low": "Низкий приоритет"}
+
+
+def _manual_task_confirm_keyboard(manual_task_id: int):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("❌ Отменить", callback_data=f"mtask_cancel:{manual_task_id}"),
+                InlineKeyboardButton("✅ Создать", callback_data=f"mtask_confirm:{manual_task_id}"),
+            ]
+        ]
+    )
+
+
+def _render_manual_task_preview(
+    target_label: str, title: str, description: str, status_name: str | None,
+    priority: str, assignee_name: str,
+) -> str:
+    lines = [f"📋 Похоже, нужно поставить задачу в «{target_label}»:", "", f"«{title}»"]
+    if description:
+        lines.append(description)
+    details = []
+    if assignee_name:
+        details.append(f"👤 {assignee_name}")
+    if status_name:
+        details.append(f"Статус: {status_name}")
+    details.append(_PRIORITY_LABELS.get(priority, priority))
+    lines.append(" · ".join(details))
+    lines.append("")
+    lines.append("Создать?")
+    return "\n".join(lines)
+
+
+async def _propose_explicit_task_command(context: ContextTypes.DEFAULT_TYPE, user, text: str) -> bool:
+    """Если сообщение владелицы в личке — явная, осознанная команда поставить ОДНУ
+    конкретную задачу в конкретный ClickUp-список (и, возможно, конкретный статус),
+    например "Поставь Свете задачу в WEEKLY в статус Понедельник с пометкой срочно ..."
+    (по прямой просьбе владелицы, 06.09) — извлекает данные (task_command.extract_task_command,
+    лёгкая модель) и присылает превью с кнопками "❌ Отменить"/"✅ Создать". Задача реально
+    создаётся в ClickUp только по нажатию "✅ Создать" (см. handle_manual_task_callback), не
+    здесь. В отличие от обычного фонового логирования задач (_log_owner_dm_tasks), эта
+    команда ЯВНО называет список/пространство — вызывающий код (handle_message) должен
+    пропустить _log_owner_dm_tasks для этого же сообщения, если эта функция вернула True
+    (иначе задача задвоится). Возвращает True, если сообщение было опознано и обработано
+    этой командой (даже если список/статус не удалось сопоставить — в этом случае вместо
+    черновика владелице прямо пишется, чего не хватило, с реальными вариантами), и False,
+    если сообщение вообще не похоже на такую явную команду — тогда handle_message
+    обрабатывает его как раньше (_log_owner_dm_tasks)."""
+    if not config.CLICKUP_ENABLED or not config.CLICKUP_TASK_TARGETS:
+        return False
+    try:
+        parsed = task_command.extract_task_command(text)
+    except Exception:
+        logger.exception("Ошибка при разборе явной команды на постановку задачи")
+        return False
+    if not parsed:
+        return False
+
+    resolved_target = _resolve_task_target(parsed["target_name"])
+    if not resolved_target:
+        known = ", ".join(t["label"] for t in config.CLICKUP_TASK_TARGETS.values())
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                f"Поняла, что нужно поставить задачу, но не разобрала, в какой именно список "
+                f"(«{parsed['target_name']}») — знаю: {known}. Уточни, пожалуйста, название списка."
+            ),
+        )
+        return True
+    target_key, target = resolved_target
+    list_id = target["list_id"]
+
+    try:
+        matched_status, available_statuses = _resolve_task_status(list_id, parsed["status_name"])
+    except Exception:
+        logger.exception("Не удалось получить статусы списка %s (задача «%s»)", list_id, parsed["title"])
+        await context.bot.send_message(
+            chat_id=user.id,
+            text="Не смогла проверить статусы этого списка в ClickUp — попробуй ещё раз чуть позже.",
+        )
+        return True
+
+    if parsed["status_name"] and not matched_status:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                f"Не нашла статус «{parsed['status_name']}» в списке «{target['label']}». "
+                f"Доступные статусы: {', '.join(available_statuses)}."
+            ),
+        )
+        return True
+
+    assignee_name = parsed["assignee_name"]
+    assignee_id = _resolve_assignee_id(assignee_name) if assignee_name else None
+    unresolved_assignee_note = ""
+    if assignee_name and not assignee_id:
+        unresolved_assignee_note = f"\n\n(не нашла «{assignee_name}» среди известных сотрудников — создам без ответственного)"
+
+    manual_task_id = storage.add_pending_manual_task(
+        user.id, text, target_key, list_id, parsed["title"], parsed["description"],
+        matched_status, parsed["priority"], assignee_id, assignee_name or None,
+    )
+    preview = _render_manual_task_preview(
+        target["label"], parsed["title"], parsed["description"], matched_status,
+        parsed["priority"], assignee_name,
+    ) + unresolved_assignee_note
+    await context.bot.send_message(
+        chat_id=user.id, text=preview, reply_markup=_manual_task_confirm_keyboard(manual_task_id)
+    )
+    return True
+
+
+async def handle_manual_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает кнопки "❌ Отменить"/"✅ Создать" под превью явной команды на постановку
+    задачи (см. _propose_explicit_task_command). Задача реально создаётся в ClickUp
+    (clickup_client.create_task, с указанным статусом, если он был сопоставлен) только
+    здесь, по "✅ Создать" — не в момент разбора текста."""
+    query = update.callback_query
+    await query.answer()
+
+    if config.OWNER_USER_ID is not None and query.from_user.id != config.OWNER_USER_ID:
+        return
+
+    action, _, task_id_raw = (query.data or "").partition(":")
+    try:
+        manual_task_id = int(task_id_raw)
+    except ValueError:
+        return
+
+    manual_task = storage.get_pending_manual_task(manual_task_id)
+    if not manual_task or manual_task["resolved"]:
+        await query.edit_message_text("Этот черновик задачи уже не актуален.")
+        return
+
+    if action == "mtask_cancel":
+        storage.resolve_pending_manual_task(manual_task_id)
+        await query.edit_message_text("Хорошо, не создаю.")
+        return
+
+    if action == "mtask_confirm":
+        try:
+            result = clickup_client.create_task(
+                manual_task["list_id"],
+                name=manual_task["title"],
+                description=manual_task["description"] or "",
+                priority=manual_task["priority"],
+                assignees=[manual_task["assignee_id"]] if manual_task["assignee_id"] else None,
+                status=manual_task["status_name"] or None,
+            )
+        except Exception:
+            logger.exception("Не удалось создать задачу в ClickUp (черновик #%s)", manual_task_id)
+            await query.edit_message_text(
+                "Не смогла создать задачу в ClickUp (возможно, проблема с доступом) — "
+                f"добавь, пожалуйста, вручную: «{manual_task['title']}»"
+            )
+            return
+        task_id = str(result.get("id", ""))
+        storage.log_pushed_task(
+            manual_task["owner_user_id"], "Личка Марины", task_id, manual_task["title"], manual_task["target_key"]
+        )
+        storage.resolve_pending_manual_task(manual_task_id)
+        await query.edit_message_text(f"Готово, создала задачу: «{manual_task['title']}» ✅")
 
 
 _WEEKDAYS_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
@@ -2094,6 +2306,12 @@ def build_application() -> Application:
             handle_employee_task_callback,
             pattern=r"^emp:(done|urgent|fire|delask|delyes|delno):",
         )
+    )
+    # Кнопки "❌ Отменить"/"✅ Создать" под превью явной команды на постановку задачи в
+    # конкретный список/статус (см. _propose_explicit_task_command/handle_manual_task_callback,
+    # по прямой просьбе владелицы, 06.09).
+    app.add_handler(
+        CallbackQueryHandler(handle_manual_task_callback, pattern=r"^mtask_(confirm|cancel):")
     )
     # Личка — обычный разговор с персоной Marina Twin.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
