@@ -34,6 +34,7 @@ def create_task(
     assignees: list[int] | None = None,
     start_date_ms: int | None = None,
     due_date_ms: int | None = None,
+    status: str | None = None,
 ) -> dict:
     """Создаёт задачу в указанном списке ClickUp (list_id — конкретный проектный список,
     см. config.CLICKUP_LIST_IDS). assignees — список ClickUp user_id (см.
@@ -41,8 +42,14 @@ def create_task(
     в МИЛЛИСЕКУНДАХ (не секундах — так требует ClickUp API), если нужно проставить время
     начала/дедлайна с точностью до часа (см. bot.py::_mirror_meeting_to_clickup — зеркало
     встреч Google Calendar в список "Расписание Марина Twin"); без них задача создаётся
-    без дат, как раньше. Бросает исключение при ошибке — вызывающий код (bot.py) сам
-    решает, как это залогировать и не уронить остальную выгрузку."""
+    без дат, как раньше. status — точное имя статуса ЭТОГО списка (например "Понедельник"
+    для WEEKLY TASKS) — используется явной постановкой задачи по просьбе владелицы (см.
+    bot.py::_propose_explicit_task_command/handle_manual_task_callback, task_command.py);
+    вызывающий код обязан заранее проверить, что такой статус реально существует в
+    списке (см. get_list_statuses ниже) — сам ClickUp при неизвестном имени статуса просто
+    вернёт ошибку. Без указания — задача создаётся с дефолтным статусом списка, как раньше.
+    Бросает исключение при ошибке — вызывающий код (bot.py) сам решает, как это
+    залогировать и не уронить остальную выгрузку."""
     if not config.CLICKUP_API_TOKEN:
         raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
 
@@ -58,6 +65,8 @@ def create_task(
     if due_date_ms is not None:
         payload["due_date"] = due_date_ms
         payload["due_date_time"] = True
+    if status:
+        payload["status"] = status
 
     url = f"{BASE_URL}/list/{list_id}/task"
     resp = requests.post(url, headers=_headers(), json=payload, timeout=20)
@@ -254,6 +263,23 @@ def get_list_closed_status(list_id: str) -> str | None:
         if (status.get("type") or "").lower() == "closed":
             return status.get("status")
     return None
+
+
+def get_list_statuses(list_id: str) -> list[str]:
+    """Все имена статусов списка, как они настроены в самом ClickUp (не только закрывающий,
+    см. get_list_closed_status выше) — нужно для явной постановки задачи в конкретный
+    статус (по прямой просьбе владелицы, 06.09: "поставь задачу в WEEKLY в статус
+    Понедельник", см. bot.py::_propose_explicit_task_command/task_command.py). Перед
+    созданием задачи с явно названным статусом сверяем его с этим реальным списком —
+    имена статусов у разных списков ClickUp произвольные (не общий словарь), и лучше
+    честно сказать владелице, какие статусы есть на самом деле, чем создать задачу с
+    выдуманным именем и получить ошибку от ClickUp API."""
+    if not config.CLICKUP_API_TOKEN:
+        raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
+    resp = requests.get(f"{BASE_URL}/list/{list_id}", headers=_headers(), timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    return [s.get("status") for s in data.get("statuses") or [] if s.get("status")]
 
 
 def set_task_status(task_id: str, status_name: str) -> None:
