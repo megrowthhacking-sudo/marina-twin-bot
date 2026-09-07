@@ -978,16 +978,23 @@ async def _log_owner_dm_tasks(user, text: str) -> None:
     if not config.CLICKUP_ENABLED:
         return
     chat_title = "Личка Марины"
+    reporter_display_name = user.first_name or "Марина"
     try:
         tasks = task_extractor.extract_tasks_classified(
-            chat_title, [{"user_name": user.first_name or "Марина", "text": text, "ts": time.time()}]
+            chat_title, [{"user_name": reporter_display_name, "text": text, "ts": time.time()}]
         )
     except Exception:
         logger.exception("Ошибка извлечения задач из личного сообщения владелицы")
         return
     if not tasks:
         return
-    created = _push_tasks(user.id, chat_title, tasks, lambda t: t.get("project") or "unsorted")
+    # Личка владелицы — репортер всегда она сама (единственный собеседник Twin в личке),
+    # сопоставлять reporter_name из экстрактора не с чем гадать: сразу берём её же
+    # telegram username (часть 33, "от кого задача").
+    created = _push_tasks(
+        user.id, chat_title, tasks, lambda t: t.get("project") or "unsorted",
+        reporter_lookup={reporter_display_name: user.username},
+    )
     if created:
         logger.info("Из личного сообщения владелицы занесено задач в ClickUp: %s", created)
 
@@ -1149,8 +1156,13 @@ async def handle_manual_task_callback(update: Update, context: ContextTypes.DEFA
             )
             return
         task_id = str(result.get("id", ""))
+        # Реальная задача из явной команды владелицы в личке — "от кого" тут всегда она
+        # сама (часть 33, "от кого задача"), гадать/сопоставлять не нужно.
+        reporter = query.from_user
         storage.log_pushed_task(
-            manual_task["owner_user_id"], "Личка Марины", task_id, manual_task["title"], manual_task["target_key"]
+            manual_task["owner_user_id"], "Личка Марины", task_id, manual_task["title"], manual_task["target_key"],
+            reporter_name=(reporter.first_name if reporter else None) or "Марина",
+            reporter_username=reporter.username if reporter else None,
         )
         storage.resolve_pending_manual_task(manual_task_id)
         await query.edit_message_text(f"Готово, создала задачу: «{manual_task['title']}» ✅")
@@ -1493,88 +1505,6 @@ async def handle_calendar_view_callback(update: Update, context: ContextTypes.DE
         text = header + body
 
     await query.edit_message_text(text, reply_markup=_calendar_period_keyboard())
-
-
-async def _ask_classification_question(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_title: str, classification_id: int, task_title: str
-) -> None:
-    """Задаёт в "смешанном" чате уточняющий вопрос по задаче, которую Claude не смог
-    однозначно классифицировать (см. _flush_chat_to_clickup). Ответ (reply на это
-    сообщение) ловит handle_group_message → _resolve_classification_reply."""
-    text = (
-        f"Не поняла, к какому проекту отнести задачу: «{task_title}»\n"
-        f"Это Atlas, Altyn или BestSwift? Ответь (reply) на это сообщение названием проекта.\n"
-        f"Если никто не подскажет — через некоторое время сама положу в «Разобрать»."
-    )
-    try:
-        sent = await context.bot.send_message(chat_id=chat_id, text=text)
-        storage.set_classification_question_message_id(classification_id, sent.message_id)
-    except Exception:
-        logger.exception(
-            "Не удалось задать уточняющий вопрос по классификации #%s в чате %s (%s)",
-            classification_id, chat_id, chat_title,
-        )
-
-
-async def _resolve_classification_reply(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, classification: dict, reply_text: str
-) -> None:
-    """Кто-то в группе ответил (reply) на уточняющий вопрос про проект задачи.
-    Отвечают Atlas/Altyn/BestSwift — кладём туда; отвечают что-то другое (или
-    непонятное) — сразу в "Разобрать", ждать дальше уже не имеет смысла, раз ответ
-    уже пришёл."""
-    classification_id = classification["id"]
-    project_key = _detect_project_keyword(reply_text) or "unsorted"
-    label = config.CLICKUP_PROJECTS[project_key]["label"]
-    assignee_id = _resolve_assignee_id(classification.get("task_assignee_name"))
-
-    task_id = _create_and_log_task(
-        classification["chat_id"],
-        classification["chat_title"],
-        project_key,
-        classification["task_title"],
-        classification["task_description"],
-        classification["task_priority"],
-        assignee_id,
-    )
-    storage.resolve_classification(classification_id, project_key)
-
-    if task_id:
-        await update.message.reply_text(f"Поняла, добавила «{classification['task_title']}» в «{label}» 👍")
-    else:
-        await update.message.reply_text(
-            f"Поняла (проект «{label}»), но не смогла создать задачу в ClickUp — возможно, список ещё не настроен."
-        )
-
-
-async def _sweep_stale_classifications(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Классификации, на которые никто не ответил дольше
-    CLICKUP_CLASSIFICATION_TIMEOUT_MINUTES, — принудительно кладём в "Разобрать", чтобы
-    задача не зависла в подвешенном состоянии навсегда."""
-    cutoff = time.time() - config.CLICKUP_CLASSIFICATION_TIMEOUT_MINUTES * 60
-    for c in storage.get_unresolved_classifications_older_than(cutoff):
-        label = config.CLICKUP_PROJECTS["unsorted"]["label"]
-        assignee_id = _resolve_assignee_id(c.get("task_assignee_name"))
-        task_id = _create_and_log_task(
-            c["chat_id"],
-            c["chat_title"],
-            "unsorted",
-            c["task_title"],
-            c["task_description"],
-            c["task_priority"],
-            assignee_id,
-        )
-        storage.resolve_classification(c["id"], "unsorted")
-        if task_id:
-            try:
-                await context.bot.send_message(
-                    chat_id=c["chat_id"],
-                    text=f"Не дождалась ответа — положила «{c['task_title']}» в «{label}» 👍",
-                )
-            except Exception:
-                logger.exception(
-                    "Не удалось уведомить чат %s о таймауте классификации #%s", c["chat_id"], c["id"]
-                )
 
 
 """Один и тот же чат может попасть на выгрузку из двух разных мест почти одновременно:
