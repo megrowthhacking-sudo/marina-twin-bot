@@ -2086,7 +2086,13 @@ async def _send_edit_mode_report(
     отчёта по умолчанию в отдельный режим правки). Задачи, помеченные "🔥 Горит",
     показываются первыми (см. _sort_tasks_fire_first). Между сообщениями — небольшая пауза
     (_TASK_MESSAGE_DELAY_SECONDS) во избежание лимита Telegram на сообщения в один чат
-    (см. _send_owner_message_with_retry)."""
+    (см. _send_owner_message_with_retry). По прямой просьбе владелицы, часть 33: команда
+    /stop (см. handle_stop_command/_request_stop_edit_mode) прерывает рассылку между
+    сообщениями (проверяется перед каждым заголовком партии и перед каждой задачей) — на
+    случай, если "Править" нажали по ошибке, а задач много (например, у Лили их около 80,
+    ждать, пока разошлются все, не всегда уместно)."""
+    global _stop_edit_mode_requested
+    _stop_edit_mode_requested = False
     if not tasks:
         try:
             await context.bot.send_message(
@@ -2103,19 +2109,34 @@ async def _send_edit_mode_report(
         list(zip(tasks[i : i + _EDIT_MODE_BATCH_SIZE], lines[i : i + _EDIT_MODE_BATCH_SIZE]))
         for i in range(0, total, _EDIT_MODE_BATCH_SIZE)
     ]
+    sent_count = 0
+    stopped = False
     try:
         for batch_num, batch in enumerate(batches, start=1):
+            if _stop_edit_mode_requested:
+                stopped = True
+                break
             header = f"✏️ Правка: {label} — {scope_note} ({total})"
             if len(batches) > 1:
                 header += f", часть {batch_num}/{len(batches)}"
             await _send_owner_message_with_retry(context, header)
             await asyncio.sleep(_TASK_MESSAGE_DELAY_SECONDS)
             for offset, (task, line) in enumerate(batch):
+                if _stop_edit_mode_requested:
+                    stopped = True
+                    break
                 keyboard = _employee_task_keyboard(task, include_weekly_button)
                 await _send_owner_message_with_retry(context, line, reply_markup=keyboard)
+                sent_count += 1
                 is_last_message = batch_num == len(batches) and offset == len(batch) - 1
                 if not is_last_message:
                     await asyncio.sleep(_TASK_MESSAGE_DELAY_SECONDS)
+            if stopped:
+                break
+        if stopped:
+            await _send_owner_message_with_retry(
+                context, f"🛑 Остановлено по /stop — отправила {sent_count} из {total}."
+            )
     except Exception:
         logger.exception("Не удалось отправить отчёт по сотруднику (%s) владелице", label)
 
@@ -2716,9 +2737,8 @@ async def periodic_flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Фоновая выгрузка задач по расписанию (CLICKUP_FLUSH_INTERVAL_MINUTES), без
     ручной команды — для ВСЕХ чатов с непрочитанными сообщениями. Для чатов,
     закреплённых за проектом, задачи идут в его список; для "смешанных" чатов без
-    привязки — классифицируются по отдельности (см. _flush_chat_to_clickup). Заодно
-    подчищает зависшие без ответа уточнения по классификации (см.
-    _sweep_stale_classifications)."""
+    привязки — классифицируются по отдельности, а то, что не удалось классифицировать —
+    сразу в "Разобрать", без вопроса в чат (см. _flush_chat_to_clickup, часть 33)."""
     if not config.CLICKUP_ENABLED:
         return
     for chat_id, chat_title in storage.get_chats_with_pending():
@@ -2729,7 +2749,6 @@ async def periodic_flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Авто-выгрузка: чат «%s» (%s), проект %s → %d задач в ClickUp",
                 chat_title, chat_id, project_key or "не закреплён (классификация)", created,
             )
-    await _sweep_stale_classifications(context)
 
 
 async def periodic_memory_job(context: ContextTypes.DEFAULT_TYPE) -> None:
