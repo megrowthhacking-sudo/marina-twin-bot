@@ -761,6 +761,7 @@ def update_escalation_question(escalation_id: int, question: str) -> None:
 _CLASSIFICATION_COLUMNS = (
     "id", "chat_id", "chat_title", "task_title", "task_description", "task_priority",
     "question_message_id", "created_at", "resolved", "resolved_project", "task_assignee_name",
+    "task_reporter_name", "task_reporter_username",
 )
 
 
@@ -771,14 +772,20 @@ def add_pending_classification(
     task_description: str,
     task_priority: str | None,
     task_assignee_name: str | None = None,
+    task_reporter_name: str | None = None,
+    task_reporter_username: str | None = None,
 ) -> int:
     cur = _conn.execute(
         """
         INSERT INTO pending_classifications
-        (chat_id, chat_title, task_title, task_description, task_priority, created_at, resolved, task_assignee_name)
-        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+        (chat_id, chat_title, task_title, task_description, task_priority, created_at, resolved,
+        task_assignee_name, task_reporter_name, task_reporter_username)
+        VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
         """,
-        (chat_id, chat_title, task_title, task_description, task_priority, time.time(), task_assignee_name),
+        (
+            chat_id, chat_title, task_title, task_description, task_priority, time.time(),
+            task_assignee_name, task_reporter_name, task_reporter_username,
+        ),
     )
     _conn.commit()
     return cur.lastrowid
