@@ -46,6 +46,12 @@ def _connect() -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_group_messages_chat_flushed ON group_messages(chat_id, flushed)")
+    # telegram_username — реальный @username автора сообщения (в отличие от user_name,
+    # который для экстрактора задач — first_name, см. bot.py::handle_group_message) — по
+    # прямой просьбе владелицы, часть 33: нужен, чтобы потом показать "от кого задача"
+    # настоящим Telegram-ником, а не только именем. Может быть NULL — не у всех в Telegram
+    # задан @username.
+    _ensure_columns(conn, "group_messages", {"telegram_username": "TEXT"})
     # Журнал того, что реально улетело в ClickUp — для отладки, отчётов по /tasksX
     # (см. get_pushed_tasks_by_project) и чтобы не гадать задним числом.
     conn.execute(
@@ -65,6 +71,14 @@ def _connect() -> sqlite3.Connection:
     # (до этой миграции) останутся с project = NULL и не попадут в отчёты — это ок,
     # это лишь исторический пробел.
     _ensure_columns(conn, "pushed_tasks", {"project": "TEXT"})
+    # reporter_name/reporter_username — по прямой просьбе владелицы, часть 33 ("от кого
+    # задача"): кто в переписке реально поднял/попросил эту задачу (см. task_extractor.py,
+    # поле reporter_name, и bot.py::_reporter_username_lookup — сопоставление с настоящим
+    # Telegram @username). Для задач, поставленных явно самой владелицей в личке (не из
+    # группового чата) — reporter_name = "Марина"/её имя, без сопоставления username (она и
+    # так единственная читает свои же отчёты). Оба поля могут быть NULL — если экстрактор
+    # не смог понять, кто именно поднял задачу, или для задач, заведённых до этой части.
+    _ensure_columns(conn, "pushed_tasks", {"reporter_name": "TEXT", "reporter_username": "TEXT"})
     # За каким проектом (ключ из config.CLICKUP_PROJECTS: "atlas"/"altyn"/"bestswift")
     # закреплён групповой чат. Проставляется автоматически либо когда кто-то в чате пишет
     # "эта группа про задачи <проект>", либо при вызове команды /tasksatlas /tasksaltyn
@@ -153,6 +167,15 @@ def _connect() -> sqlite3.Connection:
     # переспрашиваются в чате или уходят в "Разобрать" по таймауту, а не только для
     # уже классифицированных на месте.
     _ensure_columns(conn, "pending_classifications", {"task_assignee_name": "TEXT"})
+    # task_reporter_name/task_reporter_username — как и task_assignee_name выше, но для
+    # "от кого задача" (часть 33): сохраняются вместе с отложенной классификацией, чтобы
+    # это тоже не терялось для задач, которые переспрашиваются в чате или уходят в
+    # "Разобрать" по таймауту, а не только для задач, классифицированных сразу (см.
+    # bot.py::_flush_chat_to_clickup — username уже резолвится в момент постановки
+    # вопроса, а не отложенно, т.к. буфер сообщений к моменту ответа может быть уже стёрт).
+    _ensure_columns(
+        conn, "pending_classifications", {"task_reporter_name": "TEXT", "task_reporter_username": "TEXT"}
+    )
     # Все DM-сообщения бота, связанные с одной эскалацией (исходный пересланный вопрос,
     # подтверждение ответа, черновики правок) — чтобы Марина могла сделать reply-правку
     # на ЛЮБОЕ из них, а не только на самое первое сообщение (см.
