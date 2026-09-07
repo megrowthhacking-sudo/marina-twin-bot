@@ -1858,6 +1858,22 @@ async def handle_tasksall_command(update: Update, context: ContextTypes.DEFAULT_
 _TASK_MESSAGE_DELAY_SECONDS = 0.35
 
 
+# Флаг "остановить рассылку режима правки" (команда /stop, по прямой просьбе владелицы,
+# часть 33: "если я вдруг ошибочно нажала команду 'Править' и начались выгружаться по
+# одной задачи в телегу"). Простой модульный флаг, а не что-то в storage (БД) — рассылка
+# живёт только в пределах одного вызова _send_edit_mode_report, персистентность между
+# перезапусками бота не нужна, а владелица (единственная, кому доступны эти команды) может
+# запустить только одну рассылку за раз. Сбрасывается в False в НАЧАЛЕ каждого нового
+# вызова _send_edit_mode_report — иначе случайно нажатый /stop заблокировал бы все
+# последующие "Править" впредь.
+_stop_edit_mode_requested = False
+
+
+def _request_stop_edit_mode() -> None:
+    global _stop_edit_mode_requested
+    _stop_edit_mode_requested = True
+
+
 def _sort_tasks_fire_first(tasks: list[dict]) -> list[dict]:
     """Задачи, помеченные тегом ClickUp "кричащая задача" (кнопка "🔥 Горит», см.
     _is_fire/handle_employee_task_callback), идут первыми (в своём относительном порядке
@@ -1880,7 +1896,10 @@ def _format_employee_task_lines(tasks: list[dict], start_index: int = 1) -> list
     кнопками под ней, см. _employee_task_keyboard).
     Задачи, помеченные "🔥 Горит" (см. _is_fire), получают значок 🔥 вместо обычного 🔴 у
     срочных — визуально понятно, что задача поднята вручную, а не просто высокий
-    приоритет в ClickUp."""
+    приоритет в ClickUp. Если известно (часть 33, "от кого задача и на кого") — в конце
+    строки, после местоположения, добавляется ещё один суффикс "[от .../→ ...]" (см.
+    _format_attribution_suffix)."""
+    reporters = storage.get_task_reporters([t["id"] for t in tasks if t.get("id")])
     lines = []
     for offset, t in enumerate(tasks):
         i = start_index + offset
@@ -1888,7 +1907,8 @@ def _format_employee_task_lines(tasks: list[dict], start_index: int = 1) -> list
         due_suffix = _format_due_suffix(t.get("due_date"))
         location = _format_task_location(t)
         location_suffix = f" [{location}]" if location else ""
-        lines.append(f"{i}. {marker}{t['name']}{due_suffix}{location_suffix}")
+        attribution_suffix = _format_attribution_suffix(t, reporters)
+        lines.append(f"{i}. {marker}{t['name']}{due_suffix}{location_suffix}{attribution_suffix}")
     return lines
 
 
