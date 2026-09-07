@@ -1540,14 +1540,23 @@ async def _flush_chat_to_clickup(
     держать буфер вечно, тут по-прежнему помечаем прочитанным.
     project_key задан → чат закреплён за одним проектом, все задачи туда, без
     классификации. project_key is None → "смешанный" чат без привязки: каждая задача
-    классифицируется отдельно (Atlas/Алтын/BestSwift); неоднозначные не падают молча
-    в "Разобрать", а сначала переспрашиваются в чате (см. _ask_classification_question).
-    Сериализовано локом на chat_id (см. _get_chat_flush_lock) — защита от гонки между
-    немедленной выгрузкой из handle_group_message и периодической (periodic_flush_job)."""
+    классифицируется отдельно (Atlas/Алтын/BestSwift), а то, что не удалось однозначно
+    классифицировать, сразу уходит в "Разобрать" — БЕЗ уточняющего вопроса в чате (по
+    прямой просьбе владелицы, часть 33: бот больше не переспрашивает в группах, только
+    молча читает переписку и, если что, кладёт задачу в "Разобрать"; раньше здесь был
+    отдельный поток с уточняющим вопросом в чате — см. историю/project status doc, части
+    до 33). Сериализовано локом на chat_id (см. _get_chat_flush_lock) — защита от гонки
+    между немедленной выгрузкой из handle_group_message и периодической
+    (periodic_flush_job)."""
     async with _get_chat_flush_lock(chat_id):
         rows = storage.get_unflushed(chat_id)
         if not rows:
             return 0
+        # "От кого задача" (часть 33) — сопоставление reporter_name (см. task_extractor.py)
+        # с реальным Telegram @username строится ИЗ ЭТОГО ЖЕ буфера сообщений, пока он ещё
+        # не стёр (mark_flushed ниже) — иначе к моменту, когда неоднозначная задача
+        # разрешится (ответ в чате или таймаут), исходные сообщения уже не найти.
+        reporter_lookup = _reporter_lookup_from_rows(rows)
         if project_key:
             list_id = config.CLICKUP_LIST_IDS.get(project_key)
             if not list_id:
@@ -1562,7 +1571,7 @@ async def _flush_chat_to_clickup(
                     chat_id, chat_title,
                 )
                 return 0
-            created = _push_tasks(chat_id, chat_title, tasks, lambda _t: project_key)
+            created = _push_tasks(chat_id, chat_title, tasks, lambda _t: project_key, reporter_lookup)
         else:
             try:
                 tasks = task_extractor.extract_tasks_classified(chat_title, rows)
@@ -1572,17 +1581,15 @@ async def _flush_chat_to_clickup(
                     chat_id, chat_title,
                 )
                 return 0
-            clear_tasks = [t for t in tasks if t.get("project") in ("atlas", "altyn", "bestswift")]
-            ambiguous_tasks = [t for t in tasks if t not in clear_tasks]
-            created = _push_tasks(chat_id, chat_title, clear_tasks, lambda t: t.get("project"))
-            for t in ambiguous_tasks:
-                title = (t.get("title") or "").strip()
-                if not title:
-                    continue
-                classification_id = storage.add_pending_classification(
-                    chat_id, chat_title, title, t.get("description", ""), t.get("priority"), t.get("assignee_name")
-                )
-                await _ask_classification_question(context, chat_id, chat_title, classification_id, title)
+            # Раньше задачи, которые не удалось однозначно классифицировать, сначала
+            # переспрашивались в чате (see _ask_classification_question — убрано в части
+            # 33) — теперь всё, что не Atlas/Алтын/BestSwift, просто идёт в "Разобрать",
+            # без вопроса в группу.
+            created = _push_tasks(
+                chat_id, chat_title, tasks,
+                lambda t: t.get("project") if t.get("project") in ("atlas", "altyn", "bestswift") else "unsorted",
+                reporter_lookup,
+            )
         storage.mark_flushed(chat_id)
         return created
 
