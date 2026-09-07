@@ -133,7 +133,6 @@ def _update_active_countries(active: list[str], mentioned: set[str], russia_only
 
 # --- Закрепление группового чата за проектом по фразе в сообщении ---
 # ("эта группа про задачи Altyn", "это группа для задач Atlas", "это группа Bestswift/BS")
-
 def _detect_project_binding(text: str) -> str | None:
     """Ищет в сообщении совместное упоминание слова "групп-" и ключевого слова одного
     из проектов (см. config.CLICKUP_PROJECTS[...]["keywords"]) — этого достаточно для
@@ -142,20 +141,6 @@ def _detect_project_binding(text: str) -> str | None:
     if "групп" not in lowered:
         return None
     for key, project in config.CLICKUP_PROJECTS.items():
-        for kw in project["keywords"]:
-            if re.search(r"\b" + re.escape(kw) + r"\b", lowered):
-                return key
-    return None
-
-
-def _detect_project_keyword(text: str) -> str | None:
-    """Как _detect_project_binding, но без требования слова "групп-" — для коротких
-    прямых ответов на уточняющий вопрос вида "Atlas" или "это Altyn" (см.
-    _resolve_classification_reply)."""
-    lowered = text.lower()
-    for key, project in config.CLICKUP_PROJECTS.items():
-        if key == "unsorted":
-            continue
         for kw in project["keywords"]:
             if re.search(r"\b" + re.escape(kw) + r"\b", lowered):
                 return key
@@ -755,16 +740,6 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await _handle_group_message_edited(chat, msg, text)
         return
 
-    # Ответ на уточняющий вопрос "Atlas, Altyn или BestSwift?" (см.
-    # _ask_classification_question) — проверяем в первую очередь, это отдельный поток
-    # от привязки чата и обращения к "Марине" ниже.
-    reply_to = msg.reply_to_message
-    if reply_to:
-        classification = storage.get_classification_by_question_message_id(chat.id, reply_to.message_id)
-        if classification:
-            await _resolve_classification_reply(update, context, classification, text)
-            return
-
     bound_project = _detect_project_binding(text)
     if bound_project:
         previous_project = storage.get_chat_project(chat.id)
@@ -840,7 +815,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
     user_name = (user.first_name or user.username or "кто-то") if user else "кто-то"
-    storage.add_group_message(chat.id, chat.title or str(chat.id), user_name, text)
+    storage.add_group_message(
+        chat.id, chat.title or str(chat.id), user_name, text,
+        telegram_username=(user.username if user else None),
+    )
     # Раньше новое сообщение просто копилось в буфере до ближайшей периодической
     # выгрузки (см. periodic_flush_job, CLICKUP_FLUSH_INTERVAL_MINUTES) — из-за этого
     # /urgent и живые отчёты могли не видеть только что написанные задачи. Теперь
@@ -905,6 +883,17 @@ def _resolve_task_status(list_id: str, status_name_raw: str) -> tuple[str | None
     return None, statuses
 
 
+def _reporter_lookup_from_rows(rows: list[dict]) -> dict[str, str | None]:
+    """По прямой просьбе владелицы, часть 33 ("от кого задача"): строит словарь
+    user_name → telegram_username из накопленных сообщений чата (см. storage.get_unflushed/
+    task_extractor.extract_tasks — тот же rows), чтобы потом сопоставить "reporter_name",
+    которое вернул экстрактор (см. task_extractor.py — берёт имя ТОЧНО как в переписке,
+    "Имя: текст"), с настоящим Telegram-ником этого человека. Если один user_name
+    встречается несколько раз в буфере — берём username из последнего вхождения (не
+    принципиально, обычно один и тот же человек пишет с одним и тем же username)."""
+    return {r["user_name"]: r.get("telegram_username") for r in rows if r.get("user_name")}
+
+
 def _create_and_log_task(
     chat_id: int,
     chat_title: str,
@@ -913,11 +902,17 @@ def _create_and_log_task(
     description: str,
     priority,
     assignee_id: int | None = None,
+    reporter_name: str | None = None,
+    reporter_username: str | None = None,
 ) -> str | None:
     """Создаёт одну задачу в ClickUp-списке project_key и логирует её в pushed_tasks
     (нужно и для отладки, и для отчёта по /tasksX — см. _send_project_report).
     assignee_id — ClickUp user_id ответственного, если удалось сопоставить (см.
-    _resolve_assignee_id), иначе None. Возвращает id созданной задачи в ClickUp, либо
+    _resolve_assignee_id), иначе None. reporter_name/reporter_username — по прямой
+    просьбе владелицы, часть 33: кто в переписке поднял эту задачу (см.
+    _reporter_lookup_from_rows) — просто сохраняются в pushed_tasks, чтобы потом
+    показать "от кого" в отчётах (см. _format_task_lines/_format_employee_task_lines),
+    не влияют на саму задачу в ClickUp. Возвращает id созданной задачи в ClickUp, либо
     None при неудаче (список не настроен или ClickUp отказал)."""
     list_id = config.CLICKUP_LIST_IDS.get(project_key)
     if not list_id:
@@ -931,16 +926,28 @@ def _create_and_log_task(
             assignees=[assignee_id] if assignee_id else None,
         )
         task_id = str(result.get("id", ""))
-        storage.log_pushed_task(chat_id, chat_title, task_id, title, project_key)
+        storage.log_pushed_task(
+            chat_id, chat_title, task_id, title, project_key,
+            reporter_name=reporter_name, reporter_username=reporter_username,
+        )
         return task_id
     except Exception:
         logger.exception("Не удалось создать задачу в ClickUp: %s", title)
         return None
 
 
-def _push_tasks(chat_id: int, chat_title: str, tasks: list[dict], project_for: callable) -> int:
+def _push_tasks(
+    chat_id: int,
+    chat_title: str,
+    tasks: list[dict],
+    project_for: callable,
+    reporter_lookup: dict[str, str | None] | None = None,
+) -> int:
     """Общая часть: создаёт в ClickUp каждую задачу из tasks под проектом project_for(t).
-    Возвращает число реально созданных задач."""
+    reporter_lookup (см. _reporter_lookup_from_rows) — сопоставляет "reporter_name" из
+    экстрактора с реальным Telegram @username, для "от кого задача" (часть 33); можно не
+    передавать, если сопоставлять не с чем (тогда сохранится только reporter_name, без
+    username). Возвращает число реально созданных задач."""
     created = 0
     for t in tasks:
         title = (t.get("title") or "").strip()
@@ -950,8 +957,11 @@ def _push_tasks(chat_id: int, chat_title: str, tasks: list[dict], project_for: c
         if not project_key:
             continue
         assignee_id = _resolve_assignee_id(t.get("assignee_name"))
+        reporter_name = (t.get("reporter_name") or "").strip() or None
+        reporter_username = reporter_lookup.get(reporter_name) if reporter_lookup and reporter_name else None
         if _create_and_log_task(
-            chat_id, chat_title, project_key, title, t.get("description", ""), t.get("priority"), assignee_id
+            chat_id, chat_title, project_key, title, t.get("description", ""), t.get("priority"), assignee_id,
+            reporter_name=reporter_name, reporter_username=reporter_username,
         ):
             created += 1
     return created
@@ -969,16 +979,23 @@ async def _log_owner_dm_tasks(user, text: str) -> None:
     if not config.CLICKUP_ENABLED:
         return
     chat_title = "Личка Марины"
+    reporter_display_name = user.first_name or "Марина"
     try:
         tasks = task_extractor.extract_tasks_classified(
-            chat_title, [{"user_name": user.first_name or "Марина", "text": text, "ts": time.time()}]
+            chat_title, [{"user_name": reporter_display_name, "text": text, "ts": time.time()}]
         )
     except Exception:
         logger.exception("Ошибка извлечения задач из личного сообщения владелицы")
         return
     if not tasks:
         return
-    created = _push_tasks(user.id, chat_title, tasks, lambda t: t.get("project") or "unsorted")
+    # Личка владелицы — репортер всегда она сама (единственный собеседник Twin в личке),
+    # сопоставлять reporter_name из экстрактора не с чем гадать: сразу берём её же
+    # telegram username (часть 33, "от кого задача").
+    created = _push_tasks(
+        user.id, chat_title, tasks, lambda t: t.get("project") or "unsorted",
+        reporter_lookup={reporter_display_name: user.username},
+    )
     if created:
         logger.info("Из личного сообщения владелицы занесено задач в ClickUp: %s", created)
 
@@ -1140,8 +1157,13 @@ async def handle_manual_task_callback(update: Update, context: ContextTypes.DEFA
             )
             return
         task_id = str(result.get("id", ""))
+        # Реальная задача из явной команды владелицы в личке — "от кого" тут всегда она
+        # сама (часть 33, "от кого задача"), гадать/сопоставлять не нужно.
+        reporter = query.from_user
         storage.log_pushed_task(
-            manual_task["owner_user_id"], "Личка Марины", task_id, manual_task["title"], manual_task["target_key"]
+            manual_task["owner_user_id"], "Личка Марины", task_id, manual_task["title"], manual_task["target_key"],
+            reporter_name=(reporter.first_name if reporter else None) or "Марина",
+            reporter_username=reporter.username if reporter else None,
         )
         storage.resolve_pending_manual_task(manual_task_id)
         await query.edit_message_text(f"Готово, создала задачу: «{manual_task['title']}» ✅")
@@ -1486,88 +1508,6 @@ async def handle_calendar_view_callback(update: Update, context: ContextTypes.DE
     await query.edit_message_text(text, reply_markup=_calendar_period_keyboard())
 
 
-async def _ask_classification_question(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_title: str, classification_id: int, task_title: str
-) -> None:
-    """Задаёт в "смешанном" чате уточняющий вопрос по задаче, которую Claude не смог
-    однозначно классифицировать (см. _flush_chat_to_clickup). Ответ (reply на это
-    сообщение) ловит handle_group_message → _resolve_classification_reply."""
-    text = (
-        f"Не поняла, к какому проекту отнести задачу: «{task_title}»\n"
-        f"Это Atlas, Altyn или BestSwift? Ответь (reply) на это сообщение названием проекта.\n"
-        f"Если никто не подскажет — через некоторое время сама положу в «Разобрать»."
-    )
-    try:
-        sent = await context.bot.send_message(chat_id=chat_id, text=text)
-        storage.set_classification_question_message_id(classification_id, sent.message_id)
-    except Exception:
-        logger.exception(
-            "Не удалось задать уточняющий вопрос по классификации #%s в чате %s (%s)",
-            classification_id, chat_id, chat_title,
-        )
-
-
-async def _resolve_classification_reply(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, classification: dict, reply_text: str
-) -> None:
-    """Кто-то в группе ответил (reply) на уточняющий вопрос про проект задачи.
-    Отвечают Atlas/Altyn/BestSwift — кладём туда; отвечают что-то другое (или
-    непонятное) — сразу в "Разобрать", ждать дальше уже не имеет смысла, раз ответ
-    уже пришёл."""
-    classification_id = classification["id"]
-    project_key = _detect_project_keyword(reply_text) or "unsorted"
-    label = config.CLICKUP_PROJECTS[project_key]["label"]
-    assignee_id = _resolve_assignee_id(classification.get("task_assignee_name"))
-
-    task_id = _create_and_log_task(
-        classification["chat_id"],
-        classification["chat_title"],
-        project_key,
-        classification["task_title"],
-        classification["task_description"],
-        classification["task_priority"],
-        assignee_id,
-    )
-    storage.resolve_classification(classification_id, project_key)
-
-    if task_id:
-        await update.message.reply_text(f"Поняла, добавила «{classification['task_title']}» в «{label}» 👍")
-    else:
-        await update.message.reply_text(
-            f"Поняла (проект «{label}»), но не смогла создать задачу в ClickUp — возможно, список ещё не настроен."
-        )
-
-
-async def _sweep_stale_classifications(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Классификации, на которые никто не ответил дольше
-    CLICKUP_CLASSIFICATION_TIMEOUT_MINUTES, — принудительно кладём в "Разобрать", чтобы
-    задача не зависла в подвешенном состоянии навсегда."""
-    cutoff = time.time() - config.CLICKUP_CLASSIFICATION_TIMEOUT_MINUTES * 60
-    for c in storage.get_unresolved_classifications_older_than(cutoff):
-        label = config.CLICKUP_PROJECTS["unsorted"]["label"]
-        assignee_id = _resolve_assignee_id(c.get("task_assignee_name"))
-        task_id = _create_and_log_task(
-            c["chat_id"],
-            c["chat_title"],
-            "unsorted",
-            c["task_title"],
-            c["task_description"],
-            c["task_priority"],
-            assignee_id,
-        )
-        storage.resolve_classification(c["id"], "unsorted")
-        if task_id:
-            try:
-                await context.bot.send_message(
-                    chat_id=c["chat_id"],
-                    text=f"Не дождалась ответа — положила «{c['task_title']}» в «{label}» 👍",
-                )
-            except Exception:
-                logger.exception(
-                    "Не удалось уведомить чат %s о таймауте классификации #%s", c["chat_id"], c["id"]
-                )
-
-
 """Один и тот же чат может попасть на выгрузку из двух разных мест почти одновременно:
 сразу после нового сообщения (см. handle_group_message) и по расписанию
 (periodic_flush_job, независимый job на том же event loop). Раньше это иногда
@@ -1601,14 +1541,23 @@ async def _flush_chat_to_clickup(
     держать буфер вечно, тут по-прежнему помечаем прочитанным.
     project_key задан → чат закреплён за одним проектом, все задачи туда, без
     классификации. project_key is None → "смешанный" чат без привязки: каждая задача
-    классифицируется отдельно (Atlas/Алтын/BestSwift); неоднозначные не падают молча
-    в "Разобрать", а сначала переспрашиваются в чате (см. _ask_classification_question).
-    Сериализовано локом на chat_id (см. _get_chat_flush_lock) — защита от гонки между
-    немедленной выгрузкой из handle_group_message и периодической (periodic_flush_job)."""
+    классифицируется отдельно (Atlas/Алтын/BestSwift), а то, что не удалось однозначно
+    классифицировать, сразу уходит в "Разобрать" — БЕЗ уточняющего вопроса в чате (по
+    прямой просьбе владелицы, часть 33: бот больше не переспрашивает в группах, только
+    молча читает переписку и, если что, кладёт задачу в "Разобрать"; раньше здесь был
+    отдельный поток с уточняющим вопросом в чате — см. историю/project status doc, части
+    до 33). Сериализовано локом на chat_id (см. _get_chat_flush_lock) — защита от гонки
+    между немедленной выгрузкой из handle_group_message и периодической
+    (periodic_flush_job)."""
     async with _get_chat_flush_lock(chat_id):
         rows = storage.get_unflushed(chat_id)
         if not rows:
             return 0
+        # "От кого задача" (часть 33) — сопоставление reporter_name (см. task_extractor.py)
+        # с реальным Telegram @username строится ИЗ ЭТОГО ЖЕ буфера сообщений, пока он ещё
+        # не стёр (mark_flushed ниже) — иначе к моменту, когда неоднозначная задача
+        # разрешится (ответ в чате или таймаут), исходные сообщения уже не найти.
+        reporter_lookup = _reporter_lookup_from_rows(rows)
         if project_key:
             list_id = config.CLICKUP_LIST_IDS.get(project_key)
             if not list_id:
@@ -1623,7 +1572,7 @@ async def _flush_chat_to_clickup(
                     chat_id, chat_title,
                 )
                 return 0
-            created = _push_tasks(chat_id, chat_title, tasks, lambda _t: project_key)
+            created = _push_tasks(chat_id, chat_title, tasks, lambda _t: project_key, reporter_lookup)
         else:
             try:
                 tasks = task_extractor.extract_tasks_classified(chat_title, rows)
@@ -1633,17 +1582,15 @@ async def _flush_chat_to_clickup(
                     chat_id, chat_title,
                 )
                 return 0
-            clear_tasks = [t for t in tasks if t.get("project") in ("atlas", "altyn", "bestswift")]
-            ambiguous_tasks = [t for t in tasks if t not in clear_tasks]
-            created = _push_tasks(chat_id, chat_title, clear_tasks, lambda t: t.get("project"))
-            for t in ambiguous_tasks:
-                title = (t.get("title") or "").strip()
-                if not title:
-                    continue
-                classification_id = storage.add_pending_classification(
-                    chat_id, chat_title, title, t.get("description", ""), t.get("priority"), t.get("assignee_name")
-                )
-                await _ask_classification_question(context, chat_id, chat_title, classification_id, title)
+            # Раньше задачи, которые не удалось однозначно классифицировать, сначала
+            # переспрашивались в чате (see _ask_classification_question — убрано в части
+            # 33) — теперь всё, что не Atlas/Алтын/BestSwift, просто идёт в "Разобрать",
+            # без вопроса в группу.
+            created = _push_tasks(
+                chat_id, chat_title, tasks,
+                lambda t: t.get("project") if t.get("project") in ("atlas", "altyn", "bestswift") else "unsorted",
+                reporter_lookup,
+            )
         storage.mark_flushed(chat_id)
         return created
 
@@ -1698,15 +1645,44 @@ def _format_due_suffix(due_date: float | None) -> str:
     return f" (до {dt.strftime('%d.%m.%Y')})"
 
 
+def _format_attribution_suffix(task: dict, reporters: dict[str, dict]) -> str:
+    """По прямой просьбе владелицы, часть 33 ("от кого задача и к кому обращается —
+    ник в тг и на кого задача"): строит суффикс вида " [от @ivan_tg → Дима]" для строки
+    отчёта. "→ Дима" — реальные ответственные ClickUp прямо из задачи (см.
+    clickup_client._extract_assignee_names, поле "assignees" — живые, актуальные на
+    момент запроса, а не то, что было на момент постановки). "от ..." — кто в переписке
+    поднял задачу (см. storage.get_task_reporters — известно только для задач, которые
+    завёл сам бот; для задач, заведённых вручную прямо в ClickUp, неизвестно и просто
+    опускается, как и остальные "если известно" в этом боте). Если неизвестно ни то,
+    ни другое — возвращает пустую строку, ничего лишнего в строке не появляется."""
+    reporter = reporters.get(task.get("id")) or {}
+    reporter_name = (reporter.get("reporter_name") or "").strip()
+    reporter_username = (reporter.get("reporter_username") or "").strip()
+    assignees = task.get("assignees") or []
+    parts = []
+    if reporter_name and reporter_username:
+        parts.append(f"от {reporter_name} (@{reporter_username})")
+    elif reporter_username:
+        parts.append(f"от @{reporter_username}")
+    elif reporter_name:
+        parts.append(f"от {reporter_name}")
+    if assignees:
+        parts.append(f"→ {', '.join(assignees)}")
+    return f" [{' · '.join(parts)}]" if parts else ""
+
+
 def _format_task_lines(tasks: list[dict]) -> list[str]:
     """Форматирует список задач ClickUp (см. clickup_client.get_open_tasks) в пронумерованные
-    строки отчёта, отмечая срочные/высокоприоритетные задачи значком 🔴 и, если у задачи
-    задан срок в ClickUp, дописывая его в конце строки."""
+    строки отчёта, отмечая срочные/высокоприоритетные задачи значком 🔴, дописывая срок (если
+    задан в ClickUp) и, если известно, "от кого/на кого" (см. _format_attribution_suffix,
+    часть 33) в конце строки."""
+    reporters = storage.get_task_reporters([t["id"] for t in tasks if t.get("id")])
     lines = []
     for i, t in enumerate(tasks, start=1):
         marker = "🔴 " if _is_urgent(t) else ""
         due_suffix = _format_due_suffix(t.get("due_date"))
-        lines.append(f"{i}. {marker}{t['name']}{due_suffix}")
+        attribution_suffix = _format_attribution_suffix(t, reporters)
+        lines.append(f"{i}. {marker}{t['name']}{due_suffix}{attribution_suffix}")
     return lines
 
 
@@ -1813,6 +1789,26 @@ async def handle_cancelall_command(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("Висящих вопросов и не было — всё чисто.")
 
 
+async def handle_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stop — только в личке, только владелице (по прямой просьбе владелицы, часть 33):
+    "если я вдруг ошибочно нажала команду 'Править' и начались выгружаться по одной
+    задачи в телегу" — прерывает рассылку режима правки (см. _send_edit_mode_report/
+    _request_stop_edit_mode) перед следующим же сообщением. Ничего не ломает, если
+    рассылка на самом деле не идёт — просто выставляет флаг, который никто не проверит,
+    пока не запустится следующая; отвечает одинаково в обоих случаях, чтобы не пытаться
+    гадать, идёт рассылка прямо сейчас или уже нет (гонка между проверкой и ответом всё
+    равно возможна)."""
+    chat = update.effective_chat
+    if chat.type != "private":
+        await update.message.reply_text("Эта команда работает только в личке.")
+        return
+    if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+        await update.message.reply_text("Эта команда только для владелицы.")
+        return
+    _request_stop_edit_mode()
+    await update.message.reply_text("🛑 Хорошо, останавливаю рассылку задач (если она сейчас идёт).")
+
+
 async def _send_tasksall_report(context: ContextTypes.DEFAULT_TYPE) -> str:
     """/tasksall — по каждому проекту (в порядке config.CLICKUP_PROJECTS) тянет живые
     открытые задачи из ClickUp и собирает единый отчёт с разделом на каждый проект,
@@ -1863,6 +1859,22 @@ async def handle_tasksall_command(update: Update, context: ContextTypes.DEFAULT_
 _TASK_MESSAGE_DELAY_SECONDS = 0.35
 
 
+# Флаг "остановить рассылку режима правки" (команда /stop, по прямой просьбе владелицы,
+# часть 33: "если я вдруг ошибочно нажала команду 'Править' и начались выгружаться по
+# одной задачи в телегу"). Простой модульный флаг, а не что-то в storage (БД) — рассылка
+# живёт только в пределах одного вызова _send_edit_mode_report, персистентность между
+# перезапусками бота не нужна, а владелица (единственная, кому доступны эти команды) может
+# запустить только одну рассылку за раз. Сбрасывается в False в НАЧАЛЕ каждого нового
+# вызова _send_edit_mode_report — иначе случайно нажатый /stop заблокировал бы все
+# последующие "Править" впредь.
+_stop_edit_mode_requested = False
+
+
+def _request_stop_edit_mode() -> None:
+    global _stop_edit_mode_requested
+    _stop_edit_mode_requested = True
+
+
 def _sort_tasks_fire_first(tasks: list[dict]) -> list[dict]:
     """Задачи, помеченные тегом ClickUp "кричащая задача" (кнопка "🔥 Горит», см.
     _is_fire/handle_employee_task_callback), идут первыми (в своём относительном порядке
@@ -1885,7 +1897,10 @@ def _format_employee_task_lines(tasks: list[dict], start_index: int = 1) -> list
     кнопками под ней, см. _employee_task_keyboard).
     Задачи, помеченные "🔥 Горит" (см. _is_fire), получают значок 🔥 вместо обычного 🔴 у
     срочных — визуально понятно, что задача поднята вручную, а не просто высокий
-    приоритет в ClickUp."""
+    приоритет в ClickUp. Если известно (часть 33, "от кого задача и на кого") — в конце
+    строки, после местоположения, добавляется ещё один суффикс "[от .../→ ...]" (см.
+    _format_attribution_suffix)."""
+    reporters = storage.get_task_reporters([t["id"] for t in tasks if t.get("id")])
     lines = []
     for offset, t in enumerate(tasks):
         i = start_index + offset
@@ -1893,7 +1908,8 @@ def _format_employee_task_lines(tasks: list[dict], start_index: int = 1) -> list
         due_suffix = _format_due_suffix(t.get("due_date"))
         location = _format_task_location(t)
         location_suffix = f" [{location}]" if location else ""
-        lines.append(f"{i}. {marker}{t['name']}{due_suffix}{location_suffix}")
+        attribution_suffix = _format_attribution_suffix(t, reporters)
+        lines.append(f"{i}. {marker}{t['name']}{due_suffix}{location_suffix}{attribution_suffix}")
     return lines
 
 
@@ -2071,7 +2087,13 @@ async def _send_edit_mode_report(
     отчёта по умолчанию в отдельный режим правки). Задачи, помеченные "🔥 Горит",
     показываются первыми (см. _sort_tasks_fire_first). Между сообщениями — небольшая пауза
     (_TASK_MESSAGE_DELAY_SECONDS) во избежание лимита Telegram на сообщения в один чат
-    (см. _send_owner_message_with_retry)."""
+    (см. _send_owner_message_with_retry). По прямой просьбе владелицы, часть 33: команда
+    /stop (см. handle_stop_command/_request_stop_edit_mode) прерывает рассылку между
+    сообщениями (проверяется перед каждым заголовком партии и перед каждой задачей) — на
+    случай, если "Править" нажали по ошибке, а задач много (например, у Лили их около 80,
+    ждать, пока разошлются все, не всегда уместно)."""
+    global _stop_edit_mode_requested
+    _stop_edit_mode_requested = False
     if not tasks:
         try:
             await context.bot.send_message(
@@ -2088,19 +2110,34 @@ async def _send_edit_mode_report(
         list(zip(tasks[i : i + _EDIT_MODE_BATCH_SIZE], lines[i : i + _EDIT_MODE_BATCH_SIZE]))
         for i in range(0, total, _EDIT_MODE_BATCH_SIZE)
     ]
+    sent_count = 0
+    stopped = False
     try:
         for batch_num, batch in enumerate(batches, start=1):
+            if _stop_edit_mode_requested:
+                stopped = True
+                break
             header = f"✏️ Правка: {label} — {scope_note} ({total})"
             if len(batches) > 1:
                 header += f", часть {batch_num}/{len(batches)}"
             await _send_owner_message_with_retry(context, header)
             await asyncio.sleep(_TASK_MESSAGE_DELAY_SECONDS)
             for offset, (task, line) in enumerate(batch):
+                if _stop_edit_mode_requested:
+                    stopped = True
+                    break
                 keyboard = _employee_task_keyboard(task, include_weekly_button)
                 await _send_owner_message_with_retry(context, line, reply_markup=keyboard)
+                sent_count += 1
                 is_last_message = batch_num == len(batches) and offset == len(batch) - 1
                 if not is_last_message:
                     await asyncio.sleep(_TASK_MESSAGE_DELAY_SECONDS)
+            if stopped:
+                break
+        if stopped:
+            await _send_owner_message_with_retry(
+                context, f"🛑 Остановлено по /stop — отправила {sent_count} из {total}."
+            )
     except Exception:
         logger.exception("Не удалось отправить отчёт по сотруднику (%s) владелице", label)
 
@@ -2736,9 +2773,8 @@ async def periodic_flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Фоновая выгрузка задач по расписанию (CLICKUP_FLUSH_INTERVAL_MINUTES), без
     ручной команды — для ВСЕХ чатов с непрочитанными сообщениями. Для чатов,
     закреплённых за проектом, задачи идут в его список; для "смешанных" чатов без
-    привязки — классифицируются по отдельности (см. _flush_chat_to_clickup). Заодно
-    подчищает зависшие без ответа уточнения по классификации (см.
-    _sweep_stale_classifications)."""
+    привязки — классифицируются по отдельности, а то, что не удалось классифицировать —
+    сразу в "Разобрать", без вопроса в чат (см. _flush_chat_to_clickup, часть 33)."""
     if not config.CLICKUP_ENABLED:
         return
     for chat_id, chat_title in storage.get_chats_with_pending():
@@ -2749,7 +2785,6 @@ async def periodic_flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Авто-выгрузка: чат «%s» (%s), проект %s → %d задач в ClickUp",
                 chat_title, chat_id, project_key or "не закреплён (классификация)", created,
             )
-    await _sweep_stale_classifications(context)
 
 
 async def periodic_memory_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2841,7 +2876,8 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
     sections.append(
         "🗓 Календарь и прочее:\n"
         "/calendar — события календаря по периодам (сегодня/завтра/неделя/месяц)\n"
-        "/cancelall — снять все висящие вопросы из групповых чатов, на которые ещё не ответила"
+        "/cancelall — снять все висящие вопросы из групповых чатов, на которые ещё не ответила\n"
+        "/stop — остановить рассылку задач в режиме правки, если нажала по ошибке"
     )
 
     text = "\n\n".join(sections)
@@ -2859,6 +2895,10 @@ def build_application() -> Application:
     # /cancelall — только в личке, только владелице: снимает разом все висящие вопросы
     # из групп, на которые она ещё не ответила через бота (см. handle_cancelall_command).
     app.add_handler(CommandHandler("cancelall", handle_cancelall_command))
+    # /stop — только в личке, только владелице (по прямой просьбе владелицы, часть 33):
+    # прерывает рассылку режима правки, если её нажали по ошибке (см.
+    # handle_stop_command/_send_edit_mode_report).
+    app.add_handler(CommandHandler("stop", handle_stop_command))
     # /tasksall — только в личке, только владелице: живой отчёт по открытым задачам
     # сразу всех четырёх проектов одним сообщением (см. handle_tasksall_command).
     app.add_handler(CommandHandler("tasksall", handle_tasksall_command))

@@ -46,6 +46,12 @@ def _connect() -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_group_messages_chat_flushed ON group_messages(chat_id, flushed)")
+    # telegram_username — реальный @username автора сообщения (в отличие от user_name,
+    # который для экстрактора задач — first_name, см. bot.py::handle_group_message) — по
+    # прямой просьбе владелицы, часть 33: нужен, чтобы потом показать "от кого задача"
+    # настоящим Telegram-ником, а не только именем. Может быть NULL — не у всех в Telegram
+    # задан @username.
+    _ensure_columns(conn, "group_messages", {"telegram_username": "TEXT"})
     # Журнал того, что реально улетело в ClickUp — для отладки, отчётов по /tasksX
     # (см. get_pushed_tasks_by_project) и чтобы не гадать задним числом.
     conn.execute(
@@ -65,6 +71,14 @@ def _connect() -> sqlite3.Connection:
     # (до этой миграции) останутся с project = NULL и не попадут в отчёты — это ок,
     # это лишь исторический пробел.
     _ensure_columns(conn, "pushed_tasks", {"project": "TEXT"})
+    # reporter_name/reporter_username — по прямой просьбе владелицы, часть 33 ("от кого
+    # задача"): кто в переписке реально поднял/попросил эту задачу (см. task_extractor.py,
+    # поле reporter_name, и bot.py::_reporter_username_lookup — сопоставление с настоящим
+    # Telegram @username). Для задач, поставленных явно самой владелицей в личке (не из
+    # группового чата) — reporter_name = "Марина"/её имя, без сопоставления username (она и
+    # так единственная читает свои же отчёты). Оба поля могут быть NULL — если экстрактор
+    # не смог понять, кто именно поднял задачу, или для задач, заведённых до этой части.
+    _ensure_columns(conn, "pushed_tasks", {"reporter_name": "TEXT", "reporter_username": "TEXT"})
     # За каким проектом (ключ из config.CLICKUP_PROJECTS: "atlas"/"altyn"/"bestswift")
     # закреплён групповой чат. Проставляется автоматически либо когда кто-то в чате пишет
     # "эта группа про задачи <проект>", либо при вызове команды /tasksatlas /tasksaltyn
@@ -153,6 +167,15 @@ def _connect() -> sqlite3.Connection:
     # переспрашиваются в чате или уходят в "Разобрать" по таймауту, а не только для
     # уже классифицированных на месте.
     _ensure_columns(conn, "pending_classifications", {"task_assignee_name": "TEXT"})
+    # task_reporter_name/task_reporter_username — как и task_assignee_name выше, но для
+    # "от кого задача" (часть 33): сохраняются вместе с отложенной классификацией, чтобы
+    # это тоже не терялось для задач, которые переспрашиваются в чате или уходят в
+    # "Разобрать" по таймауту, а не только для задач, классифицированных сразу (см.
+    # bot.py::_flush_chat_to_clickup — username уже резолвится в момент постановки
+    # вопроса, а не отложенно, т.к. буфер сообщений к моменту ответа может быть уже стёрт).
+    _ensure_columns(
+        conn, "pending_classifications", {"task_reporter_name": "TEXT", "task_reporter_username": "TEXT"}
+    )
     # Все DM-сообщения бота, связанные с одной эскалацией (исходный пересланный вопрос,
     # подтверждение ответа, черновики правок) — чтобы Марина могла сделать reply-правку
     # на ЛЮБОЕ из них, а не только на самое первое сообщение (см.
@@ -317,20 +340,24 @@ def reset_chat(chat_id: int) -> None:
 
 # --- Буфер групповых сообщений (сбор задач для ClickUp) ---
 
-def add_group_message(chat_id: int, chat_title: str, user_name: str, text: str) -> None:
+def add_group_message(
+    chat_id: int, chat_title: str, user_name: str, text: str, telegram_username: str | None = None
+) -> None:
     _conn.execute(
-        "INSERT INTO group_messages (chat_id, chat_title, user_name, text, ts, flushed) VALUES (?, ?, ?, ?, ?, 0)",
-        (chat_id, chat_title, user_name, text, time.time()),
+        "INSERT INTO group_messages (chat_id, chat_title, user_name, text, ts, flushed, telegram_username) "
+        "VALUES (?, ?, ?, ?, ?, 0, ?)",
+        (chat_id, chat_title, user_name, text, time.time(), telegram_username),
     )
     _conn.commit()
 
 
 def get_unflushed(chat_id: int) -> list[dict]:
     rows = _conn.execute(
-        "SELECT user_name, text, ts FROM group_messages WHERE chat_id = ? AND flushed = 0 ORDER BY ts ASC",
+        "SELECT user_name, text, ts, telegram_username FROM group_messages "
+        "WHERE chat_id = ? AND flushed = 0 ORDER BY ts ASC",
         (chat_id,),
     ).fetchall()
-    return [{"user_name": r[0], "text": r[1], "ts": r[2]} for r in rows]
+    return [{"user_name": r[0], "text": r[1], "ts": r[2], "telegram_username": r[3]} for r in rows]
 
 
 def get_last_group_message(chat_id: int, max_age_seconds: float = 600) -> dict | None:
@@ -436,10 +463,20 @@ def save_chat_memory(chat_id: int, chat_title: str, summary: str, last_message_i
     _conn.commit()
 
 
-def log_pushed_task(chat_id: int, chat_title: str, clickup_task_id: str, title: str, project: str | None = None) -> None:
+def log_pushed_task(
+    chat_id: int,
+    chat_title: str,
+    clickup_task_id: str,
+    title: str,
+    project: str | None = None,
+    reporter_name: str | None = None,
+    reporter_username: str | None = None,
+) -> None:
     _conn.execute(
-        "INSERT INTO pushed_tasks (chat_id, chat_title, clickup_task_id, title, project, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (chat_id, chat_title, clickup_task_id, title, project, time.time()),
+        "INSERT INTO pushed_tasks "
+        "(chat_id, chat_title, clickup_task_id, title, project, created_at, reporter_name, reporter_username) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (chat_id, chat_title, clickup_task_id, title, project, time.time(), reporter_name, reporter_username),
     )
     _conn.commit()
 
@@ -453,6 +490,33 @@ def get_pushed_tasks_by_project(project: str) -> list[dict]:
         (project,),
     ).fetchall()
     return [{"title": r[0], "chat_title": r[1], "created_at": r[2]} for r in rows]
+
+
+def get_task_reporters(clickup_task_ids: list[str]) -> dict[str, dict]:
+    """По прямой просьбе владелицы, часть 33 ("от кого задача"): массовый (не по одной
+    задаче — их в отчёте может быть и 80, как у Лили) поиск reporter_name/reporter_username
+    по clickup_task_id среди когда-либо созданных ботом задач (см. log_pushed_task). Задачи,
+    заведённые НЕ через бота (вручную прямо в ClickUp), в pushed_tasks не попадают — для
+    них просто вернётся пусто, вызывающий код (см. bot.py::_format_task_lines/
+    _format_employee_task_lines) аккуратно опускает "от кого", если неизвестно. Если один
+    и тот же clickup_task_id почему-то залогирован дважды — берём самую свежую запись
+    (маловероятно, но на всякий случай, ORDER BY id DESC + INSERT OR IGNORE логики ниже)."""
+    if not clickup_task_ids:
+        return {}
+    placeholders = ",".join("?" for _ in clickup_task_ids)
+    rows = _conn.execute(
+        f"""
+        SELECT clickup_task_id, reporter_name, reporter_username FROM pushed_tasks
+        WHERE clickup_task_id IN ({placeholders})
+        ORDER BY id ASC
+        """,
+        clickup_task_ids,
+    ).fetchall()
+    result: dict[str, dict] = {}
+    for task_id, reporter_name, reporter_username in rows:
+        if reporter_name or reporter_username:
+            result[task_id] = {"reporter_name": reporter_name, "reporter_username": reporter_username}
+    return result
 
 
 # --- Привязка чата к проекту ClickUp (atlas / altyn / bestswift) ---
@@ -697,6 +761,7 @@ def update_escalation_question(escalation_id: int, question: str) -> None:
 _CLASSIFICATION_COLUMNS = (
     "id", "chat_id", "chat_title", "task_title", "task_description", "task_priority",
     "question_message_id", "created_at", "resolved", "resolved_project", "task_assignee_name",
+    "task_reporter_name", "task_reporter_username",
 )
 
 
@@ -707,14 +772,20 @@ def add_pending_classification(
     task_description: str,
     task_priority: str | None,
     task_assignee_name: str | None = None,
+    task_reporter_name: str | None = None,
+    task_reporter_username: str | None = None,
 ) -> int:
     cur = _conn.execute(
         """
         INSERT INTO pending_classifications
-        (chat_id, chat_title, task_title, task_description, task_priority, created_at, resolved, task_assignee_name)
-        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+        (chat_id, chat_title, task_title, task_description, task_priority, created_at, resolved,
+        task_assignee_name, task_reporter_name, task_reporter_username)
+        VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
         """,
-        (chat_id, chat_title, task_title, task_description, task_priority, time.time(), task_assignee_name),
+        (
+            chat_id, chat_title, task_title, task_description, task_priority, time.time(),
+            task_assignee_name, task_reporter_name, task_reporter_username,
+        ),
     )
     _conn.commit()
     return cur.lastrowid
