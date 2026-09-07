@@ -1644,15 +1644,44 @@ def _format_due_suffix(due_date: float | None) -> str:
     return f" (до {dt.strftime('%d.%m.%Y')})"
 
 
+def _format_attribution_suffix(task: dict, reporters: dict[str, dict]) -> str:
+    """По прямой просьбе владелицы, часть 33 ("от кого задача и к кому обращается —
+    ник в тг и на кого задача"): строит суффикс вида " [от @ivan_tg → Дима]" для строки
+    отчёта. "→ Дима" — реальные ответственные ClickUp прямо из задачи (см.
+    clickup_client._extract_assignee_names, поле "assignees" — живые, актуальные на
+    момент запроса, а не то, что было на момент постановки). "от ..." — кто в переписке
+    поднял задачу (см. storage.get_task_reporters — известно только для задач, которые
+    завёл сам бот; для задач, заведённых вручную прямо в ClickUp, неизвестно и просто
+    опускается, как и остальные "если известно" в этом боте). Если неизвестно ни то,
+    ни другое — возвращает пустую строку, ничего лишнего в строке не появляется."""
+    reporter = reporters.get(task.get("id")) or {}
+    reporter_name = (reporter.get("reporter_name") or "").strip()
+    reporter_username = (reporter.get("reporter_username") or "").strip()
+    assignees = task.get("assignees") or []
+    parts = []
+    if reporter_name and reporter_username:
+        parts.append(f"от {reporter_name} (@{reporter_username})")
+    elif reporter_username:
+        parts.append(f"от @{reporter_username}")
+    elif reporter_name:
+        parts.append(f"от {reporter_name}")
+    if assignees:
+        parts.append(f"→ {', '.join(assignees)}")
+    return f" [{' · '.join(parts)}]" if parts else ""
+
+
 def _format_task_lines(tasks: list[dict]) -> list[str]:
     """Форматирует список задач ClickUp (см. clickup_client.get_open_tasks) в пронумерованные
-    строки отчёта, отмечая срочные/высокоприоритетные задачи значком 🔴 и, если у задачи
-    задан срок в ClickUp, дописывая его в конце строки."""
+    строки отчёта, отмечая срочные/высокоприоритетные задачи значком 🔴, дописывая срок (если
+    задан в ClickUp) и, если известно, "от кого/на кого" (см. _format_attribution_suffix,
+    часть 33) в конце строки."""
+    reporters = storage.get_task_reporters([t["id"] for t in tasks if t.get("id")])
     lines = []
     for i, t in enumerate(tasks, start=1):
         marker = "🔴 " if _is_urgent(t) else ""
         due_suffix = _format_due_suffix(t.get("due_date"))
-        lines.append(f"{i}. {marker}{t['name']}{due_suffix}")
+        attribution_suffix = _format_attribution_suffix(t, reporters)
+        lines.append(f"{i}. {marker}{t['name']}{due_suffix}{attribution_suffix}")
     return lines
 
 
@@ -1757,6 +1786,26 @@ async def handle_cancelall_command(update: Update, context: ContextTypes.DEFAULT
         )
     else:
         await update.message.reply_text("Висящих вопросов и не было — всё чисто.")
+
+
+async def handle_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stop — только в личке, только владелице (по прямой просьбе владелицы, часть 33):
+    "если я вдруг ошибочно нажала команду 'Править' и начались выгружаться по одной
+    задачи в телегу" — прерывает рассылку режима правки (см. _send_edit_mode_report/
+    _request_stop_edit_mode) перед следующим же сообщением. Ничего не ломает, если
+    рассылка на самом деле не идёт — просто выставляет флаг, который никто не проверит,
+    пока не запустится следующая; отвечает одинаково в обоих случаях, чтобы не пытаться
+    гадать, идёт рассылка прямо сейчас или уже нет (гонка между проверкой и ответом всё
+    равно возможна)."""
+    chat = update.effective_chat
+    if chat.type != "private":
+        await update.message.reply_text("Эта команда работает только в личке.")
+        return
+    if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+        await update.message.reply_text("Эта команда только для владелицы.")
+        return
+    _request_stop_edit_mode()
+    await update.message.reply_text("🛑 Хорошо, останавливаю рассылку задач (если она сейчас идёт).")
 
 
 async def _send_tasksall_report(context: ContextTypes.DEFAULT_TYPE) -> str:
