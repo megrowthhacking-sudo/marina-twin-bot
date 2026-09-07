@@ -26,6 +26,22 @@ def _headers() -> dict:
     }
 
 
+def _extract_assignee_names(task_json: dict) -> list[str]:
+    """Имена ответственных прямо из ClickUp-объекта задачи (поле "assignees", отдаёт сам
+    ClickUp API — не путать с локальным assignee_name из task_extractor.py, который лишь
+    свободный текст на момент СОЗДАНИЯ задачи). Используется, чтобы в отчётах (см. bot.py,
+    часть 33, "на кого задача") показывать живое, актуальное назначение — в том числе для
+    задач, назначенных/переназначенных вручную прямо в ClickUp, а не только ботом. Берём
+    "username" (реальное отображаемое имя ClickUp-аккаунта); если вдруг его нет — email как
+    запасной вариант; если и его нет — пропускаем эту запись, а не подставляем None/пусто."""
+    names = []
+    for a in task_json.get("assignees") or []:
+        name = a.get("username") or a.get("email")
+        if name:
+            names.append(name)
+    return names
+
+
 def create_task(
     list_id: str,
     name: str,
@@ -140,6 +156,7 @@ def get_open_tasks(
                     "due_date": due_date,
                     "url": t.get("url"),
                     "tags": [tg.get("name") for tg in t.get("tags") or [] if tg.get("name")],
+                    "assignees": _extract_assignee_names(t),
                 }
             )
         if data.get("last_page", True) or not batch:
@@ -239,6 +256,7 @@ def get_open_tasks_team_wide(assignee_id: int | None = None) -> list[dict]:
                     "list_name": list_field.get("name"),
                     "folder_name": folder_name,
                     "space_id": space_field.get("id"),
+                    "assignees": _extract_assignee_names(t),
                 }
             )
         if len(batch) < 100:
