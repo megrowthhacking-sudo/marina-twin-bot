@@ -132,7 +132,6 @@ def _update_active_countries(active: list[str], mentioned: set[str], russia_only
 
 # --- Закрепление группового чата за проектом по фразе в сообщении ---
 # ("эта группа про задачи Altyn", "это группа для задач Atlas", "это группа Bestswift/BS")
-
 def _detect_project_binding(text: str) -> str | None:
     """Ищет в сообщении совместное упоминание слова "групп-" и ключевого слова одного
     из проектов (см. config.CLICKUP_PROJECTS[...]["keywords"]) — этого достаточно для
@@ -141,20 +140,6 @@ def _detect_project_binding(text: str) -> str | None:
     if "групп" not in lowered:
         return None
     for key, project in config.CLICKUP_PROJECTS.items():
-        for kw in project["keywords"]:
-            if re.search(r"\b" + re.escape(kw) + r"\b", lowered):
-                return key
-    return None
-
-
-def _detect_project_keyword(text: str) -> str | None:
-    """Как _detect_project_binding, но без требования слова "групп-" — для коротких
-    прямых ответов на уточняющий вопрос вида "Atlas" или "это Altyn" (см.
-    _resolve_classification_reply)."""
-    lowered = text.lower()
-    for key, project in config.CLICKUP_PROJECTS.items():
-        if key == "unsorted":
-            continue
         for kw in project["keywords"]:
             if re.search(r"\b" + re.escape(kw) + r"\b", lowered):
                 return key
@@ -754,16 +739,6 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await _handle_group_message_edited(chat, msg, text)
         return
 
-    # Ответ на уточняющий вопрос "Atlas, Altyn или BestSwift?" (см.
-    # _ask_classification_question) — проверяем в первую очередь, это отдельный поток
-    # от привязки чата и обращения к "Марине" ниже.
-    reply_to = msg.reply_to_message
-    if reply_to:
-        classification = storage.get_classification_by_question_message_id(chat.id, reply_to.message_id)
-        if classification:
-            await _resolve_classification_reply(update, context, classification, text)
-            return
-
     bound_project = _detect_project_binding(text)
     if bound_project:
         previous_project = storage.get_chat_project(chat.id)
@@ -839,7 +814,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
     user_name = (user.first_name or user.username or "кто-то") if user else "кто-то"
-    storage.add_group_message(chat.id, chat.title or str(chat.id), user_name, text)
+    storage.add_group_message(
+        chat.id, chat.title or str(chat.id), user_name, text,
+        telegram_username=(user.username if user else None),
+    )
     # Раньше новое сообщение просто копилось в буфере до ближайшей периодической
     # выгрузки (см. periodic_flush_job, CLICKUP_FLUSH_INTERVAL_MINUTES) — из-за этого
     # /urgent и живые отчёты могли не видеть только что написанные задачи. Теперь
