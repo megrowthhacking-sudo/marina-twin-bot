@@ -289,6 +289,61 @@ CLICKUP_WEEKLY_STATUS_COMMANDS = {
     "maintasks": {"label": "Задачи 2026", "status": "задачи 2026"},
 }
 
+# Реестры банков Алтына (Google Sheets) по прямой просьбе владелицы, часть 32 (см.
+# altyn_registry.py) — 2 таблицы, обе расшарены "по ссылке — все могут читать", читаются
+# публичным CSV-экспортом конкретного листа (Google gviz), без сервисного аккаунта.
+# "columns" — индексы (с нуля) колонок листа: bank/manager/status обязательны, "extra"
+# опционален (доп. примечание, если в листе есть отдельная колонка под него).
+ALTYN_REGISTRY_SHEETS = {
+    "rs_broker": {
+        "file_id": "10xe6RsRUL3rArogufKrJtzBB5-I7YEcxUWQUE_QZd1U",
+        "sheets": [
+            {
+                "name": "Открытие РС Алтын Брокер",
+                "label": "Алтын Брокер — открытие Р/С",
+                "columns": {"bank": 1, "manager": 2, "status": 3},
+            },
+            {
+                "name": "Подключение банков РФ Кошелек А",
+                "label": "Кошелек Алтын — подключение банков",
+                "columns": {"bank": 1, "manager": 4, "status": 2, "extra": 3},
+            },
+        ],
+    },
+    "banki_rf": {
+        "file_id": "1_zvu3BsA7ElW0tFiy396cqaqyYro-MV1",
+        "sheets": [
+            {
+                "name": "Банки-участники СБП и PSP",
+                "label": "Банки РФ — СБП и PSP",
+                "columns": {"bank": 1, "manager": 3, "status": 2},
+            },
+            {
+                "name": "Агенты",
+                "label": "Банки РФ — через агентов",
+                "columns": {"bank": 1, "manager": 4, "status": 3, "extra": 2},
+            },
+            {
+                "name": "Подключенына подключении",
+                "label": "Банки РФ — на подключении",
+                "columns": {"bank": 1, "manager": 4, "status": 2, "extra": 3},
+            },
+        ],
+    },
+}
+
+# Команды по менеджерам Алтына (по прямой просьбе владелицы, часть 32, см.
+# altyn_registry.py) — "match" — список префиксов (в нижнем регистре) для сопоставления
+# с колонкой "Менеджер" в реестрах (там встречаются вариации вида "Илья"/"Илья А").
+ALTYN_MANAGER_COMMANDS = {
+    "altynilya": {"label": "Илья (Агафонов)", "match": ["илья"]},
+    "altynliliana": {"label": "Лилиана", "match": ["лилиана"]},
+    "altynlena": {"label": "Лена", "match": ["лена"]},
+    "altynslava": {"label": "Слава", "match": ["слава"]},
+    "altynsveta": {"label": "Света", "match": ["света"]},
+    "altynsergey": {"label": "Сергей", "match": ["сергей"]},
+}
+
 # Часовой пояс утреннего дайджеста (IANA-имя, например "Europe/Moscow" или
 # "Asia/Almaty") и время, во сколько его слать владелице — по каждому проекту
 # отдельным сообщением полный список открытых задач из ClickUp, срочные помечены 🔴
