@@ -2792,7 +2792,8 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
     sections.append(
         "🗓 Календарь и прочее:\n"
         "/calendar — события календаря по периодам (сегодня/завтра/неделя/месяц)\n"
-        "/cancelall — снять все висящие вопросы из групповых чатов, на которые ещё не ответила"
+        "/cancelall — снять все висящие вопросы из групповых чатов, на которые ещё не ответила\n"
+        "/stop — остановить рассылку задач в режиме правки, если нажала по ошибке"
     )
 
     text = "\n\n".join(sections)
@@ -2810,6 +2811,10 @@ def build_application() -> Application:
     # /cancelall — только в личке, только владелице: снимает разом все висящие вопросы
     # из групп, на которые она ещё не ответила через бота (см. handle_cancelall_command).
     app.add_handler(CommandHandler("cancelall", handle_cancelall_command))
+    # /stop — только в личке, только владелице (по прямой просьбе владелицы, часть 33):
+    # прерывает рассылку режима правки, если её нажали по ошибке (см.
+    # handle_stop_command/_send_edit_mode_report).
+    app.add_handler(CommandHandler("stop", handle_stop_command))
     # /tasksall — только в личке, только владелице: живой отчёт по открытым задачам
     # сразу всех четырёх проектов одним сообщением (см. handle_tasksall_command).
     app.add_handler(CommandHandler("tasksall", handle_tasksall_command))
