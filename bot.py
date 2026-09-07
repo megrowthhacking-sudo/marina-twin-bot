@@ -27,6 +27,7 @@ from telegram.ext import (
     filters,
 )
 
+import altyn_registry
 import calendar_client
 import chat_memory
 import claude_client
@@ -2621,6 +2622,41 @@ def _make_employee_weekly_command_handler(employee_key: str):
     return handler
 
 
+def _make_altyn_registry_command_handler(manager_key: str):
+    """Команды /altynilya /altynliliana /altynlena /altynslava /altynsveta /altynsergey
+    (по прямой просьбе владелицы, часть 32, см. config.ALTYN_MANAGER_COMMANDS) — статусы
+    по банкам этого менеджера из реестров Алтына в Google Sheets (см. altyn_registry.py).
+    НЕ путать с уже существующими /altyn /atlas (config.CLICKUP_WEEKLY_STATUS_COMMANDS) —
+    те про статус задач в ClickUp-списке WEEKLY TASKS, это про банковские реестры, разные
+    источники данных, разные команды, совпадений в именах нет. Только в личке, только для
+    владелицы, как и остальные отчётные команды."""
+    label = config.ALTYN_MANAGER_COMMANDS[manager_key]["label"]
+
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        if chat.type != "private":
+            await update.message.reply_text("Эта команда работает только в личке.")
+            return
+        if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+            await update.message.reply_text("Эта команда только для владелицы.")
+            return
+        await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+        try:
+            rows = altyn_registry.fetch_manager_report(manager_key)
+        except Exception:
+            logger.exception("Не удалось получить реестр Алтына для менеджера %s", label)
+            await update.message.reply_text(
+                f"Не смогла прочитать реестры Алтына для «{label}» — проблема с доступом "
+                f"к гугл-таблице или сетью, попробуй ещё раз чуть позже."
+            )
+            return
+        text = altyn_registry.format_manager_report(label, rows)
+        for chunk in _split_for_telegram(text):
+            await update.message.reply_text(chunk)
+
+    return handler
+
+
 def _make_weekly_status_command_handler(command_key: str):
     """Команды /unsorted /atlas /altyn /approval /docsdev /monday ... /sunday (по прямой
     просьбе владелицы, часть 27, см. config.CLICKUP_WEEKLY_STATUS_COMMANDS) — каждая для
@@ -2793,6 +2829,15 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
         + "\n".join(weekly_status_lines)
     )
 
+    altyn_registry_lines = [
+        f"/{key} — банки Алтына (Брокер + Кошелек Алтын + Банки РФ) по менеджеру «{c['label']}»"
+        for key, c in config.ALTYN_MANAGER_COMMANDS.items()
+    ]
+    sections.append(
+        "🏦 Реестры банков Алтына по менеджеру (живьём из Google Sheets, не путать с "
+        "/altyn выше — тот про статус задач ClickUp):\n" + "\n".join(altyn_registry_lines)
+    )
+
     sections.append(
         "🗓 Календарь и прочее:\n"
         "/calendar — события календаря по периодам (сегодня/завтра/неделя/месяц)\n"
@@ -2855,6 +2900,11 @@ def build_application() -> Application:
     # всем ответственным сразу.
     for command_key in config.CLICKUP_WEEKLY_STATUS_COMMANDS:
         app.add_handler(CommandHandler(command_key, _make_weekly_status_command_handler(command_key)))
+    # /altynilya /altynliliana /altynlena /altynslava /altynsveta /altynsergey — по прямой
+    # просьбе владелицы, часть 32 (см. config.ALTYN_MANAGER_COMMANDS/altyn_registry.py):
+    # статусы по банкам Алтына по каждому менеджеру, живьём из Google Sheets.
+    for manager_key in config.ALTYN_MANAGER_COMMANDS:
+        app.add_handler(CommandHandler(manager_key, _make_altyn_registry_command_handler(manager_key)))
     # /commands — только в личке, только владелице: краткая справка по всем командам бота
     # (см. handle_commands_command).
     app.add_handler(CommandHandler("commands", handle_commands_command))
