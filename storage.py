@@ -340,20 +340,24 @@ def reset_chat(chat_id: int) -> None:
 
 # --- Буфер групповых сообщений (сбор задач для ClickUp) ---
 
-def add_group_message(chat_id: int, chat_title: str, user_name: str, text: str) -> None:
+def add_group_message(
+    chat_id: int, chat_title: str, user_name: str, text: str, telegram_username: str | None = None
+) -> None:
     _conn.execute(
-        "INSERT INTO group_messages (chat_id, chat_title, user_name, text, ts, flushed) VALUES (?, ?, ?, ?, ?, 0)",
-        (chat_id, chat_title, user_name, text, time.time()),
+        "INSERT INTO group_messages (chat_id, chat_title, user_name, text, ts, flushed, telegram_username) "
+        "VALUES (?, ?, ?, ?, ?, 0, ?)",
+        (chat_id, chat_title, user_name, text, time.time(), telegram_username),
     )
     _conn.commit()
 
 
 def get_unflushed(chat_id: int) -> list[dict]:
     rows = _conn.execute(
-        "SELECT user_name, text, ts FROM group_messages WHERE chat_id = ? AND flushed = 0 ORDER BY ts ASC",
+        "SELECT user_name, text, ts, telegram_username FROM group_messages "
+        "WHERE chat_id = ? AND flushed = 0 ORDER BY ts ASC",
         (chat_id,),
     ).fetchall()
-    return [{"user_name": r[0], "text": r[1], "ts": r[2]} for r in rows]
+    return [{"user_name": r[0], "text": r[1], "ts": r[2], "telegram_username": r[3]} for r in rows]
 
 
 def get_last_group_message(chat_id: int, max_age_seconds: float = 600) -> dict | None:
@@ -459,10 +463,20 @@ def save_chat_memory(chat_id: int, chat_title: str, summary: str, last_message_i
     _conn.commit()
 
 
-def log_pushed_task(chat_id: int, chat_title: str, clickup_task_id: str, title: str, project: str | None = None) -> None:
+def log_pushed_task(
+    chat_id: int,
+    chat_title: str,
+    clickup_task_id: str,
+    title: str,
+    project: str | None = None,
+    reporter_name: str | None = None,
+    reporter_username: str | None = None,
+) -> None:
     _conn.execute(
-        "INSERT INTO pushed_tasks (chat_id, chat_title, clickup_task_id, title, project, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (chat_id, chat_title, clickup_task_id, title, project, time.time()),
+        "INSERT INTO pushed_tasks "
+        "(chat_id, chat_title, clickup_task_id, title, project, created_at, reporter_name, reporter_username) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (chat_id, chat_title, clickup_task_id, title, project, time.time(), reporter_name, reporter_username),
     )
     _conn.commit()
 
@@ -476,6 +490,33 @@ def get_pushed_tasks_by_project(project: str) -> list[dict]:
         (project,),
     ).fetchall()
     return [{"title": r[0], "chat_title": r[1], "created_at": r[2]} for r in rows]
+
+
+def get_task_reporters(clickup_task_ids: list[str]) -> dict[str, dict]:
+    """По прямой просьбе владелицы, часть 33 ("от кого задача"): массовый (не по одной
+    задаче — их в отчёте может быть и 80, как у Лили) поиск reporter_name/reporter_username
+    по clickup_task_id среди когда-либо созданных ботом задач (см. log_pushed_task). Задачи,
+    заведённые НЕ через бота (вручную прямо в ClickUp), в pushed_tasks не попадают — для
+    них просто вернётся пусто, вызывающий код (см. bot.py::_format_task_lines/
+    _format_employee_task_lines) аккуратно опускает "от кого", если неизвестно. Если один
+    и тот же clickup_task_id почему-то залогирован дважды — берём самую свежую запись
+    (маловероятно, но на всякий случай, ORDER BY id DESC + INSERT OR IGNORE логики ниже)."""
+    if not clickup_task_ids:
+        return {}
+    placeholders = ",".join("?" for _ in clickup_task_ids)
+    rows = _conn.execute(
+        f"""
+        SELECT clickup_task_id, reporter_name, reporter_username FROM pushed_tasks
+        WHERE clickup_task_id IN ({placeholders})
+        ORDER BY id ASC
+        """,
+        clickup_task_ids,
+    ).fetchall()
+    result: dict[str, dict] = {}
+    for task_id, reporter_name, reporter_username in rows:
+        if reporter_name or reporter_username:
+            result[task_id] = {"reporter_name": reporter_name, "reporter_username": reporter_username}
+    return result
 
 
 # --- Привязка чата к проекту ClickUp (atlas / altyn / bestswift) ---
