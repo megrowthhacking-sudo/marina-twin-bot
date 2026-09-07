@@ -882,6 +882,17 @@ def _resolve_task_status(list_id: str, status_name_raw: str) -> tuple[str | None
     return None, statuses
 
 
+def _reporter_lookup_from_rows(rows: list[dict]) -> dict[str, str | None]:
+    """По прямой просьбе владелицы, часть 33 ("от кого задача"): строит словарь
+    user_name → telegram_username из накопленных сообщений чата (см. storage.get_unflushed/
+    task_extractor.extract_tasks — тот же rows), чтобы потом сопоставить "reporter_name",
+    которое вернул экстрактор (см. task_extractor.py — берёт имя ТОЧНО как в переписке,
+    "Имя: текст"), с настоящим Telegram-ником этого человека. Если один user_name
+    встречается несколько раз в буфере — берём username из последнего вхождения (не
+    принципиально, обычно один и тот же человек пишет с одним и тем же username)."""
+    return {r["user_name"]: r.get("telegram_username") for r in rows if r.get("user_name")}
+
+
 def _create_and_log_task(
     chat_id: int,
     chat_title: str,
@@ -890,11 +901,17 @@ def _create_and_log_task(
     description: str,
     priority,
     assignee_id: int | None = None,
+    reporter_name: str | None = None,
+    reporter_username: str | None = None,
 ) -> str | None:
     """Создаёт одну задачу в ClickUp-списке project_key и логирует её в pushed_tasks
     (нужно и для отладки, и для отчёта по /tasksX — см. _send_project_report).
     assignee_id — ClickUp user_id ответственного, если удалось сопоставить (см.
-    _resolve_assignee_id), иначе None. Возвращает id созданной задачи в ClickUp, либо
+    _resolve_assignee_id), иначе None. reporter_name/reporter_username — по прямой
+    просьбе владелицы, часть 33: кто в переписке поднял эту задачу (см.
+    _reporter_lookup_from_rows) — просто сохраняются в pushed_tasks, чтобы потом
+    показать "от кого" в отчётах (см. _format_task_lines/_format_employee_task_lines),
+    не влияют на саму задачу в ClickUp. Возвращает id созданной задачи в ClickUp, либо
     None при неудаче (список не настроен или ClickUp отказал)."""
     list_id = config.CLICKUP_LIST_IDS.get(project_key)
     if not list_id:
@@ -908,16 +925,28 @@ def _create_and_log_task(
             assignees=[assignee_id] if assignee_id else None,
         )
         task_id = str(result.get("id", ""))
-        storage.log_pushed_task(chat_id, chat_title, task_id, title, project_key)
+        storage.log_pushed_task(
+            chat_id, chat_title, task_id, title, project_key,
+            reporter_name=reporter_name, reporter_username=reporter_username,
+        )
         return task_id
     except Exception:
         logger.exception("Не удалось создать задачу в ClickUp: %s", title)
         return None
 
 
-def _push_tasks(chat_id: int, chat_title: str, tasks: list[dict], project_for: callable) -> int:
+def _push_tasks(
+    chat_id: int,
+    chat_title: str,
+    tasks: list[dict],
+    project_for: callable,
+    reporter_lookup: dict[str, str | None] | None = None,
+) -> int:
     """Общая часть: создаёт в ClickUp каждую задачу из tasks под проектом project_for(t).
-    Возвращает число реально созданных задач."""
+    reporter_lookup (см. _reporter_lookup_from_rows) — сопоставляет "reporter_name" из
+    экстрактора с реальным Telegram @username, для "от кого задача" (часть 33); можно не
+    передавать, если сопоставлять не с чем (тогда сохранится только reporter_name, без
+    username). Возвращает число реально созданных задач."""
     created = 0
     for t in tasks:
         title = (t.get("title") or "").strip()
@@ -927,8 +956,11 @@ def _push_tasks(chat_id: int, chat_title: str, tasks: list[dict], project_for: c
         if not project_key:
             continue
         assignee_id = _resolve_assignee_id(t.get("assignee_name"))
+        reporter_name = (t.get("reporter_name") or "").strip() or None
+        reporter_username = reporter_lookup.get(reporter_name) if reporter_lookup and reporter_name else None
         if _create_and_log_task(
-            chat_id, chat_title, project_key, title, t.get("description", ""), t.get("priority"), assignee_id
+            chat_id, chat_title, project_key, title, t.get("description", ""), t.get("priority"), assignee_id,
+            reporter_name=reporter_name, reporter_username=reporter_username,
         ):
             created += 1
     return created
