@@ -1706,7 +1706,11 @@ async def _send_project_report(context: ContextTypes.DEFAULT_TYPE, project_key: 
     тянет их живьём из ClickUp (не из локального журнала когда-либо созданных ботом
     задач), так отчёт отражает актуальное состояние, включая то, что закрыли или
     поменяли напрямую в ClickUp. Срочные задачи (priority urgent/high) помечены 🔴.
-    Вызывается и после команды /tasksX, и утренним дайджестом (см. daily_digest_job)."""
+    Вызывается и после команды /tasksX, и утренним дайджестом (см. daily_digest_job).
+    Отправка идёт через _send_owner_message_with_retry с одной попыткой повтора при
+    HTTP 429 (RetryAfter) от Telegram — до этого прямой вызов send_message без ретрая
+    приводил к тому, что сообщение просто терялось (см. QA-разбор от 2026-09-08, когда
+    из-за этого не доставился весь утренний дайджест целиком, все 4 раздела)."""
     if config.OWNER_USER_ID is None:
         return
     label = config.CLICKUP_PROJECTS[project_key]["label"]
@@ -1719,7 +1723,7 @@ async def _send_project_report(context: ContextTypes.DEFAULT_TYPE, project_key: 
         text = "\n".join([f"📋 «{label}» — открытые задачи ({len(tasks)}):"] + _format_task_lines(tasks))
     try:
         for chunk in _split_for_telegram(text):
-            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
+            await _send_owner_message_with_retry(context, chunk)
     except Exception:
         logger.exception("Не удалось отправить отчёт по проекту %s владелице", project_key)
 
