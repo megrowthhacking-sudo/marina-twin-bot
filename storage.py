@@ -489,6 +489,19 @@ def log_pushed_task(
     _conn.commit()
 
 
+def get_recent_task_titles(chat_id: int, since_ts: float) -> list[str]:
+    """QA-ревью 07.09: заголовки всех задач, заведённых ботом в ЭТОМ чате после
+    since_ts — используется bot.py (см. _push_tasks/_is_likely_duplicate_title) для
+    тихой защиты от дублей, когда одна и та же встреча/задача упоминается в чате
+    несколько раз подряд с чуть разной формулировкой и иначе завелась бы в ClickUp
+    повторно (в т.ч. в другой список). Окно и порог схожести — на стороне bot.py."""
+    rows = _conn.execute(
+        "SELECT title FROM pushed_tasks WHERE chat_id = ? AND created_at >= ? ORDER BY created_at ASC",
+        (chat_id, since_ts),
+    ).fetchall()
+    return [r[0] for r in rows if r[0]]
+
+
 def get_pushed_tasks_by_project(project: str) -> list[dict]:
     """Все когда-либо созданные ботом задачи по одному проекту (из всех чатов),
     в порядке создания — для отчёта по команде /tasksX (см. _send_project_report в

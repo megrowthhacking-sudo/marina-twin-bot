@@ -8,6 +8,7 @@ Telegram-бот "Marina Twin" — штатный юрист по праву РФ
 """
 
 import asyncio
+import difflib
 import logging
 import re
 import time
@@ -937,6 +938,42 @@ def _create_and_log_task(
         return None
 
 
+_TASK_DEDUP_WINDOW_SECONDS = 6 * 3600
+_TASK_DEDUP_SIMILARITY_THRESHOLD = 0.87
+
+
+def _normalize_task_title(title: str) -> str:
+    """Приводит заголовок задачи к виду, пригодному для сравнения на дубликаты:
+    нижний регистр + без пунктуации/лишних пробелов. Используется и для точного
+    сравнения после нормализации, и как вход для _is_likely_duplicate_title."""
+    normalized = re.sub(r"[^\w\s]", " ", title.lower(), flags=re.UNICODE)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _is_likely_duplicate_title(title: str, recent_titles: list[str]) -> bool:
+    """QA-ревью 07.09: одна и та же встреча/задача попадала в чат несколько раз
+    подряд (с разной формулировкой) и заводилась в ClickUp дважды, в т.ч. в разных
+    списках (см. пример "Встреча с Банк Хлынов..." — дубль за 21 секунду). Здесь
+    зеркалим паттерн overlap-предупреждений из calendar_client.py: тихая защита,
+    ничего не блокируем, просто не создаём то, что почти наверняка уже есть среди
+    recent_titles (задачи этого же чата за последние _TASK_DEDUP_WINDOW_SECONDS).
+    Совпадением считаем точное совпадение после нормализации ИЛИ высокое сходство
+    (SequenceMatcher.ratio >= _TASK_DEDUP_SIMILARITY_THRESHOLD)."""
+    normalized = _normalize_task_title(title)
+    if not normalized:
+        return False
+    for recent in recent_titles:
+        recent_normalized = _normalize_task_title(recent)
+        if not recent_normalized:
+            continue
+        if normalized == recent_normalized:
+            return True
+        ratio = difflib.SequenceMatcher(None, normalized, recent_normalized).ratio()
+        if ratio >= _TASK_DEDUP_SIMILARITY_THRESHOLD:
+            return True
+    return False
+
+
 def _push_tasks(
     chat_id: int,
     chat_title: str,
@@ -948,14 +985,26 @@ def _push_tasks(
     reporter_lookup (см. _reporter_lookup_from_rows) — сопоставляет "reporter_name" из
     экстрактора с реальным Telegram @username, для "от кого задача" (часть 33); можно не
     передавать, если сопоставлять не с чем (тогда сохранится только reporter_name, без
-    username). Возвращает число реально созданных задач."""
+    username). Возвращает число реально созданных задач.
+
+    QA-ревью 07.09: перед созданием каждой задачи сверяем её заголовок с уже
+    созданными в этом же чате за последние 6 часов (см. storage.get_recent_task_titles,
+    _is_likely_duplicate_title) — если похоже на уже существующую, тихо пропускаем
+    (только логируем), не блокируя остальные задачи в пачке. Это тот же silent-
+    protection паттерн, что и overlap-предупреждения календаря (см. calendar_client.py)."""
     created = 0
+    recent_titles = storage.get_recent_task_titles(chat_id, time.time() - _TASK_DEDUP_WINDOW_SECONDS)
     for t in tasks:
         title = (t.get("title") or "").strip()
         if not title:
             continue
         project_key = project_for(t)
         if not project_key:
+            continue
+        if _is_likely_duplicate_title(title, recent_titles):
+            logger.info(
+                "Пропускаю вероятный дубликат задачи в чате %s: %r", chat_id, title,
+            )
             continue
         assignee_id = _resolve_assignee_id(t.get("assignee_name"))
         reporter_name = (t.get("reporter_name") or "").strip() or None
@@ -965,6 +1014,7 @@ def _push_tasks(
             reporter_name=reporter_name, reporter_username=reporter_username,
         ):
             created += 1
+            recent_titles.append(title)
     return created
 
 
