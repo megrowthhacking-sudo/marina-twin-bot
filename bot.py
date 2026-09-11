@@ -36,6 +36,7 @@ import config
 import escalation
 import kb
 import meeting_extractor
+import schedule_reminders
 import storage
 import task_command
 import task_extractor
@@ -2880,6 +2881,15 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
         "/stop — остановить рассылку задач в режиме правки, если нажала по ошибке"
     )
 
+    if config.SCHEDULE_REMINDERS_ENABLED:
+        trello_note = "" if config.TRELLO_ENABLED else " (личное расписание из Trello пока не подключено)"
+        sections.append(
+            "🔔 Напоминания о расписании (без команды, работает автоматически):\n"
+            f"— утренний план на день в {config.MORNING_PLAN_HOUR:02d}:{config.MORNING_PLAN_MINUTE:02d}\n"
+            f"— точечные напоминания за {', '.join(str(m) for m in config.REMINDER_LEAD_MINUTES)} мин. до "
+            f"встречи/задачи с известным временем — из календаря и рабочего расписания (WEEKLY TASKS)" + trello_note
+        )
+
     text = "\n\n".join(sections)
     for chunk in _split_for_telegram(text):
         await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
@@ -3005,6 +3015,23 @@ def build_application() -> Application:
             "ClickUp-интеграция выключена (нет CLICKUP_API_TOKEN или ни один CLICKUP_LIST_* не задан) — "
             "сбор задач копится, но никуда не уходит."
         )
+
+    if config.SCHEDULE_REMINDERS_ENABLED:
+        reminder_interval = config.REMINDER_CHECK_INTERVAL_MINUTES * 60
+        app.job_queue.run_repeating(
+            schedule_reminders.check_and_send_reminders_job, interval=reminder_interval, first=reminder_interval
+        )
+        app.job_queue.run_daily(
+            schedule_reminders.morning_plan_job,
+            time=digest_time(
+                hour=config.MORNING_PLAN_HOUR,
+                minute=config.MORNING_PLAN_MINUTE,
+                tzinfo=ZoneInfo(config.MARINATWIN_TIMEZONE),
+            ),
+        )
+        logger.info("Напоминания о расписании включены.")
+    else:
+        logger.info("Напоминания о расписании выключены.")
 
     return app
 
