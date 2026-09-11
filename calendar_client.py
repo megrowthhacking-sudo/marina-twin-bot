@@ -11,6 +11,7 @@
 
 import json
 import logging
+from datetime import datetime
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -110,3 +111,33 @@ def list_events(time_min_iso: str, time_max_iso: str) -> list[dict]:
             }
         )
     return events
+
+
+def find_overlapping_events(start_iso: str, end_iso: str) -> list[dict]:
+    """Ищет существующие события календаря, чьё время пересекается с интервалом
+    [start_iso, end_iso) новой встречи — для предупреждения владелицы о конфликте
+    расписания ДО подтверждения (см. bot.py::_build_overlap_warning), не блокирует
+    постановку. Не путать с точным дублем по названию+времени (PR #85) — здесь любые
+    пересечения по времени. all_day события не сравниваются. Молча возвращает [] при
+    ошибке."""
+    try:
+        new_start = datetime.fromisoformat(start_iso)
+        new_end = datetime.fromisoformat(end_iso)
+        candidates = list_events(start_iso, end_iso)
+    except Exception:
+        logger.warning("Не удалось проверить пересечения по времени для новой встречи", exc_info=True)
+        return []
+
+    overlapping = []
+    for ev in candidates:
+        if ev.get("all_day"):
+            continue
+        try:
+            ev_start = datetime.fromisoformat(ev["start"])
+            ev_end = datetime.fromisoformat(ev["end"])
+        except (ValueError, TypeError):
+            continue
+        if ev_start < new_end and new_start < ev_end:
+            overlapping.append(ev)
+
+    return overlapping
