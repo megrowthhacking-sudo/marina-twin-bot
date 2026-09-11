@@ -1,9 +1,8 @@
 name: One-time PR cleanup (11.09.2026)
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/one-time-pr-cleanup.yml'
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
 permissions:
   pull-requests: write
   contents: read
