@@ -1246,15 +1246,41 @@ def _meeting_confirm_keyboard(meeting_id: int):
     )
 
 
-def _render_meeting_preview(title: str, start_iso: str, end_iso: str, location: str, *, editing: bool = False) -> str:
-    """Общий текст превью черновика встречи — используется и при первом предложении
-    (см. _propose_meeting_draft), и после правки по кнопке "✏️ Изменить" (см.
-    _apply_meeting_edit), чтобы формулировка не расходилась между двумя местами."""
+def _render_meeting_preview(
+    title: str,
+    start_iso: str,
+    end_iso: str,
+    location: str,
+    *,
+    editing: bool = False,
+    overlap_warning: str = "",
+) -> str:
+    """Текст превью черновика встречи. overlap_warning (см. _build_overlap_warning) —
+    необязательная строка-предупреждение о пересечении по времени; пустая строка ничего
+    не добавляет."""
     start_human = _format_meeting_time(start_iso)
     end_human = _format_meeting_time(end_iso)
     location_line = f"\n📍 {location}" if location else ""
+    warning_line = f"\n\n{overlap_warning}" if overlap_warning else ""
     heading = "📅 Обновила черновик встречи:" if editing else "📅 Похоже, ты хочешь поставить встречу:"
-    return f"{heading}\n\n«{title}»\n{start_human} – {end_human}{location_line}\n\nПрименить?"
+    return f"{heading}\n\n«{title}»\n{start_human} – {end_human}{location_line}{warning_line}\n\nПрименить?"
+
+
+def _build_overlap_warning(start_iso: str, end_iso: str) -> str:
+    """Проверяет через calendar_client.find_overlapping_events пересечение по времени —
+    только предупреждает в превью, не блокирует постановку (решение за владелицей).
+    Любая ошибка молча даёт пустое предупреждение."""
+    if not config.GOOGLE_CALENDAR_ENABLED:
+        return ""
+    try:
+        overlaps = calendar_client.find_overlapping_events(start_iso, end_iso)
+    except Exception:
+        logger.exception("Не удалось проверить пересечения по времени для новой встречи")
+        return ""
+    if not overlaps:
+        return ""
+    lines = [f"«{ev['title']}» ({_format_meeting_time(ev['start'])})" for ev in overlaps[:3]]
+    return "⚠️ Пересекается по времени с: " + "; ".join(lines)
 
 
 async def _propose_meeting_draft(context: ContextTypes.DEFAULT_TYPE, user, text: str) -> None:
@@ -1280,7 +1306,10 @@ async def _propose_meeting_draft(context: ContextTypes.DEFAULT_TYPE, user, text:
     meeting_id = storage.add_pending_meeting(
         user.id, text, meeting["title"], meeting["start"], meeting["end"], meeting["location"]
     )
-    preview = _render_meeting_preview(meeting["title"], meeting["start"], meeting["end"], meeting["location"])
+    overlap_warning = _build_overlap_warning(meeting["start"], meeting["end"])
+    preview = _render_meeting_preview(
+        meeting["title"], meeting["start"], meeting["end"], meeting["location"], overlap_warning=overlap_warning
+    )
     await context.bot.send_message(
         chat_id=user.id, text=preview, reply_markup=_meeting_confirm_keyboard(meeting_id)
     )
@@ -1311,7 +1340,10 @@ async def _apply_meeting_edit(context: ContextTypes.DEFAULT_TYPE, user, meeting:
         )
         return
     storage.update_meeting_details(meeting_id, parsed["title"], parsed["start"], parsed["end"], parsed["location"])
-    preview = _render_meeting_preview(parsed["title"], parsed["start"], parsed["end"], parsed["location"], editing=True)
+    overlap_warning = _build_overlap_warning(parsed["start"], parsed["end"])
+    preview = _render_meeting_preview(
+        parsed["title"], parsed["start"], parsed["end"], parsed["location"], editing=True, overlap_warning=overlap_warning
+    )
     await context.bot.send_message(
         chat_id=user.id, text=preview, reply_markup=_meeting_confirm_keyboard(meeting_id)
     )
