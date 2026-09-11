@@ -283,6 +283,14 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sent_reminders (
+            reminder_key TEXT PRIMARY KEY,
+            sent_at REAL NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -1032,3 +1040,22 @@ def get_all_employee_telegram_ids() -> dict[str, int]:
     config.EMPLOYEE_COMMANDS[...]["telegram_user_id"] в bot.py::_available_forward_recipients."""
     rows = _conn.execute("SELECT employee_key, telegram_user_id FROM employee_telegram_ids").fetchall()
     return {row[0]: row[1] for row in rows}
+
+
+def has_sent_reminder(reminder_key: str) -> bool:
+    row = _conn.execute("SELECT 1 FROM sent_reminders WHERE reminder_key = ?", (reminder_key,)).fetchone()
+    return row is not None
+
+
+def mark_reminder_sent(reminder_key: str) -> None:
+    _conn.execute(
+        "INSERT OR IGNORE INTO sent_reminders (reminder_key, sent_at) VALUES (?, ?)",
+        (reminder_key, time.time()),
+    )
+    _conn.commit()
+
+
+def cleanup_old_sent_reminders(older_than_seconds: float = 2 * 24 * 3600) -> None:
+    cutoff = time.time() - older_than_seconds
+    _conn.execute("DELETE FROM sent_reminders WHERE sent_at < ?", (cutoff,))
+    _conn.commit()
