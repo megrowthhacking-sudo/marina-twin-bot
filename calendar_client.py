@@ -11,6 +11,7 @@
 
 import json
 import logging
+from datetime import datetime, timedelta
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -33,6 +34,39 @@ def _get_service():
     return _service
 
 
+def _find_duplicate_event(title: str, start_iso: str, end_iso: str) -> str | None:
+    """Ищет в личном календаре Марины (config.GOOGLE_CALENDAR_ID) уже существующее
+    событие с тем же названием (без учёта регистра) в окне времени [start_iso - 30мин,
+    end_iso + 30мин] — используется create_event(), чтобы повторное нажатие кнопки
+    подтверждения встречи (см. bot.py::handle_calendar_callback) или ретрай не создавали
+    несколько одинаковых событий. Возвращает id найденного события или None, если
+    дубликат не найден. Любая ошибка поиска (сеть/API) не должна мешать созданию
+    события — в этом случае просто логируем и возвращаем None."""
+    try:
+        service = _get_service()
+        start_dt = datetime.fromisoformat(start_iso)
+        end_dt = datetime.fromisoformat(end_iso)
+        time_min = (start_dt - timedelta(minutes=30)).isoformat()
+        time_max = (end_dt + timedelta(minutes=30)).isoformat()
+        result = (
+            service.events()
+            .list(
+                calendarId=config.GOOGLE_CALENDAR_ID,
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+            )
+            .execute()
+        )
+        for item in result.get("items", []):
+            if item.get("summary", "").strip().lower() == title.strip().lower():
+                return item["id"]
+        return None
+    except Exception as e:
+        logger.warning("Ошибка поиска дублей события '%s': %s", title, e)
+        return None
+
+
 def create_event(
     title: str,
     start_iso: str,
@@ -46,6 +80,10 @@ def create_event(
     есть). Возвращает id созданного события в Google Calendar — пока используется только
     для лога/будущего редактирования, отдельно нигде не хранится за пределами
     storage.pending_meetings.calendar_event_id."""
+    existing_id = _find_duplicate_event(title, start_iso, end_iso)
+    if existing_id is not None:
+        logger.info("Найден дубликат события '%s' (id=%s), новое событие не создаётся", title, existing_id)
+        return existing_id
     service = _get_service()
     body = {
         "summary": title,
