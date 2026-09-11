@@ -411,3 +411,30 @@ MEMORY_UPDATE_INTERVAL_MINUTES = int(os.environ.get("MEMORY_UPDATE_INTERVAL_MINU
 # самом ClickUp через Guests & Permissions списка/папки, это не поле API. Если не задан —
 # зеркалирование просто не происходит (событие в календаре всё равно создаётся).
 CLICKUP_LIST_SCHEDULE = os.environ.get("CLICKUP_LIST_SCHEDULE", "").strip() or None
+
+# --- Напоминания о расписании — часть 42.
+TRELLO_API_KEY = os.environ.get("TRELLO_API_KEY", "").strip() or None
+TRELLO_TOKEN = os.environ.get("TRELLO_TOKEN", "").strip() or None
+TRELLO_BOARD_ID = os.environ.get("TRELLO_BOARD_ID", "").strip() or None
+TRELLO_ENABLED = bool(TRELLO_API_KEY and TRELLO_TOKEN and TRELLO_BOARD_ID)
+
+SCHEDULE_WEEKDAY_NAMES = [
+ "понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье",
+]
+SCHEDULE_WEEKDAY_STATUS_KEYS = [
+ "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+]
+
+_reminder_lead_raw = os.environ.get("REMINDER_LEAD_MINUTES", "30,5").strip()
+REMINDER_LEAD_MINUTES = sorted(
+ {int(x.strip()) for x in _reminder_lead_raw.split(",") if x.strip()}, reverse=True
+) or [30, 5]
+
+REMINDER_CHECK_INTERVAL_MINUTES = int(os.environ.get("REMINDER_CHECK_INTERVAL_MINUTES", "1"))
+
+MORNING_PLAN_HOUR = int(os.environ.get("MORNING_PLAN_HOUR", "8"))
+MORNING_PLAN_MINUTE = int(os.environ.get("MORNING_PLAN_MINUTE", "0"))
+
+SCHEDULE_REMINDERS_ENABLED = bool(
+ OWNER_USER_ID is not None and (GOOGLE_CALENDAR_ENABLED or CLICKUP_WEEKLY_ENABLED or TRELLO_ENABLED)
+)
