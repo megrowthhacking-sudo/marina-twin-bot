@@ -71,6 +71,24 @@ _CLASSIFY_SYSTEM_PROMPT = f"""Ты читаешь переписку рабоч�
 Если задач нет — верни {{"tasks": []}}."""
 
 
+def _extract_json_object(text: str) -> str | None:
+    """Вырезает первый сбалансированный {...} блок из текста — на случай если модель,
+    вопреки системному промпту, добавила пояснение до/после JSON (см. QA-ревью 07.09:
+    экстрактор изредка не даёт чистый JSON, из-за чего задача могла тихо теряться)."""
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+        if depth == 0:
+            return text[start : i + 1]
+    return None
+
+
 def _call_extractor(system_prompt: str, chat_title: str, messages: list[dict]) -> list[dict]:
     """messages — список {"user_name": str, "text": str, "ts": float} в хронологическом порядке."""
     if not messages:
@@ -96,15 +114,27 @@ def _call_extractor(system_prompt: str, chat_title: str, messages: list[dict]) -
             raw = raw[4:]
         raw = raw.strip()
 
+    parsed = None
     try:
         parsed = json.loads(raw)
-        tasks = parsed.get("tasks", [])
-        if not isinstance(tasks, list):
-            raise ValueError("tasks не список")
-        return tasks
-    except (json.JSONDecodeError, ValueError):
+    except json.JSONDecodeError:
+        # Первая попытка не удалась — пробуем вырезать сбалансированный {...} блок
+        # из ответа (модель могла добавить пояснение до/после JSON) и распарсить его
+        # отдельно, прежде чем сдаваться и терять все задачи из сообщения.
+        candidate = _extract_json_object(raw)
+        if candidate is not None:
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                parsed = None
+    if parsed is None:
         logger.warning("Не удалось распарсить JSON от экстрактора задач, сырой ответ: %s", raw[:500])
         return []
+    tasks = parsed.get("tasks", [])
+    if not isinstance(tasks, list):
+        logger.warning("Поле tasks в ответе экстрактора не список, сырой ответ: %s", raw[:500])
+        return []
+    return tasks
 
 
 def extract_tasks(chat_title: str, messages: list[dict]) -> list[dict]:
