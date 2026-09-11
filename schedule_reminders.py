@@ -27,7 +27,7 @@ def _now() -> datetime:
 
 async def _send_to_owner(context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
  if config.OWNER_USER_ID is None:
- return False
+  return False
  try:
  await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=text)
  return True
