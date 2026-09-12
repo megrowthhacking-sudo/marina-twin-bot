@@ -1815,7 +1815,12 @@ async def _send_urgent_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     """/urgent — по каждому проекту тянет живые задачи из ClickUp, оставляет только
     срочные (priority urgent/high) и собирает одним сообщением с разделом на каждый
     проект (см. _split_for_telegram — режется на несколько сообщений, если не
-    помещается в лимит Telegram)."""
+    помещается в лимит Telegram). Отправка идёт через _send_owner_message_with_retry
+    (та же защита от HTTP 429/RetryAfter Telegram, что и в _send_project_report, см.
+    часть 41/PR #114) — раньше здесь был прямой send_message без повтора, из-за чего
+    при flood control сводка срочных задач терялась бы так же, как терялся утренний
+    дайджест до части 41; этот конкретный вызов был сознательно не тронут в PR #114,
+    чтобы не смешивать два фикса."""
     if config.OWNER_USER_ID is None:
         return
     sections = []
@@ -1833,7 +1838,7 @@ async def _send_urgent_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     text = "\n\n".join(sections)
     try:
         for chunk in _split_for_telegram(text):
-            await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
+            await _send_owner_message_with_retry(context, chunk)
     except Exception:
         logger.exception("Не удалось отправить сводку срочных задач владелице")
 
