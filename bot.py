@@ -744,30 +744,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     bound_project = _detect_project_binding(text)
     if bound_project:
-        previous_project = storage.get_chat_project(chat.id)
+        # По прямой просьбе владелицы (16.09) бот больше НЕ пишет подтверждение
+        # привязки чата к проекту в сам групповой чат — молча запоминает привязку
+        # и продолжает слушать переписку без единого сообщения от себя.
         storage.set_chat_project(chat.id, bound_project)
-        if bound_project == "unsorted":
-            if previous_project and previous_project != "unsorted":
-                prev_label = config.CLICKUP_PROJECTS[previous_project]["label"]
-                await msg.reply_text(
-                    f"Поняла, переключаю этот чат с проекта «{prev_label}» на «Unsorted» — "
-                    f"теперь буду собирать отсюда задачи в папку «Unsorted» 👍"
-                )
-            else:
-                await msg.reply_text("Поняла, буду собирать отсюда задачи в папку «Unsorted» 👍")
-        else:
-            label = config.CLICKUP_PROJECTS[bound_project]["label"]
-            if previous_project and previous_project != bound_project:
-                prev_label = (
-                    "Unsorted" if previous_project == "unsorted"
-                    else config.CLICKUP_PROJECTS[previous_project]["label"]
-                )
-                await msg.reply_text(
-                    f"Поняла, переключаю этот чат с проекта «{prev_label}» на «{label}» — "
-                    f"теперь буду собирать здесь задачи по проекту «{label}» 👍"
-                )
-            else:
-                await msg.reply_text(f"Поняла, буду собирать здесь задачи по проекту «{label}» 👍")
         return
 
     if await _is_addressed_to_marina(update, context, text):
