@@ -416,9 +416,9 @@ CLICKUP_LIST_SCHEDULE = os.environ.get("CLICKUP_LIST_SCHEDULE", "").strip() or N
 # чтобы автоматически завести их в Google Calendar (см. clickup_meeting_watch.py) — по
 # прямой просьбе владелицы (23.09.2026). Это ОБРАТНОЕ направление относительно
 # CLICKUP_LIST_SCHEDULE выше: там подтверждённая в личном диалоге встреча зеркалится
-# ИЗ Google Calendar В ClickUp; здесь же произвольная задача, заведённая КЕМ УГОДНО в
-# ClickUp (не только в 4 официальных проектных списках CLICKUP_LIST_IDS, а по всему
-# workspace — включая WEEKLY TASKS и любые командные списки, см.
+# ИЗ Google Calendar В ClickUp; здесь же произвольная задача, заведённая в ClickUp (не
+# только в 4 официальных проектных списках CLICKUP_LIST_IDS, а по всему workspace —
+# включая WEEKLY TASKS и любые командные списки, см.
 # clickup_client.get_open_tasks_team_wide), анализируется на предмет того, что она
 # описывает встречу, и если да — событие заводится В Google Calendar, полностью
 # автоматически, БЕЗ кнопок подтверждения (в отличие от _propose_meeting_draft в bot.py) —
@@ -426,8 +426,19 @@ CLICKUP_LIST_SCHEDULE = os.environ.get("CLICKUP_LIST_SCHEDULE", "").strip() or N
 # ошибся. Отдельный независимый процесс, никак не связанный ни с обычной выгрузкой задач
 # в ClickUp (CLICKUP_FLUSH_INTERVAL_MINUTES), ни с зеркалированием расписания выше. Раз в
 # 3 минуты по умолчанию — компромисс между скоростью реакции и лишними вызовами ClickUp
-# API/Claude на пустом ходу.
+# API/Claude на пустом ходу. По прямой просьбе владелицы (24.09.2026) обрабатываются
+# ТОЛЬКО задачи, назначенные НА НЕЁ (см. CLICKUP_MEETING_WATCH_ASSIGNEE_ID ниже) — чтобы
+# встречи коллег не засоряли её личный Google Calendar.
 CLICKUP_MEETING_SCAN_INTERVAL_MINUTES = int(os.environ.get("CLICKUP_MEETING_SCAN_INTERVAL_MINUTES", "3"))
+
+# ClickUp user_id владелицы, на которого фильтруются задачи в clickup_meeting_watch.py —
+# по прямой просьбе владелицы (24.09.2026), чтобы автоматически заводились в её Google
+# Calendar только ЕЁ СОБСТВЕННЫЕ встречи, а не задачи коллег. Берётся из
+# CLICKUP_ASSIGNEE_MAP["марина"] — того же источника, что и команда /marina — чтобы не
+# дублировать её user_id ещё раз. None, если "марина" вдруг отсутствует в
+# CLICKUP_ASSIGNEE_MAP (fail-safe: job тогда просто не найдёт задач с assignee_id=None и
+# ничего не заведёт, вместо того чтобы упасть).
+CLICKUP_MEETING_WATCH_ASSIGNEE_ID = CLICKUP_ASSIGNEE_MAP.get("марина")
 
 # --- Напоминания о расписании — часть 42.
 TRELLO_API_KEY = os.environ.get("TRELLO_API_KEY", "").strip() or None
