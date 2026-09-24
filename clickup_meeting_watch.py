@@ -75,15 +75,19 @@ def _format_notification(meeting: dict, task_name: str, task_url: str | None, tz
 
 
 async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Раз в config.CLICKUP_MEETING_SCAN_INTERVAL_MINUTES сканирует ВЕСЬ ClickUp workspace
-    (не только 4 официальных проектных списка) на предмет новых задач, НАЗНАЧЕННЫХ НА
-    ВЛАДЕЛИЦУ (фильтрация на стороне ClickUp API через параметр assignee_id — тот же
-    механизм, что и в командах team-member, см. clickup_client.get_open_tasks_team_wide),
-    созданных за последние сутки, и для каждой ещё не виденной задачи (см.
-    storage.has_seen_clickup_meeting_task) прогоняет её полный текст (название +
-    описание) через meeting_extractor.extract_meeting_from_task. Если задача похожа на
-    встречу/созвон/звонок — сразу создаёт событие в Google Calendar (без подтверждения)
-    и шлёт владелице пост-фактум уведомление. Любая ошибка на отдельной задаче только
+    """Раз в config.CLICKUP_MEETING_SCAN_INTERVAL_MINUTES сканирует пространства ClickUp
+    config.CLICKUP_MEETING_WATCH_SPACE_IDS ("РАСПИСАНИЕ" и "ATLAS" — не весь workspace, см.
+    докстринг модуля выше) на предмет задач, НАЗНАЧЕННЫХ НА ВЛАДЕЛИЦУ
+    (config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID — серверная фильтрация ClickUp API, та же,
+    что и у команд по сотрудникам), ДВУМЯ независимыми запросами: (1) созданные за
+    последние сутки (ловит вновь заведённые задачи быстро) и (2) с due_date в ближайшие
+    config.CLICKUP_MEETING_DUE_LOOKAHEAD_DAYS дней (ловит задачи, заведённые заранее кем-то
+    другим, но с приближающимся сроком — см. докстринг модуля выше про инцидент с Clear
+    Junction). Результаты объединяются по id задачи. Для каждой ещё не виденной задачи (см.
+    storage.has_seen_clickup_meeting_task) прогоняет её полный текст (название + описание)
+    через meeting_extractor.extract_meeting_from_task. Если задача похожа на
+    встречу/созвон/звонок — сразу создаёт событие в Google Calendar (без подтверждения) и
+    шлёт владелице пост-фактум уведомление. Любая ошибка на отдельной задаче только
     логируется — не должна останавливать обработку остальных задач этого скана."""
     if not (config.CLICKUP_TEAM_WIDE_ENABLED and config.GOOGLE_CALENDAR_ENABLED and config.OWNER_USER_ID):
         return
@@ -94,24 +98,47 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
     cutoff_ms = int(cutoff.timestamp() * 1000)
 
     try:
-        tasks = clickup_client.get_open_tasks_team_wide(
+        new_tasks = clickup_client.get_open_tasks_team_wide(
             assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
             date_created_gt_ms=cutoff_ms,
             space_ids=config.CLICKUP_MEETING_WATCH_SPACE_IDS,
         )
     except Exception:
         logger.exception("Не удалось получить новые задачи ClickUp для сканирования встреч")
+        new_tasks = []
+
+    due_from_ms = int(now.timestamp() * 1000)
+    due_to_ms = int((now + timedelta(days=config.CLICKUP_MEETING_DUE_LOOKAHEAD_DAYS)).timestamp() * 1000)
+    try:
+        due_soon_tasks = clickup_client.get_open_tasks_team_wide(
+            assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
+            due_date_gt_ms=due_from_ms,
+            due_date_lt_ms=due_to_ms,
+            space_ids=config.CLICKUP_MEETING_WATCH_SPACE_IDS,
+        )
+    except Exception:
+        logger.exception("Не удалось получить задачи ClickUp с приближающимся due_date для сканирования встреч")
+        due_soon_tasks = []
+
+    if not new_tasks and not due_soon_tasks:
         return
+
+    due_soon_ids = {task.get("id") for task in due_soon_tasks if task.get("id")}
+    tasks_by_id: dict[str, dict] = {}
+    for task in new_tasks + due_soon_tasks:
+        task_id = task.get("id")
+        if task_id:
+            tasks_by_id.setdefault(task_id, task)
+    tasks = list(tasks_by_id.values())
 
     for task in tasks:
         task_id = task.get("id")
         if not task_id:
             continue
-        # Доп. клиентская перепроверка на случай сбоя серверного фильтра ClickUp —
-        # не обрабатываем задачи старше окна поиска.
-        created = task.get("date_created") or 0
-        if created and created < cutoff.timestamp():
-            continue
+        if task_id not in due_soon_ids:
+            created = task.get("date_created") or 0
+            if created and created < cutoff.timestamp():
+                continue
         if storage.has_seen_clickup_meeting_task(task_id):
             continue
 
@@ -121,8 +148,6 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
             logger.exception("Не удалось прочитать полную задачу ClickUp %s для анализа встречи", task_id)
             continue
         if not full_task:
-            # Задача уже удалена/недоступна между сканом списка и этой точкой — помечаем
-            # виденной, чтобы не пытаться повторно на каждом следующем скане.
             storage.mark_seen_clickup_meeting_task(task_id)
             continue
 
@@ -160,8 +185,6 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
                 "Не удалось создать событие Google Calendar из ClickUp-задачи %s («%s»)",
                 task_id, task.get("name"),
             )
-            # Не помечаем виденной — на следующем скане попробуем ещё раз, вдруг проблема
-            # временная (например, кратковременная недоступность Google API).
             continue
 
         storage.mark_seen_clickup_meeting_task(task_id)
