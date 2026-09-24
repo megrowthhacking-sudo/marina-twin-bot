@@ -228,7 +228,7 @@ def get_open_tasks_team_wide(
     поведение как раньше.
 
     Бросает исключение при ошибке сети/API — вызывающий код сам решает, как это
-    залогировать и что ответить пользователю.\"\"\"
+    залогировать и что ответить пользователю."""
     if not config.CLICKUP_API_TOKEN:
         raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
     if not config.CLICKUP_TEAM_ID:
