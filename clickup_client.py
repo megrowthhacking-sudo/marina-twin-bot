@@ -166,7 +166,12 @@ def get_open_tasks(
     return tasks
 
 
-def get_open_tasks_team_wide(assignee_id: int | None = None, date_created_gt_ms: int | None = None) -> list[dict]:
+def get_open_tasks_team_wide(
+    assignee_id: int | None = None,
+    date_created_gt_ms: int | None = None,
+    due_date_gt_ms: int | None = None,
+    due_date_lt_ms: int | None = None,
+) -> list[dict]:
     """Тянет ОТКРЫТЫЕ задачи по ВСЕМУ workspace ClickUp (config.CLICKUP_TEAM_ID) — все
     пространства/папки/списки, а не только 4 официальных проектных списка (см.
     get_open_tasks выше). Добавлено 06.09 по прямой просьбе владелицы: персональные
@@ -208,6 +213,15 @@ def get_open_tasks_team_wide(assignee_id: int | None = None, date_created_gt_ms:
     С этим параметром ClickUp сам отдаёт только недавно созданные задачи, что резко
     сокращает объём пагинации при частом (раз в несколько минут) сканировании. Без него —
     поведение как раньше, ограничения по дате нет.
+
+    due_date_gt_ms / due_date_lt_ms — серверные фильтры ClickUp (параметры "due_date_gt" /
+    "due_date_lt", unix-время в МИЛЛИСЕКУНДАХ), а не клиентская фильтрация: due_date_gt_ms
+    возвращает только задачи с due_date СТРОГО ПОСЛЕ этого момента, due_date_lt_ms — только
+    задачи с due_date СТРОГО ДО этого момента. Добавлены для команды /meetm (см. bot.py):
+    единый хронологический список всех встреч из Google Calendar и ClickUp в пределах
+    настраиваемого горизонта (60 дней) — эти параметры позволяют отобрать задачи-встречи
+    по их срокам (due_date) в пределах нужного горизонта без постраничного перебора вообще
+    всех открытых задач workspace.
     Бросает исключение при ошибке сети/API — вызывающий код сам решает, как это
     залогировать и что ответить пользователю."""
     if not config.CLICKUP_API_TOKEN:
@@ -229,6 +243,10 @@ def get_open_tasks_team_wide(assignee_id: int | None = None, date_created_gt_ms:
             params["assignees[]"] = [assignee_id]
         if date_created_gt_ms is not None:
             params["date_created_gt"] = date_created_gt_ms
+        if due_date_gt_ms is not None:
+            params["due_date_gt"] = due_date_gt_ms
+        if due_date_lt_ms is not None:
+            params["due_date_lt"] = due_date_lt_ms
         resp = requests.get(
             f"{BASE_URL}/team/{config.CLICKUP_TEAM_ID}/task",
             headers=_headers(),
