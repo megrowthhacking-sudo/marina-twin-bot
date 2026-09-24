@@ -1577,7 +1577,7 @@ _MONTHS_GENITIVE = [
     "июля", "августа", "сентября", "октября", "ноября", "декабря",
 ]
 
-_MEETM_HORIZON_DAYS = 60
+_MEETM_HORIZON_DAYS = 30
 
 
 def _meetm_day_header(dt: datetime) -> str:
