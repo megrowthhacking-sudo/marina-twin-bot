@@ -2,13 +2,14 @@
 Auto-scheduling ClickUp-задач как встреч в Google Calendar — по прямой просьбе владелицы
 (23.09.2026). Обратное направление относительно meeting_extractor.extract_meeting /
 bot.py::_propose_meeting_draft (там источник — личное сообщение владелицы, событие
-создаётся только после подтверждения кнопкой "✅ Применить"): здесь источник — ЛЮБАЯ
-НОВАЯ задача, заведённая КЕМ УГОДНО в ClickUp workspace, не только в 4 официальных
-проектных списках (config.CLICKUP_LIST_IDS), а по всему workspace — включая WEEKLY TASKS
-и любые командные списки (см. clickup_client.get_open_tasks_team_wide). Если задача
-похожа на встречу/созвон/звонок — событие в Google Calendar (m@altyn.one) создаётся
-СРАЗУ, без каких-либо кнопок подтверждения; владелице только пост-фактум приходит
-уведомление, чтобы она могла поправить встречу, если разбор текста ошибся.
+создаётся только после подтверждения кнопкой "✅ Применить"): здесь источник — НОВАЯ
+задача в ClickUp workspace, НАЗНАЧЕННАЯ НА ВЛАДЕЛИЦУ (см.
+config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID), не только в 4 официальных проектных списках
+(config.CLICKUP_LIST_IDS), а по всему workspace — включая WEEKLY TASKS и любые командные
+списки (см. clickup_client.get_open_tasks_team_wide). Если задача похожа на
+встречу/созвон/звонок — событие в Google Calendar (m@altyn.one) создаётся СРАЗУ, без
+каких-либо кнопок подтверждения; владелице только пост-фактум приходит уведомление, чтобы
+она могла поправить встречу, если разбор текста ошибся.
 
 check_new_clickup_meetings_job регистрируется в bot.py::build_application и запускается
 раз в config.CLICKUP_MEETING_SCAN_INTERVAL_MINUTES минут — только если одновременно
@@ -75,8 +76,10 @@ def _format_notification(meeting: dict, task_name: str, task_url: str | None, tz
 
 async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Раз в config.CLICKUP_MEETING_SCAN_INTERVAL_MINUTES сканирует ВЕСЬ ClickUp workspace
-    (не только 4 официальных проектных списка) на предмет новых задач, созданных за
-    последние сутки, и для каждой ещё не виденной задачи (см.
+    (не только 4 официальных проектных списка) на предмет новых задач, НАЗНАЧЕННЫХ НА
+    ВЛАДЕЛИЦУ (фильтрация на стороне ClickUp API через параметр assignee_id — тот же
+    механизм, что и в командах team-member, см. clickup_client.get_open_tasks_team_wide),
+    созданных за последние сутки, и для каждой ещё не виденной задачи (см.
     storage.has_seen_clickup_meeting_task) прогоняет её полный текст (название +
     описание) через meeting_extractor.extract_meeting_from_task. Если задача похожа на
     встречу/созвон/звонок — сразу создаёт событие в Google Calendar (без подтверждения)
@@ -91,7 +94,10 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
     cutoff_ms = int(cutoff.timestamp() * 1000)
 
     try:
-        tasks = clickup_client.get_open_tasks_team_wide(date_created_gt_ms=cutoff_ms)
+        tasks = clickup_client.get_open_tasks_team_wide(
+            assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
+            date_created_gt_ms=cutoff_ms,
+        )
     except Exception:
         logger.exception("Не удалось получить новые задачи ClickUp для сканирования встреч")
         return
