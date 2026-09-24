@@ -171,6 +171,7 @@ def get_open_tasks_team_wide(
     date_created_gt_ms: int | None = None,
     due_date_gt_ms: int | None = None,
     due_date_lt_ms: int | None = None,
+    space_ids: list[str] | None = None,
 ) -> list[dict]:
     """Тянет ОТКРЫТЫЕ задачи по ВСЕМУ workspace ClickUp (config.CLICKUP_TEAM_ID) — все
     пространства/папки/списки, а не только 4 официальных проектных списка (см.
@@ -222,8 +223,12 @@ def get_open_tasks_team_wide(
     настраиваемого горизонта (60 дней) — эти параметры позволяют отобрать задачи-встречи
     по их срокам (due_date) в пределах нужного горизонта без постраничного перебора вообще
     всех открытых задач workspace.
+    space_ids — если задан, серверный фильтр ClickUp (параметр space_ids[]) — возвращает
+    только задачи из перечисленных пространств, не по всему workspace. Без него —
+    поведение как раньше.
+
     Бросает исключение при ошибке сети/API — вызывающий код сам решает, как это
-    залогировать и что ответить пользователю."""
+    залогировать и что ответить пользователю.\"\"\"
     if not config.CLICKUP_API_TOKEN:
         raise RuntimeError("ClickUp не настроен (нет CLICKUP_API_TOKEN)")
     if not config.CLICKUP_TEAM_ID:
@@ -247,6 +252,8 @@ def get_open_tasks_team_wide(
             params["due_date_gt"] = due_date_gt_ms
         if due_date_lt_ms is not None:
             params["due_date_lt"] = due_date_lt_ms
+        if space_ids:
+            params["space_ids[]"] = space_ids
         resp = requests.get(
             f"{BASE_URL}/team/{config.CLICKUP_TEAM_ID}/task",
             headers=_headers(),
