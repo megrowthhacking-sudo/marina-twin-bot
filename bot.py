@@ -1572,6 +1572,210 @@ async def handle_calendar_view_callback(update: Update, context: ContextTypes.DE
     await query.edit_message_text(text, reply_markup=_calendar_period_keyboard())
 
 
+_MONTHS_GENITIVE = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+
+_MEETM_HORIZON_DAYS = 60
+
+
+def _meetm_day_header(dt: datetime) -> str:
+    """Человекочитаемый заголовок дня для /meetm: "Четверг, 24 сентября" — день недели
+    (config.SCHEDULE_WEEKDAY_NAMES, те же полные строчные названия, что и в напоминаниях
+    о расписании) с большой буквы + число + месяц в родительном падеже (_MONTHS_GENITIVE),
+    без года — горизонт команды (_MEETM_HORIZON_DAYS) на практике не выходит за пределы
+    текущего года, а год без надобности захламлял бы вывод."""
+    weekday_name = config.SCHEDULE_WEEKDAY_NAMES[dt.weekday()]
+    return f"{weekday_name.capitalize()}, {dt.day} {_MONTHS_GENITIVE[dt.month - 1]}"
+
+
+async def _collect_meetm_calendar_items(start: datetime, end: datetime, tz: ZoneInfo) -> list[dict]:
+    """Часть /meetm (см. handle_meetm_command) — события Google Calendar (m@altyn.one) за
+    период [start, end) в едином формате {"start", "end", "all_day", "title", "location",
+    "source": "calendar", "time_is_guessed": False}, готовом для сортировки вместе с
+    элементами из ClickUp (см. _collect_meetm_clickup_items). Здесь оказываются ВСЕ
+    события календаря за период — включая уже поставленные автоматически из ClickUp
+    (см. clickup_meeting_watch.py) и подтверждённые вручную через calendar-флоу — поэтому
+    именно календарь, а не ClickUp, основной источник /meetm."""
+    events = calendar_client.list_events(start.isoformat(), end.isoformat())
+    items = []
+    for e in events:
+        if e["all_day"]:
+            try:
+                start_dt = datetime.fromisoformat(e["start"]).replace(tzinfo=tz)
+            except ValueError:
+                continue
+            end_dt = None
+        else:
+            try:
+                start_dt = datetime.fromisoformat(e["start"]).astimezone(tz)
+                end_dt = datetime.fromisoformat(e["end"]).astimezone(tz)
+            except ValueError:
+                continue
+        items.append(
+            {
+                "start": start_dt,
+                "end": end_dt,
+                "all_day": e["all_day"],
+                "title": e["title"],
+                "location": e.get("location"),
+                "source": "calendar",
+                "time_is_guessed": False,
+            }
+        )
+    return items
+
+
+async def _collect_meetm_clickup_items(start: datetime, end: datetime, tz: ZoneInfo) -> list[dict]:
+    """Часть /meetm (см. handle_meetm_command) — "донабор" встреч из ClickUp, которые ЕЩЁ
+    не попали в календарь: старые задачи с будущим сроком (due_date), заведённые ДО того,
+    как заработал автосканер clickup_meeting_watch.py (тот смотрит только на НЕДАВНО
+    созданные задачи — см. config.CLICKUP_MEETING_SCAN_INTERVAL_MINUTES), либо заведённые,
+    пока бот не работал.
+
+    Специально НИЧЕГО не пишет ни в Google Calendar, ни в storage.clickup_meeting_seen —
+    /meetm только читает и показывает; автопостановка событий остаётся исключительно
+    задачей clickup_meeting_watch.py, чтобы не плодить дублирующиеся события и не путать
+    состояние дедупликации фонового job'а.
+
+    Дедупликация с календарём: пропускаются (а) задачи из списка
+    config.CLICKUP_LIST_SCHEDULE — туда зеркалятся уже подтверждённые встречи ИЗ
+    календаря (см. _mirror_meeting_to_clickup), они и так придут через
+    _collect_meetm_calendar_items; (б) задачи, которые фоновый job уже разобрал хотя бы
+    раз (storage.has_seen_clickup_meeting_task) — если это была встреча, она уже в
+    календаре и придёт оттуда, если не встреча — незачем гонять Claude по ней ещё раз."""
+    try:
+        candidates = clickup_client.get_open_tasks_team_wide(
+            due_date_gt_ms=int(start.timestamp() * 1000),
+            due_date_lt_ms=int(end.timestamp() * 1000),
+        )
+    except Exception:
+        logger.exception("/meetm: не удалось получить задачи ClickUp с due_date в периоде")
+        return []
+
+    items = []
+    for t in candidates:
+        task_id = t.get("id")
+        if not task_id:
+            continue
+        if storage.has_seen_clickup_meeting_task(task_id):
+            continue
+        try:
+            full = clickup_client.get_task(task_id)
+        except Exception:
+            logger.exception("/meetm: не удалось получить полную задачу ClickUp %s", task_id)
+            continue
+        if not full:
+            continue
+        if config.CLICKUP_LIST_SCHEDULE and full.get("list_id") == config.CLICKUP_LIST_SCHEDULE:
+            continue
+        due_iso = None
+        if t.get("due_date"):
+            due_iso = datetime.fromtimestamp(t["due_date"], tz).isoformat()
+        created_iso = None
+        if t.get("date_created"):
+            created_iso = datetime.fromtimestamp(t["date_created"], tz).isoformat()
+        try:
+            meeting = meeting_extractor.extract_meeting_from_task(
+                title=full.get("name") or t.get("name") or "(без названия)",
+                description=full.get("description") or "",
+                due_date_iso=due_iso,
+                created_iso=created_iso,
+                tz_name=config.MARINATWIN_TIMEZONE,
+            )
+        except Exception:
+            logger.exception("/meetm: ошибка разбора задачи ClickUp %s на предмет встречи", task_id)
+            continue
+        if not meeting:
+            continue
+        try:
+            start_dt = datetime.fromisoformat(meeting["start"]).astimezone(tz)
+            end_dt = datetime.fromisoformat(meeting["end"]).astimezone(tz)
+        except (ValueError, KeyError):
+            continue
+        if not (start <= start_dt < end):
+            continue
+        items.append(
+            {
+                "start": start_dt,
+                "end": end_dt,
+                "all_day": False,
+                "title": meeting.get("title") or full.get("name") or t.get("name"),
+                "location": meeting.get("location"),
+                "source": "clickup",
+                "time_is_guessed": bool(meeting.get("time_is_guessed")),
+            }
+        )
+    return items
+
+
+async def handle_meetm_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/meetm — по прямой просьбе владелицы (24.09.2026): единый последовательный список
+    ВСЕХ встреч Марины от момента вызова команды на _MEETM_HORIZON_DAYS дней вперёд, с
+    указанием дня недели и месяца по каждому дню — собран из ДВУХ источников сразу:
+    Google Calendar (m@altyn.one, см. _collect_meetm_calendar_items) и ClickUp по всему
+    workspace (см. _collect_meetm_clickup_items — "донабор" задач-встреч, которые
+    календарь мог ещё не увидеть). Только в личке, только для владелицы — как /calendar
+    и /urgent."""
+    chat = update.effective_chat
+    if chat.type != "private":
+        await update.message.reply_text("Эта команда работает только в личке.")
+        return
+    if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+        await update.message.reply_text("Эта команда только для владелицы.")
+        return
+    if not config.GOOGLE_CALENDAR_ENABLED:
+        await update.message.reply_text("Google Calendar пока не настроен.")
+        return
+
+    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+    start = datetime.now(tz)
+    end = start + timedelta(days=_MEETM_HORIZON_DAYS)
+
+    await update.message.reply_text("Собираю встречи из календаря и ClickUp...")
+
+    try:
+        calendar_items = await _collect_meetm_calendar_items(start, end, tz)
+    except Exception:
+        logger.exception("/meetm: не удалось получить события календаря")
+        await update.message.reply_text("Не смогла получить события календаря — попробуй ещё раз чуть позже.")
+        return
+
+    clickup_items: list[dict] = []
+    if config.CLICKUP_TEAM_WIDE_ENABLED:
+        clickup_items = await _collect_meetm_clickup_items(start, end, tz)
+
+    items = [it for it in (calendar_items + clickup_items) if it["start"] >= start]
+    items.sort(key=lambda it: it["start"])
+
+    if not items:
+        await update.message.reply_text(f"Встреч не найдено на ближайшие {_MEETM_HORIZON_DAYS} дней.")
+        return
+
+    lines = [f"🗓 Все встречи на ближайшие {_MEETM_HORIZON_DAYS} дней ({len(items)}):\n"]
+    current_day = None
+    for it in items:
+        day = it["start"].date()
+        if day != current_day:
+            current_day = day
+            lines.append(f"\n{_meetm_day_header(it['start'])}")
+        if it["all_day"]:
+            time_part = "весь день"
+        else:
+            time_part = it["start"].strftime("%H:%M")
+        if it.get("end"):
+            time_part += f"–{it['end'].strftime('%H:%M')}"
+        location_part = f" 📍{it['location']}" if it.get("location") else ""
+        source_part = " (ClickUp)" if it["source"] == "clickup" else ""
+        guessed_part = " ❓время примерное" if it.get("time_is_guessed") else ""
+        lines.append(f"  {time_part} — {it['title']}{location_part}{source_part}{guessed_part}")
+
+    text = "\n".join(lines)
+    for chunk in _split_for_telegram(text):
+        await update.message.reply_text(chunk)
+
+
 """Один и тот же чат может попасть на выгрузку из двух разных мест почти одновременно:
 сразу после нового сообщения (см. handle_group_message) и по расписанию
 (periodic_flush_job, независимый job на том же event loop). Раньше это иногда
@@ -2949,6 +3153,8 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
     sections.append(
         "🗓 Календарь и прочее:\n"
         "/calendar — события календаря по периодам (сегодня/завтра/неделя/месяц)\n"
+        f"/meetm — все встречи подряд по датам на {_MEETM_HORIZON_DAYS} дней вперёд, "
+        "с днём недели и месяцем, из календаря + ClickUp\n"
         "/cancelall — снять все висящие вопросы из групповых чатов, на которые ещё не ответила\n"
         "/stop — остановить рассылку задач в режиме правки, если нажала по ошибке"
     )
@@ -3006,6 +3212,10 @@ def build_application() -> Application:
     # handle_calendar_view_callback).
     app.add_handler(CommandHandler("calendar", handle_calendar_command))
     app.add_handler(CallbackQueryHandler(handle_calendar_view_callback, pattern=r"^calview:"))
+    # /meetm — только в личке, только владелице: единый последовательный список ВСЕХ
+    # встреч (календарь + ClickUp) на _MEETM_HORIZON_DAYS дней вперёд (см.
+    # handle_meetm_command), по прямой просьбе владелицы 24.09.2026.
+    app.add_handler(CommandHandler("meetm", handle_meetm_command))
     # Персональные команды по сотрудникам: /lili /olga /sveta /ilya /nazgul /alex /ub /marina
     # /nikolay /nick — только в личке, только владелице (см. config.EMPLOYEE_COMMANDS /
     # _send_employee_report). Плюс для каждого — "weekly"-версия (например
