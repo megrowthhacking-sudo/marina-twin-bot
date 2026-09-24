@@ -451,6 +451,19 @@ CLICKUP_MEETING_WATCH_SPACE_IDS = [
     "1100590000000016",  # ATLAS
 ]
 
+# Обнаружилось (24.09.2026, часть 4 — жалоба владелицы: не поставился зум с Clear Junction
+# на завтра), что описанного выше сканирования "только НОВЫЕ задачи за последние сутки"
+# недостаточно: задача была заведена коллегой ЗАРАНЕЕ (больше суток назад) с due_date на
+# завтра — check_new_clickup_meetings_job её просто не видел, потому что фильтр смотрит на
+# date_created, а не на due_date. Чтобы отлавливать и такие "старые" задачи с
+# приближающимся сроком, а не только вновь заведённые, job дополнительно (см.
+# clickup_meeting_watch.py) делает второй запрос — по due_date в диапазоне [сейчас, сейчас
+# + CLICKUP_MEETING_DUE_LOOKAHEAD_DAYS дней], в тех же двух пространствах и с тем же
+# исполнителем. Дедупликация между обоими запросами и с уже обработанными задачами — как и
+# раньше, через storage.has_seen_clickup_meeting_task, так что задача не будет поставлена в
+# календарь дважды. 30 дней — тот же горизонт, что и у /meetm (см. bot.py::_MEETM_HORIZON_DAYS).
+CLICKUP_MEETING_DUE_LOOKAHEAD_DAYS = int(os.environ.get("CLICKUP_MEETING_DUE_LOOKAHEAD_DAYS", "30"))
+
 # --- Напоминания о расписании — часть 42.
 TRELLO_API_KEY = os.environ.get("TRELLO_API_KEY", "").strip() or None
 TRELLO_TOKEN = os.environ.get("TRELLO_TOKEN", "").strip() or None
