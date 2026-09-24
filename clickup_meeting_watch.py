@@ -97,6 +97,7 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
         tasks = clickup_client.get_open_tasks_team_wide(
             assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
             date_created_gt_ms=cutoff_ms,
+            space_ids=config.CLICKUP_MEETING_WATCH_SPACE_IDS,
         )
     except Exception:
         logger.exception("Не удалось получить новые задачи ClickUp для сканирования встреч")

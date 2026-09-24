@@ -256,6 +256,7 @@ CLICKUP_SPACE_NAMES = {
     "901811161056": "АДМИН ЗАДАЧИ НАШИ КОМПАНИИ",
     "901811160844": "ШАБЛОНЫ",
     "901812689518": "Twin",
+    "1100590000000016": "ATLAS",
 }
 
 # Команды по статусам списка WEEKLY TASKS (по прямой просьбе владелицы, часть 27, см.
@@ -439,6 +440,16 @@ CLICKUP_MEETING_SCAN_INTERVAL_MINUTES = int(os.environ.get("CLICKUP_MEETING_SCAN
 # CLICKUP_ASSIGNEE_MAP (fail-safe: job тогда просто не найдёт задач с assignee_id=None и
 # ничего не заведёт, вместо того чтобы упасть).
 CLICKUP_MEETING_WATCH_ASSIGNEE_ID = CLICKUP_ASSIGNEE_MAP.get("марина")
+
+# Автопостановка встреч сужена ещё раз (по прямой просьбе владелицы, 24.09.2026, часть 3):
+# только два пространства ClickUp — "РАСПИСАНИЕ" (личное расписание, WEEKLY TASKS) и
+# "ATLAS" (внешние партнёры/шлюзы/банки, список "ATLAS РАСПИСАНИЕ") — а не весь workspace.
+# Явно НЕ внутренний список задач "Atlas Marina Twin" (команда /tasksatlas) — владелица
+# уточнила, что имеет в виду именно пространство ATLAS с папкой "Шлюзы и партнёры".
+CLICKUP_MEETING_WATCH_SPACE_IDS = [
+    "901812152944",  # РАСПИСАНИЕ
+    "1100590000000016",  # ATLAS
+]
 
 # --- Напоминания о расписании — часть 42.
 TRELLO_API_KEY = os.environ.get("TRELLO_API_KEY", "").strip() or None
