@@ -291,6 +291,22 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    # Дедуп для clickup_meeting_watch.py (auto-scheduling встреч из ClickUp-задач в Google
+    # Calendar, 23.09.2026): без этой таблицы фоновый job (см.
+    # check_new_clickup_meetings_job) при каждом запуске заново находил бы одну и ту же
+    # уже обработанную задачу ClickUp (она остаётся "созданной в последние 24 часа" ещё
+    # долго после первой обработки) и слал бы повторные события/уведомления. task_id —
+    # ClickUp task id (строка), seen_at — unix-время первой обработки, чтобы можно было
+    # чистить старые записи (см. cleanup_old_seen_clickup_meeting_tasks ниже) и не давать
+    # таблице бесконечно расти.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clickup_meeting_seen (
+            task_id TEXT PRIMARY KEY,
+            seen_at REAL NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -1071,4 +1087,27 @@ def mark_reminder_sent(reminder_key: str) -> None:
 def cleanup_old_sent_reminders(older_than_seconds: float = 2 * 24 * 3600) -> None:
     cutoff = time.time() - older_than_seconds
     _conn.execute("DELETE FROM sent_reminders WHERE sent_at < ?", (cutoff,))
+    _conn.commit()
+
+
+def has_seen_clickup_meeting_task(task_id: str) -> bool:
+    """Дедуп для clickup_meeting_watch.py — уже обрабатывали ли эту ClickUp-задачу на
+    предмет авто-постановки встречи в Google Calendar (независимо от того, оказалась ли
+    она реально встречей — сам факт анализа фиксируется, чтобы не гонять Claude повторно
+    на каждом скане тем же самым task_id)."""
+    row = _conn.execute("SELECT 1 FROM clickup_meeting_seen WHERE task_id = ?", (task_id,)).fetchone()
+    return row is not None
+
+
+def mark_seen_clickup_meeting_task(task_id: str) -> None:
+    _conn.execute(
+        "INSERT OR IGNORE INTO clickup_meeting_seen (task_id, seen_at) VALUES (?, ?)",
+        (task_id, time.time()),
+    )
+    _conn.commit()
+
+
+def cleanup_old_seen_clickup_meeting_tasks(older_than_seconds: float = 7 * 24 * 3600) -> None:
+    cutoff = time.time() - older_than_seconds
+    _conn.execute("DELETE FROM clickup_meeting_seen WHERE seen_at < ?", (cutoff,))
     _conn.commit()

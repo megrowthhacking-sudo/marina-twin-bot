@@ -412,6 +412,23 @@ MEMORY_UPDATE_INTERVAL_MINUTES = int(os.environ.get("MEMORY_UPDATE_INTERVAL_MINU
 # зеркалирование просто не происходит (событие в календаре всё равно создаётся).
 CLICKUP_LIST_SCHEDULE = os.environ.get("CLICKUP_LIST_SCHEDULE", "").strip() or None
 
+# Как часто сканировать ClickUp на предмет НОВЫХ задач, похожих на встречу/созвон/звонок,
+# чтобы автоматически завести их в Google Calendar (см. clickup_meeting_watch.py) — по
+# прямой просьбе владелицы (23.09.2026). Это ОБРАТНОЕ направление относительно
+# CLICKUP_LIST_SCHEDULE выше: там подтверждённая в личном диалоге встреча зеркалится
+# ИЗ Google Calendar В ClickUp; здесь же произвольная задача, заведённая КЕМ УГОДНО в
+# ClickUp (не только в 4 официальных проектных списках CLICKUP_LIST_IDS, а по всему
+# workspace — включая WEEKLY TASKS и любые командные списки, см.
+# clickup_client.get_open_tasks_team_wide), анализируется на предмет того, что она
+# описывает встречу, и если да — событие заводится В Google Calendar, полностью
+# автоматически, БЕЗ кнопок подтверждения (в отличие от _propose_meeting_draft в bot.py) —
+# только пост-фактум уведомление владелице, чтобы она могла поправить, если разбор текста
+# ошибся. Отдельный независимый процесс, никак не связанный ни с обычной выгрузкой задач
+# в ClickUp (CLICKUP_FLUSH_INTERVAL_MINUTES), ни с зеркалированием расписания выше. Раз в
+# 3 минуты по умолчанию — компромисс между скоростью реакции и лишними вызовами ClickUp
+# API/Claude на пустом ходу.
+CLICKUP_MEETING_SCAN_INTERVAL_MINUTES = int(os.environ.get("CLICKUP_MEETING_SCAN_INTERVAL_MINUTES", "3"))
+
 # --- Напоминания о расписании — часть 42.
 TRELLO_API_KEY = os.environ.get("TRELLO_API_KEY", "").strip() or None
 TRELLO_TOKEN = os.environ.get("TRELLO_TOKEN", "").strip() or None

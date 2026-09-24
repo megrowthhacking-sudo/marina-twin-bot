@@ -166,7 +166,7 @@ def get_open_tasks(
     return tasks
 
 
-def get_open_tasks_team_wide(assignee_id: int | None = None) -> list[dict]:
+def get_open_tasks_team_wide(assignee_id: int | None = None, date_created_gt_ms: int | None = None) -> list[dict]:
     """Тянет ОТКРЫТЫЕ задачи по ВСЕМУ workspace ClickUp (config.CLICKUP_TEAM_ID) — все
     пространства/папки/списки, а не только 4 официальных проектных списка (см.
     get_open_tasks выше). Добавлено 06.09 по прямой просьбе владелицы: персональные
@@ -198,6 +198,16 @@ def get_open_tasks_team_wide(assignee_id: int | None = None) -> list[dict]:
     пространства прямо в объекте задачи, только id (см. config.CLICKUP_SPACE_NAMES —
     сопоставление сделано вручную по данным живого запроса
     clickup_get_workspace_hierarchy, а не через отдельный API-вызов на каждую задачу).
+
+    date_created_gt_ms — если задан, серверный фильтр ClickUp (параметр "date_created_gt",
+    unix-время в МИЛЛИСЕКУНДАХ) — возвращает только задачи, созданные ПОСЛЕ этого момента.
+    Добавлено для clickup_meeting_watch.py (сканирование workspace на предмет новых задач
+    вроде встреч/созвонов, часть про auto-scheduling, 23.09.2026): без этого фильтра
+    пришлось бы каждый раз перебирать постранично вообще ВСЕ открытые задачи workspace
+    только чтобы клиентски отбросить старые — на большом workspace это дорого и медленно.
+    С этим параметром ClickUp сам отдаёт только недавно созданные задачи, что резко
+    сокращает объём пагинации при частом (раз в несколько минут) сканировании. Без него —
+    поведение как раньше, ограничения по дате нет.
     Бросает исключение при ошибке сети/API — вызывающий код сам решает, как это
     залогировать и что ответить пользователю."""
     if not config.CLICKUP_API_TOKEN:
@@ -217,6 +227,8 @@ def get_open_tasks_team_wide(assignee_id: int | None = None) -> list[dict]:
         }
         if assignee_id is not None:
             params["assignees[]"] = [assignee_id]
+        if date_created_gt_ms is not None:
+            params["date_created_gt"] = date_created_gt_ms
         resp = requests.get(
             f"{BASE_URL}/team/{config.CLICKUP_TEAM_ID}/task",
             headers=_headers(),
@@ -280,6 +292,10 @@ def get_task(task_id: str) -> dict | None:
     get_list_closed_status/mark_task_done ниже), id её пространства (чтобы завести тег
     "кричащая задача", если его ещё нет в этом пространстве — см. ensure_tag_on_task) или
     её текущие теги (чтобы понять, стоит ли уже пометка "🔥 Горит» — см. bot.py::_is_fire).
+    Также возвращает полное "description" задачи — нужно clickup_meeting_watch.py, чтобы
+    прогнать через meeting_extractor.extract_meeting_from_task не только заголовок, но и
+    весь текст описания задачи (там часто и есть время/ссылка на созвон, которых в
+    заголовке нет).
     None, если задача не найдена (уже удалена — например, кто-то удалил её напрямую в
     ClickUp между отправкой отчёта и нажатием кнопки)."""
     if not config.CLICKUP_API_TOKEN:
@@ -297,6 +313,7 @@ def get_task(task_id: str) -> dict | None:
         "list_id": list_field.get("id"),
         "space_id": space_field.get("id"),
         "tags": [tg.get("name") for tg in data.get("tags") or [] if tg.get("name")],
+        "description": data.get("description") or "",
     }
 
 

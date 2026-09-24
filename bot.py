@@ -33,6 +33,7 @@ import calendar_client
 import chat_memory
 import claude_client
 import clickup_client
+import clickup_meeting_watch
 import config
 import escalation
 import kb
@@ -3103,6 +3104,30 @@ def build_application() -> Application:
         logger.info("Напоминания о расписании включены.")
     else:
         logger.info("Напоминания о расписании выключены.")
+
+    # Auto-scheduling ClickUp-задач как встреч в Google Calendar (см.
+    # clickup_meeting_watch.py) — по прямой просьбе владелицы, 23.09.2026: сканирует ВЕСЬ
+    # ClickUp workspace (не только 4 официальных проектных списка, но и WEEKLY TASKS, и
+    # любые командные списки), а не только выгружает задачи В ClickUp, как обычная
+    # интеграция выше. Включается независимо от config.CLICKUP_ENABLED — нужны именно
+    # team-wide доступ к ClickUp, Google Calendar и известный OWNER_USER_ID (кому слать
+    # пост-фактум уведомление), не 4 проектных списка.
+    if config.CLICKUP_TEAM_WIDE_ENABLED and config.GOOGLE_CALENDAR_ENABLED and config.OWNER_USER_ID is not None:
+        meeting_watch_interval = config.CLICKUP_MEETING_SCAN_INTERVAL_MINUTES * 60
+        app.job_queue.run_repeating(
+            clickup_meeting_watch.check_new_clickup_meetings_job,
+            interval=meeting_watch_interval,
+            first=meeting_watch_interval,
+        )
+        logger.info(
+            "Авто-постановка встреч из ClickUp в Google Calendar включена, скан каждые %d мин.",
+            config.CLICKUP_MEETING_SCAN_INTERVAL_MINUTES,
+        )
+    else:
+        logger.info(
+            "Авто-постановка встреч из ClickUp в Google Calendar выключена (нужны "
+            "CLICKUP_TEAM_ID+CLICKUP_API_TOKEN, GOOGLE_CALENDAR_ENABLED и OWNER_USER_ID)."
+        )
 
     return app
 
