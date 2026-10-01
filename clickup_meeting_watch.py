@@ -291,7 +291,13 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
     конфигурацию и делегирует скан в scan_and_schedule_clickup_meetings (у которого с
     01.10.2026 есть третий источник кандидатов — скан доски WEEKLY TASKS по статусу-дню
     недели, см. _collect_weekly_board_candidates). Статистика не нужна — это фон,
-    обратной связи нет."""
+    обратной связи нет.
+    space_ids=None (01.10.2026, по прямой просьбе владелицы) — скан, как и у
+    /calendarclick, идёт по ВСЕМУ workspace, а не только по config.CLICKUP_MEETING_WATCH_SPACE_IDS
+    (РАСПИСАНИЕ + ATLAS). Раньше фон был уже сужен специально, чтобы не захламлять
+    календарь встречами коллег (24.09.2026) — это сознательно отменено по новой просьбе
+    владелицы: теперь любая похожая на встречу задача, назначенная на неё, из любого
+    пространства, авто-ставится в календарь."""
     if not (config.CLICKUP_TEAM_WIDE_ENABLED and config.GOOGLE_CALENDAR_ENABLED and config.OWNER_USER_ID):
         return
-    await scan_and_schedule_clickup_meetings(context)
+    await scan_and_schedule_clickup_meetings(context, space_ids=None)
