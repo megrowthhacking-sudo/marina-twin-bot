@@ -1776,6 +1776,51 @@ async def handle_meetm_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(chunk)
 
 
+async def handle_calendarclick_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/calendarclick — ручной запуск скана ClickUp (РАСПИСАНИЕ + ATLAS) на новые встречи,
+    не дожидаясь фонового job'а (clickup_meeting_watch.check_new_clickup_meetings_job).
+    Использует ту же общую логику — clickup_meeting_watch.scan_and_schedule_clickup_meetings.
+    Только в личке, только для владелицы."""
+    chat = update.effective_chat
+    if chat.type != "private":
+        await update.message.reply_text("Эта команда работает только в личке.")
+        return
+    if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+        await update.message.reply_text("Эта команда только для владелицы.")
+        return
+    if not (config.CLICKUP_TEAM_WIDE_ENABLED and config.GOOGLE_CALENDAR_ENABLED and config.OWNER_USER_ID):
+        await update.message.reply_text(
+            "Для этой команды нужны ClickUp (CLICKUP_TEAM_ID + CLICKUP_API_TOKEN) и Google Calendar — "
+            "что-то из этого пока не настроено."
+        )
+        return
+
+    await update.message.reply_text("Проверяю ClickUp на новые встречи...")
+
+    try:
+        stats = await clickup_meeting_watch.scan_and_schedule_clickup_meetings(context)
+    except Exception:
+        logger.exception("/calendarclick: не удалось выполнить скан ClickUp")
+        await update.message.reply_text("Не смогла проверить ClickUp — попробуй ещё раз чуть позже.")
+        return
+
+    created = stats.get("created") or []
+    errors = stats.get("errors") or 0
+    scanned = stats.get("scanned") or 0
+
+    if created:
+        lines = [f"Нашла встреч: {len(created)}\n"]
+        for m in created:
+            lines.append(f"📅 {m['when']} — {m['title']} (задача: «{m['task_name']}»)")
+    else:
+        lines = [f"Новых встреч нет (разобрано задач: {scanned})"]
+    if errors:
+        lines.append(f"\n⚠️ Не удалось обработать задач: {errors} — смотри логи")
+
+    for chunk in _split_for_telegram("\n".join(lines)):
+        await update.message.reply_text(chunk)
+
+
 """Один и тот же чат может попасть на выгрузку из двух разных мест почти одновременно:
 сразу после нового сообщения (см. handle_group_message) и по расписанию
 (periodic_flush_job, независимый job на том же event loop). Раньше это иногда
@@ -3155,6 +3200,7 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
         "/calendar — события календаря по периодам (сегодня/завтра/неделя/месяц)\n"
         f"/meetm — все встречи подряд по датам на {_MEETM_HORIZON_DAYS} дней вперёд, "
         "с днём недели и месяцем, из календаря + ClickUp\n"
+        "/calendarclick — сразу проверить ClickUp (РАСПИСАНИЕ + ATLAS) на новые встречи и поставить их в календарь, не дожидаясь автоскана\n"
         "/cancelall — снять все висящие вопросы из групповых чатов, на которые ещё не ответила\n"
         "/stop — остановить рассылку задач в режиме правки, если нажала по ошибке"
     )
@@ -3216,6 +3262,10 @@ def build_application() -> Application:
     # встреч (календарь + ClickUp) на _MEETM_HORIZON_DAYS дней вперёд (см.
     # handle_meetm_command), по прямой просьбе владелицы 24.09.2026.
     app.add_handler(CommandHandler("meetm", handle_meetm_command))
+    # /calendarclick — on-demand вариант фонового job'а check_new_clickup_meetings_job:
+    # тот же скан ClickUp на новые встречи, но по команде владелицы, без ожидания
+    # интервала (см. handle_calendarclick_command).
+    app.add_handler(CommandHandler("calendarclick", handle_calendarclick_command))
     # Персональные команды по сотрудникам: /lili /olga /sveta /ilya /nazgul /alex /ub /marina
     # /nikolay /nick — только в личке, только владелице (см. config.EMPLOYEE_COMMANDS /
     # _send_employee_report). Плюс для каждого — "weekly"-версия (например
