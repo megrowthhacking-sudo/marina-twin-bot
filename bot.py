@@ -815,6 +815,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     msg = update.effective_message
     if msg is None:
         return
+    storage.note_group_chat_seen(chat.id, chat.title or str(chat.id))
     _maybe_capture_employee_telegram_id(update)
     _maybe_capture_calendar_viewer_telegram_id(update)
     text = msg.text or ""
