@@ -1795,10 +1795,10 @@ async def handle_calendarclick_command(update: Update, context: ContextTypes.DEF
         )
         return
 
-    await update.message.reply_text("Проверяю ClickUp на новые встречи...")
+    await update.message.reply_text("Проверяю весь ClickUp на новые встречи...")
 
     try:
-        stats = await clickup_meeting_watch.scan_and_schedule_clickup_meetings(context)
+        stats = await clickup_meeting_watch.scan_and_schedule_clickup_meetings(context, space_ids=None)
     except Exception:
         logger.exception("/calendarclick: не удалось выполнить скан ClickUp")
         await update.message.reply_text("Не смогла проверить ClickUp — попробуй ещё раз чуть позже.")
@@ -3200,7 +3200,7 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
         "/calendar — события календаря по периодам (сегодня/завтра/неделя/месяц)\n"
         f"/meetm — все встречи подряд по датам на {_MEETM_HORIZON_DAYS} дней вперёд, "
         "с днём недели и месяцем, из календаря + ClickUp\n"
-        "/calendarclick — сразу проверить ClickUp (РАСПИСАНИЕ + ATLAS) на новые встречи и поставить их в календарь, не дожидаясь автоскана\n"
+        "/calendarclick — сразу проверить весь ClickUp на новые встречи и поставить их в календарь, не дожидаясь автоскана\n"
         "/cancelall — снять все висящие вопросы из групповых чатов, на которые ещё не ответила\n"
         "/stop — остановить рассылку задач в режиме правки, если нажала по ошибке"
     )
