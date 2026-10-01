@@ -420,6 +420,27 @@ def get_chats_with_pending() -> list[tuple[int, str]]:
     return [(r[0], r[1] or str(r[0])) for r in rows]
 
 
+def get_known_group_chats(limit: int = 50) -> list[tuple[int, str]]:
+    """Список (chat_id, chat_title) ВСЕХ групповых чатов, где бот хоть раз видел
+    сообщение (а не только тех, у кого сейчас есть невыгруженное, как у
+    get_chats_with_pending) — отсортирован по последней активности (свежие сверху).
+    Добавлено 01.10.2026, по прямой просьбе владелицы: нужен для /mygroups —
+    разового диагностического способа узнать числовой chat_id конкретных её рабочих
+    групп (чтобы потом прописать их в config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS), раз
+    Telegram не показывает chat_id в обычном интерфейсе."""
+    rows = _conn.execute(
+        """
+        SELECT chat_id, MAX(chat_title), MAX(ts)
+        FROM group_messages
+        GROUP BY chat_id
+        ORDER BY MAX(ts) DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [(r[0], r[1] or str(r[0])) for r in rows]
+
+
 # --- "Память" группового чата (см. chat_memory.py, periodic_memory_job в bot.py) ---
 
 def get_messages_since(chat_id: int, since_id: int, limit: int = 500) -> list[dict]:
