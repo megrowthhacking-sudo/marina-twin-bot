@@ -101,6 +101,61 @@ def _maybe_capture_employee_telegram_id(update: Update) -> None:
         logger.exception("Не удалось сохранить telegram_user_id для %s (@%s)", employee_key, user.username)
 
 
+# {telegram_username_в_нижнем_регистре} — набор @username (без "@"), которым владелица
+# разрешила смотреть СВОЙ личный календарь через /calendar, без доступа к остальным
+# её личным командам (добавлено 01.10.2026, по прямой просьбе владелицы — см.
+# config.CALENDAR_VIEWER_USERNAMES). Независимо от _EMPLOYEE_USERNAME_TO_KEY выше:
+# это про просмотр календаря, а не про отчёты по сотруднику.
+_CALENDAR_VIEWER_USERNAMES_LOWER = {u.lower() for u in config.CALENDAR_VIEWER_USERNAMES}
+
+
+def _maybe_capture_calendar_viewer_telegram_id(update: Update) -> None:
+    """Аналог _maybe_capture_employee_telegram_id выше, но для
+    config.CALENDAR_VIEWER_USERNAMES (доступ на просмотр /calendar, не связан с
+    EMPLOYEE_COMMANDS/отчётами). Сохраняет telegram_user_id под ключом
+    "calview:<username>" в той же таблице storage.employee_telegram_ids — таблица
+    общая и свободная по ключу, отдельная схема не нужна (см. _is_calendar_viewer
+    ниже, где это используется для допуска к /calendar)."""
+    user = update.effective_user
+    if user is None or not user.username:
+        return
+    username_lower = user.username.lower()
+    if username_lower not in _CALENDAR_VIEWER_USERNAMES_LOWER:
+        return
+    storage_key = f"calview:{username_lower}"
+    if storage.get_employee_telegram_id(storage_key) == user.id:
+        return # уже сохранён этот же id — не дёргаем базу заново на каждое сообщение
+    try:
+        storage.save_employee_telegram_id(storage_key, user.id, user.username)
+        logger.info(
+            "Распознан telegram_user_id для доступа к /calendar по @%s", user.username
+        )
+    except Exception:
+        logger.exception(
+            "Не удалось сохранить telegram_user_id для доступа к /calendar (@%s)", user.username
+        )
+
+
+def _is_calendar_viewer(user) -> bool:
+    """True, если user — владелица ИЛИ один из config.CALENDAR_VIEWER_USERNAMES, для
+    которого уже распознан telegram_user_id (см. _maybe_capture_calendar_viewer_telegram_id
+    выше — человеку нужно хоть раз написать боту в личку, чтобы бот узнал его числовой
+    id). Используется в handle_calendar_command/handle_calendar_view_callback (добавлено
+    01.10.2026, по прямой просьбе владелицы) — доступ только на просмотр, ставить/менять
+    события всё ещё может только владелица, остальные личные команды это не трогает."""
+    if user is None:
+        return False
+    if config.OWNER_USER_ID is not None and user.id == config.OWNER_USER_ID:
+        return True
+    if not user.username:
+        return False
+    username_lower = user.username.lower()
+    if username_lower not in _CALENDAR_VIEWER_USERNAMES_LOWER:
+        return False
+    stored_id = storage.get_employee_telegram_id(f"calview:{username_lower}")
+    return stored_id == user.id
+
+
 def _split_for_telegram(text: str) -> list[str]:
     """Режет длинный ответ на куски под лимит Telegram, стараясь резать по абзацам."""
     if len(text) <= TELEGRAM_MESSAGE_LIMIT:
@@ -199,6 +254,7 @@ async def _is_addressed_to_marina(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _maybe_capture_employee_telegram_id(update)
+    _maybe_capture_calendar_viewer_telegram_id(update)
     storage.reset_chat(update.effective_chat.id)
     await update.message.reply_text(
         "Привет! Я на связи 🙂 Пиши, с чем помочь — я тут же подключусь."
@@ -599,6 +655,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = update.message.text or ""
 
     _maybe_capture_employee_telegram_id(update)
+    _maybe_capture_calendar_viewer_telegram_id(update)
 
     if not _is_allowed(user.id):
         logger.warning("Отклонён неразрешённый пользователь %s (%s)", user.id, user.username)
@@ -735,6 +792,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if msg is None:
         return
     _maybe_capture_employee_telegram_id(update)
+    _maybe_capture_calendar_viewer_telegram_id(update)
     text = msg.text or ""
     if not text.strip():
         return
@@ -1500,16 +1558,21 @@ def _format_calendar_event_line(event: dict, tz: ZoneInfo) -> str:
 
 
 async def handle_calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/calendar — только в личке, только для владелицы: предлагает выбрать период
-    кнопками (Сегодня/Завтра/Текущая неделя/Следующая неделя/Текущий месяц), см.
-    handle_calendar_view_callback — там и происходит реальный запрос к Google Calendar
-    по нажатию кнопки."""
+    """/calendar — в личке: владелице, а также тем из config.CALENDAR_VIEWER_USERNAMES,
+    чей telegram_user_id уже распознан (см. _is_calendar_viewer; добавлено 01.10.2026,
+    по прямой просьбе владелицы — она сама назвала конкретные @username, которым можно
+    смотреть её расписание). Доступ для не-владелицы — только на просмотр: предлагает
+    выбрать период кнопками (Сегодня/Завтра/Текущая неделя/Следующая неделя/Текущий
+    месяц), см. handle_calendar_view_callback — там и происходит реальный запрос к
+    Google Calendar по нажатию кнопки. Ставить/менять события всё так же может только
+    владелица — остальные команды это не трогает."""
+    _maybe_capture_calendar_viewer_telegram_id(update)
     chat = update.effective_chat
     if chat.type != "private":
         await update.message.reply_text("Эта команда работает только в личке.")
         return
-    if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
-        await update.message.reply_text("Эта команда только для владелицы.")
+    if not _is_calendar_viewer(update.effective_user):
+        await update.message.reply_text("У тебя нет доступа к этой команде.")
         return
     if not config.GOOGLE_CALENDAR_ENABLED:
         await update.message.reply_text("Google Calendar пока не настроен.")
@@ -1525,11 +1588,13 @@ async def handle_calendar_view_callback(update: Update, context: ContextTypes.DE
     списком, оставляя те же кнопки — можно переключать период дальше, не вызывая
     /calendar заново. Список обрезается под лимит сообщения Telegram, если событий
     очень много (см. TELEGRAM_MESSAGE_LIMIT) — это команда просмотра одним
-    сообщением, а не постраничный отчёт."""
+    сообщением, а не постраничный отчёт. Доступ — тот же, что у /calendar (владелица
+    + config.CALENDAR_VIEWER_USERNAMES, см. _is_calendar_viewer; добавлено 01.10.2026,
+    по прямой просьбе владелицы)."""
     query = update.callback_query
     await query.answer()
 
-    if config.OWNER_USER_ID is not None and query.from_user.id != config.OWNER_USER_ID:
+    if not _is_calendar_viewer(query.from_user):
         return
 
     _, _, period = (query.data or "").partition(":")
