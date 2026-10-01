@@ -114,10 +114,13 @@ def list_events(time_min_iso: str, time_max_iso: str) -> list[dict]:
     за выбранный период (сегодня/завтра/неделя/месяц). Оба аргумента — ISO 8601
     datetime со смещением (см. bot.py::_calendar_period_bounds). singleEvents=True
     разворачивает повторяющиеся события в отдельные экземпляры, отсортированные по
-    времени начала. Возвращает список словарей {"title", "start", "end", "location",
+    времени начала. Возвращает список словарей {"id", "title", "start", "end", "location",
     "all_day"} — "start"/"end" остаются ISO-строками как их вернул Google (с таймзоной
     для обычных событий, только дата "YYYY-MM-DD" для событий на весь день, см.
-    "all_day"). Читает ВСЕ события календаря за период, не только созданные ботом —
+    "all_day"). "id" (добавлено 01.10.2026, по просьбе владелицы) — id события в Google
+    Calendar, нужен для update_event (см. ниже) — команде /calendarclickup, которая
+    переписывает название уже существующего события, если оно отличается от ClickUp.
+    Читает ВСЕ события календаря за период, не только созданные ботом —
     это осознанно: команда задумана как полноценный обзор расписания, а не только
     зеркало собственных встреч бота. Бросает исключение при ошибке сети/API —
     вызывающий код сам решает, как это залогировать и что ответить."""
@@ -140,6 +143,7 @@ def list_events(time_min_iso: str, time_max_iso: str) -> list[dict]:
         end = item.get("end", {})
         events.append(
             {
+                "id": item.get("id"),
                 "title": item.get("summary") or "(без названия)",
                 "start": start.get("dateTime") or start.get("date"),
                 "end": end.get("dateTime") or end.get("date"),
@@ -148,6 +152,35 @@ def list_events(time_min_iso: str, time_max_iso: str) -> list[dict]:
             }
         )
     return events
+
+
+def update_event(
+    event_id: str,
+    title: str | None = None,
+    location: str | None = None,
+    description: str | None = None,
+) -> None:
+    """Частично обновляет уже существующее событие календаря (events().patch — меняет
+    только переданные поля; время, участников, повторения и т.п. не трогает). Добавлено
+    01.10.2026 по прямой просьбе владелицы: команда /calendarclickup сверяет её встречи
+    ClickUp с календарём, и если встреча уже стоит на то же время, но названа по-другому —
+    переписывает название на то, как оно написано в ClickUp (см.
+    clickup_meeting_watch.reconcile_clickup_titles_in_calendar). event_id — id события
+    (см. "id" в list_events выше). Если ни одно поле не передано — ничего не делает, API
+    не зовётся. Бросает исключение при ошибке сети/API — вызывающий код сам решает, как
+    это залогировать."""
+    body: dict = {}
+    if title is not None:
+        body["summary"] = title
+    if location is not None:
+        body["location"] = location
+    if description is not None:
+        body["description"] = description
+    if not body:
+        return
+    service = _get_service()
+    service.events().patch(calendarId=config.GOOGLE_CALENDAR_ID, eventId=event_id, body=body).execute()
+    logger.info("Событие календаря %s обновлено: %s", event_id, body)
 
 
 def find_overlapping_events(start_iso: str, end_iso: str) -> list[dict]:
