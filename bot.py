@@ -1883,6 +1883,61 @@ async def handle_calendarclick_view_callback(update: Update, context: ContextTyp
     await query.edit_message_text(text, reply_markup=_calendarclick_period_keyboard())
 
 
+async def handle_calendarclickup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/calendarclickup — только в личке, только для владелицы (добавлено 01.10.2026, по
+    прямой просьбе владелицы): сверяет её встречи в ClickUp за ближайшие 7 дней с личным
+    календарём (m@altyn.one) и, если встреча УЖЕ стоит в календаре на то же время, но
+    названа по-другому (например, была заведена вручную под другим названием) —
+    переписывает название события на то, как оно написано в ClickUp. Отсутствующие
+    встречи при этом тоже создаёт (по просьбе владелицы — одна команда и достраивает, и
+    чистит разночтения). См. clickup_meeting_watch.reconcile_clickup_titles_in_calendar —
+    там же про сопоставление по времени (не по названию) и про "неоднозначно", если в
+    одном временном окне несколько существующих событий (тогда ничего не трогаем, только
+    предупреждаем)."""
+    chat = update.effective_chat
+    if chat.type != "private":
+        await update.message.reply_text("Эта команда работает только в личке.")
+        return
+    if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+        await update.message.reply_text("Эта команда только для владелицы.")
+        return
+    if not (config.CLICKUP_TEAM_WIDE_ENABLED and config.GOOGLE_CALENDAR_ENABLED and config.OWNER_USER_ID):
+        await update.message.reply_text(
+            "Для этой команды нужны ClickUp (CLICKUP_TEAM_ID + CLICKUP_API_TOKEN) и Google Calendar — "
+            "что-то из этого пока не настроено."
+        )
+        return
+    await update.message.reply_text("Сверяю ClickUp с календарём за ближайшую неделю...")
+    try:
+        stats = await clickup_meeting_watch.reconcile_clickup_titles_in_calendar(horizon_days=7)
+    except Exception:
+        logger.exception("/calendarclickup: не удалось сверить ClickUp с календарём")
+        await update.message.reply_text("Не смогла сверить ClickUp с календарём — попробуй ещё раз чуть позже.")
+        return
+
+    lines = [f"📅 Сверка за ближайшую неделю (проверено задач: {stats['scanned']}):"]
+    if stats["renamed"]:
+        lines.append(f"\n✏️ Переименовано в календаре ({len(stats['renamed'])}):")
+        for r in stats["renamed"]:
+            lines.append(f"«{r['old_title']}» → «{r['new_title']}» — {r['when']}")
+    if stats["created"]:
+        lines.append(f"\n➕ Поставлено новых ({len(stats['created'])}):")
+        for c in stats["created"]:
+            lines.append(f"«{c['title']}» — {c['when']}")
+    if stats["ambiguous"]:
+        lines.append(f"\n⚠️ Неоднозначно, проверь вручную ({len(stats['ambiguous'])}):")
+        for a in stats["ambiguous"]:
+            lines.append(f"«{a['title']}» — {a['when']} (рядом {a['count']} событий календаря)")
+    if stats["errors"]:
+        lines.append(f"\n❌ Ошибок при обработке: {stats['errors']}")
+    if not (stats["renamed"] or stats["created"] or stats["ambiguous"] or stats["errors"]):
+        lines.append("\nВсё совпадает, менять нечего.")
+    text = "\n".join(lines)
+    if len(text) > TELEGRAM_MESSAGE_LIMIT:
+        text = text[: TELEGRAM_MESSAGE_LIMIT - 50] + "\n\n...список обрезан."
+    await update.message.reply_text(text)
+
+
 """Один и тот же чат может попасть на выгрузку из двух разных мест почти одновременно:
 сразу после нового сообщения (см. handle_group_message) и по расписанию
 (periodic_flush_job, независимый job на том же event loop). Раньше это иногда
@@ -3263,6 +3318,7 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
         f"/meetm — все встречи подряд по датам на {_MEETM_HORIZON_DAYS} дней вперёд, "
         "с днём недели и месяцем, из календаря + ClickUp\n"
         "/calendarclick — выбрать период (как у /calendar) и увидеть все встречи за него, подтянув из ClickUp то, чего ещё нет в календаре\n"
+        "/calendarclickup — сверить встречи ClickUp за ближайшую неделю с календарём: переписать название, если встреча уже стоит под другим именем, и доставить то, чего не хватает\n"
         "/cancelall — снять все висящие вопросы из групповых чатов, на которые ещё не ответила\n"
         "/stop — остановить рассылку задач в режиме правки, если нажала по ошибке"
     )
@@ -3330,6 +3386,12 @@ def build_application() -> Application:
     # владелицы 01.10.2026.
     app.add_handler(CommandHandler("calendarclick", handle_calendarclick_command))
     app.add_handler(CallbackQueryHandler(handle_calendarclick_view_callback, pattern=r"^ccview:"))
+    # /calendarclickup — только в личке, только владелице: сверяет её встречи ClickUp за
+    # ближайшую неделю с личным календарём и переписывает название уже стоящего события,
+    # если оно отличается от ClickUp (заодно достраивает отсутствующие встречи — см.
+    # handle_calendarclickup_command / clickup_meeting_watch.reconcile_clickup_titles_in_calendar),
+    # по прямой просьбе владелицы 01.10.2026.
+    app.add_handler(CommandHandler("calendarclickup", handle_calendarclickup_command))
     # Персональные команды по сотрудникам: /lili /olga /sveta /ilya /nazgul /alex /ub /marina
     # /nikolay /nick — только в личке, только владелице (см. config.EMPLOYEE_COMMANDS /
     # _send_employee_report). Плюс для каждого — "weekly"-версия (например
