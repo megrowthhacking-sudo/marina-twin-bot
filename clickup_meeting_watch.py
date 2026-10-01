@@ -634,3 +634,84 @@ async def reconcile_clickup_titles_in_calendar(horizon_days: int = 7) -> dict:
         )
 
     return stats
+
+
+async def dedupe_calendar_events(horizon_days: int = 7) -> dict:
+    """Ищет в личном календаре (config.GOOGLE_CALENDAR_ID) ТОЧНЫЕ дубли за ближайшие
+    horizon_days дней и удаляет лишние копии, оставляя одну (добавлено 01.10.2026, по
+    прямой просьбе владелицы, сразу следом за /calendarclickup — вызывается из того же
+    bot.py::handle_calendarclickup_command, после reconcile_clickup_titles_in_calendar,
+    и попадает в тот же отчёт).
+
+    "Точный дубль" — намеренно строгое определение (по прямой просьбе владелицы, чтобы
+    не снести по ошибке две разные встречи, которые просто совпали по времени): ОДНО И
+    ТО ЖЕ название (без учёта регистра и пробелов по краям) И ОДНО И ТО ЖЕ время
+    начала/конца. Событие с ДРУГИМ названием в то же окно времени (ровно тот случай
+    stats["ambiguous"] у reconcile_clickup_titles_in_calendar выше) дублем НЕ считается
+    и не трогается — это разные, хоть и совпадающие по времени, встречи; удалять их
+    "на всякий случай" владелица явно не просила.
+
+    Диапазон — та же неделя, что и у /calendarclickup (по прямой просьбе владелицы), а
+    не весь календарь: один вызов calendar_client.list_events за [сегодня,
+    сегодня+horizon_days), события группируются по (название.strip().lower(), start,
+    end). all_day события не участвуют (та же оговорка, что и в
+    reconcile_clickup_titles_in_calendar — там действительно сравнивались только
+    некруглосуточные события). Внутри группы из 2+ одинаковых событий первое (в
+    порядке, в котором Google Calendar вернул список — он сортирован по startTime)
+    остаётся, остальные удаляются через calendar_client.delete_event; list_events не
+    возвращает дату создания события, так что внутри по-настоящему идентичной пары
+    выбор "что оставить" произвольный, но безопасный — события неразличимы по
+    содержанию.
+
+    Возвращает {"scanned": int (всего некруглосуточных событий в периоде), "deleted":
+    [{"title", "when", "removed"}, ...] (removed — сколько лишних копий удалено для
+    этой встречи), "errors": int}. Ошибка удаления одной группы/события только
+    логируется и не мешает обработке остальных."""
+    stats: dict = {"scanned": 0, "deleted": [], "errors": 0}
+    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+    now = datetime.now(tz)
+    start = now
+    end = now + timedelta(days=horizon_days)
+
+    try:
+        events = calendar_client.list_events(start.isoformat(), end.isoformat())
+    except Exception:
+        logger.exception("Не удалось прочитать календарь для поиска дублей (/calendarclickup)")
+        stats["errors"] += 1
+        return stats
+
+    events = [e for e in events if not e.get("all_day")]
+    stats["scanned"] = len(events)
+
+    groups: dict[tuple[str, str, str], list[dict]] = {}
+    for e in events:
+        key = (e.get("title", "").strip().lower(), e.get("start"), e.get("end"))
+        groups.setdefault(key, []).append(e)
+
+    for (_title_key, start_iso, _end_iso), group in groups.items():
+        if len(group) < 2:
+            continue
+        keep, *extra = group
+        display_title = keep.get("title") or "(без названия)"
+        try:
+            when = datetime.fromisoformat(start_iso).astimezone(tz).strftime("%d.%m %H:%M")
+        except (ValueError, TypeError):
+            when = start_iso or ""
+
+        removed = 0
+        for dup in extra:
+            event_id = dup.get("id")
+            if not event_id:
+                continue
+            try:
+                calendar_client.delete_event(event_id)
+                removed += 1
+            except Exception:
+                logger.exception(
+                    "Не удалось удалить дубль события «%s» (id=%s, /calendarclickup)", display_title, event_id,
+                )
+                stats["errors"] += 1
+        if removed:
+            stats["deleted"].append({"title": display_title, "when": when, "removed": removed})
+
+    return stats
