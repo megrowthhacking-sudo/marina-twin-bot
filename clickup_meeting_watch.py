@@ -318,3 +318,115 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
     if not (config.CLICKUP_TEAM_WIDE_ENABLED and config.GOOGLE_CALENDAR_ENABLED and config.OWNER_USER_ID):
         return
     await scan_and_schedule_clickup_meetings(context, space_ids=None)
+
+
+async def ensure_period_clickup_meetings_in_calendar(start: datetime, end: datetime) -> dict:
+    """Часть команды /calendarclick с кнопками периода (добавлено 01.10.2026, по просьбе
+    владелицы — раньше /calendarclick показывал только НОВЫЕ, ещё не виденные задачи, из-за
+    чего не показывал "все встречи"; см. bot.py::handle_calendarclick_view_callback и
+    bot.py::_calendar_period_bounds). В отличие от scan_and_schedule_clickup_meetings (там
+    задачи, которые storage.has_seen_clickup_meeting_task уже видел, пропускаются), здесь
+    проверка "уже видели" не используется вообще — цель именно показать ВСЁ, что ClickUp
+    считает встречей в выбранном периоде, а не только то, что появилось с прошлого скана.
+    Безопасно звать повторно для одного и того же периода любое число раз: для каждой
+    распознанной встречи зовём calendar_client.create_event, а он сам ищет в календаре
+    существующее событие с тем же названием в районе того же времени (окно ±30 минут, см.
+    calendar_client._find_duplicate_event) и, если находит, НЕ создаёт новое — просто
+    подтверждает, что оно уже есть. Новых дублей в календаре поэтому не возникает.
+    Источники кандидатов — по всему workspace (space_ids=None, по той же более ранней
+    просьбе владелицы, что и у /calendarclick и у фонового job'а):
+    (1) clickup_client.get_open_tasks_team_wide с due_date внутри [start, end);
+    (2) доска WEEKLY TASKS (_collect_weekly_board_candidates) — она устроена как "ближайшие
+    7 дней от сегодня", поэтому реально даёт кандидатов только если выбранный период
+    пересекается с этим окном (для «Сегодня»/«Завтра»/«Текущая неделя» — как правило
+    полностью; для «Следующая неделя»/«Текущий месяц» эта доска почти ничего не добавляет —
+    у неё просто нет данных о датах дальше недели вперёд, карточка на доске всего одна на
+    каждый день недели, не по одной на каждую будущую неделю).
+    Возвращает {"scanned": int, "created_or_confirmed": int, "errors": int} — только для
+    лога; сама команда после вызова показывает владелице финальный список обычным
+    calendar_client.list_events, а не то, что вернула эта функция, — так в списке видны и
+    уже существовавшие ручные встречи, и только что подтверждённые из ClickUp, одним
+    вызовом."""
+    stats: dict = {"scanned": 0, "created_or_confirmed": 0, "errors": 0}
+    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+    try:
+        due_tasks = clickup_client.get_open_tasks_team_wide(
+            assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
+            due_date_gt_ms=int(start.timestamp() * 1000),
+            due_date_lt_ms=int(end.timestamp() * 1000),
+            space_ids=None,
+        )
+    except Exception:
+        logger.exception("Не удалось получить задачи ClickUp с due_date в периоде для /calendarclick")
+        due_tasks = []
+    now = datetime.now(tz)
+    weekly_board_tasks, weekly_target_date_by_task_id = _collect_weekly_board_candidates(now)
+    start_date = start.date()
+    end_date = end.date()
+    weekly_board_tasks = [
+        task
+        for task in weekly_board_tasks
+        if start_date <= weekly_target_date_by_task_id.get(task.get("id"), start_date - timedelta(days=1)) < end_date
+    ]
+    tasks_by_id: dict[str, dict] = {}
+    for task in due_tasks + weekly_board_tasks:
+        task_id = task.get("id")
+        if task_id:
+            tasks_by_id.setdefault(task_id, task)
+    for task in tasks_by_id.values():
+        task_id = task.get("id")
+        if not task_id:
+            continue
+        stats["scanned"] += 1
+        try:
+            full_task = clickup_client.get_task(task_id)
+        except Exception:
+            logger.exception("Не удалось прочитать задачу ClickUp %s для /calendarclick за период", task_id)
+            stats["errors"] += 1
+            continue
+        if not full_task:
+            continue
+        description = full_task.get("description") or ""
+        due_iso = _iso_or_none(task.get("due_date"), tz)
+        created_iso = _iso_or_none(task.get("date_created"), tz)
+        weekday_target_date = weekly_target_date_by_task_id.get(task_id)
+        weekday_hint_date_iso = f"{weekday_target_date.isoformat()}T00:00:00" if weekday_target_date else None
+        try:
+            meeting = meeting_extractor.extract_meeting_from_task(
+                title=task.get("name") or full_task.get("name") or "(без названия)",
+                description=description,
+                due_date_iso=due_iso,
+                created_iso=created_iso,
+                tz_name=config.MARINATWIN_TIMEZONE,
+                weekday_hint_date_iso=weekday_hint_date_iso,
+            )
+        except Exception:
+            logger.exception("Ошибка разбора задачи ClickUp %s на предмет встречи (/calendarclick период)", task_id)
+            stats["errors"] += 1
+            continue
+        if not meeting:
+            continue
+        try:
+            meeting_start = datetime.fromisoformat(meeting["start"]).astimezone(tz)
+        except (ValueError, KeyError, TypeError):
+            continue
+        if not (start <= meeting_start < end):
+            continue
+        try:
+            calendar_client.create_event(
+                meeting["title"],
+                meeting["start"],
+                meeting["end"],
+                location=meeting.get("location") or None,
+                description=f"Авто-поставлено из ClickUp-задачи: {task.get('url') or task_id}",
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось создать/подтвердить событие календаря для задачи ClickUp %s («%s»)",
+                task_id, task.get("name"),
+            )
+            stats["errors"] += 1
+            continue
+        storage.mark_seen_clickup_meeting_task(task_id)
+        stats["created_or_confirmed"] += 1
+    return stats
