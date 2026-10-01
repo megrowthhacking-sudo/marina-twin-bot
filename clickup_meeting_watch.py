@@ -341,7 +341,16 @@ async def ensure_period_clickup_meetings_in_calendar(start: datetime, end: datet
     пересекается с этим окном (для «Сегодня»/«Завтра»/«Текущая неделя» — как правило
     полностью; для «Следующая неделя»/«Текущий месяц» эта доска почти ничего не добавляет —
     у неё просто нет данных о датах дальше недели вперёд, карточка на доске всего одна на
-    каждый день недели, не по одной на каждую будущую неделю).
+    каждый день недели, не по одной на каждую будущую неделю);
+    (3) добавлено 01.10.2026, по просьбе владелицы — ВСЕ открытые задачи workspace,
+    назначенные на владелицу, БЕЗ фильтра по due_date/дате создания, клиентски
+    отфильтрованные по явной дате в названии (meeting_extractor.parse_explicit_date_time,
+    без вызова Claude — дёшево), попадающей в [start, end). Это снимает ограничение
+    источника (2): теперь сотрудники пишут дату/время прямо в названии задачи (формат
+    "дата, время, компания, тип, тема" — договорённость от 01.10.2026), due_date в ClickUp
+    при этом может быть не заполнен вовсе, поэтому такие задачи не попадали бы ни в (1),
+    ни в (2) для дальних периодов («Следующая неделя»/«Текущий месяц») — здесь ищем их
+    напрямую по тексту названия, независимо от того, насколько далеко вперёд стоит дата.
     Возвращает {"scanned": int, "created_or_confirmed": int, "errors": int} — только для
     лога; сама команда после вызова показывает владелице финальный список обычным
     calendar_client.list_events, а не то, что вернула эта функция, — так в списке видны и
@@ -368,8 +377,22 @@ async def ensure_period_clickup_meetings_in_calendar(start: datetime, end: datet
         for task in weekly_board_tasks
         if start_date <= weekly_target_date_by_task_id.get(task.get("id"), start_date - timedelta(days=1)) < end_date
     ]
+    try:
+        all_own_tasks = clickup_client.get_open_tasks_team_wide(
+            assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
+            space_ids=None,
+        )
+    except Exception:
+        logger.exception("Не удалось получить все задачи ClickUp владелицы для /calendarclick за период")
+        all_own_tasks = []
+    explicit_date_tasks = []
+    for task in all_own_tasks:
+        name = task.get("name") or ""
+        explicit_match = meeting_extractor.parse_explicit_date_time(name, now)
+        if explicit_match and start_date <= explicit_match["start"].date() < end_date:
+            explicit_date_tasks.append(task)
     tasks_by_id: dict[str, dict] = {}
-    for task in due_tasks + weekly_board_tasks:
+    for task in due_tasks + weekly_board_tasks + explicit_date_tasks:
         task_id = task.get("id")
         if task_id:
             tasks_by_id.setdefault(task_id, task)
