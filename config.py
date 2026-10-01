@@ -199,6 +199,25 @@ for _employee_key, _env_name in _EMPLOYEE_TELEGRAM_ID_ENV.items():
         except ValueError:
             pass
 
+# /calendar для не-владелицы (добавлено 01.10.2026, по прямой просьбе владелицы): эти
+# Telegram @username (без "@", в нижнем регистре — сравнение регистронезависимое, см.
+# bot.py::_maybe_capture_calendar_viewer_telegram_id) тоже могут вызвать /calendar и
+# увидеть ЕЁ личный календарь (GOOGLE_CALENDAR_ID) — ровно то же самое, что видит сама
+# владелица, только на чтение (ставить/менять события им не доступно). 4 из 5 — те же
+# сотрудники, что и в EMPLOYEE_COMMANDS (ffforgetmenot/yama_888/claire_claire_bs/
+# fesius_altyn), пятая (irina_urazova) отдельным сотрудником не заведена. Как и у
+# EMPLOYEE_COMMANDS[...]["telegram_username"], числовой telegram_user_id бот узнаёт
+# только когда человек реально напишет ему хоть раз (личка или группа с ботом) — сам
+# просмотр календаря при этом разрешён только в личке с ботом (как и у всех остальных
+# личных команд владелицы), а не в групповых чатах.
+CALENDAR_VIEWER_USERNAMES = {
+    "yama_888",
+    "ffforgetmenot",
+    "claire_claire_bs",
+    "fesius_altyn",
+    "irina_urazova",
+}
+
 # Список ClickUp "WEEKLY TASKS" (id 901819932817) в пространстве "РАСПИСАНИЕ" — по прямой
 # просьбе владелицы (06.09): для каждого человека из EMPLOYEE_COMMANDS выше заведена ещё
 # и "weekly"-команда (например "/nikolayweekly", см. bot.py::_send_employee_weekly_report),
