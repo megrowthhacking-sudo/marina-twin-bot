@@ -9,7 +9,8 @@
 
 import json
 import logging
-from datetime import datetime, timedelta
+import re
+from datetime import date, datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 
 import config
@@ -18,6 +19,52 @@ from claude_client import client
 logger = logging.getLogger(__name__)
 
 _WEEKDAY_NAMES = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+
+# Явная дата/время в названии/описании задачи (добавлено 01.10.2026): по новой договорённости
+# владелицы сотрудники пишут дату и время встречи прямо в названии (например "2.10 14:00"),
+# чтобы бот не гадал по статусу-дню недели или due_date. parse_explicit_date_time разбирает
+# такой текст детерминированно, без участия Claude; extract_meeting_from_task использует
+# результат как высший приоритет. Год не пишется: берётся текущий, а если дата уже прошла —
+# следующий. Если времени в тексте нет — 12:00.
+_EXPLICIT_DATE_RE = re.compile(r"(?<![\d.])(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?(?![\d:])")
+_EXPLICIT_TIME_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?!\d)")
+
+
+def parse_explicit_date_time(text: str, now: datetime) -> dict | None:
+    """Ищет в тексте явную дату (например "2.10") и время (например "14:00"). Возвращает
+    {"start": datetime с таймзоной now, "time_found": bool} или None, если даты нет."""
+    if not text:
+        return None
+
+    start_date = None
+    for match in _EXPLICIT_DATE_RE.finditer(text):
+        day, month = int(match.group(1)), int(match.group(2))
+        year_str = match.group(3)
+        try:
+            if year_str:
+                start_date = date(int(year_str), month, day)
+            else:
+                start_date = date(now.year, month, day)
+                if start_date < now.date():
+                    start_date = date(now.year + 1, month, day)
+        except ValueError:
+            start_date = None
+            continue
+        break
+    if start_date is None:
+        return None
+
+    time_match = _EXPLICIT_TIME_RE.search(text)
+    if time_match:
+        start_time = dt_time(int(time_match.group(1)), int(time_match.group(2)))
+    else:
+        start_time = dt_time(12, 0)
+
+    return {
+        "start": datetime.combine(start_date, start_time, tzinfo=now.tzinfo),
+        "time_found": time_match is not None,
+    }
+
 
 _SYSTEM_PROMPT_TEMPLATE = """Ты помогаешь понять, просит ли пользователь поставить/записать встречу \
 в календарь, и если да — извлечь для неё данные.
@@ -139,7 +186,7 @@ _TASK_SYSTEM_PROMPT_TEMPLATE = """Ты анализируешь задачу и�
 - Описание: {description}
 - Дедлайн (due_date), если задан: {due_date}
 - Дата создания задачи (created_date): {created_date}
-{weekday_hint_block}
+{weekday_hint_block}{explicit_hint_block}
 Правила:
 - Если задача явно НЕ про встречу/созвон/звонок (обычная рабочая задача, документ, напоминание \
 без участия других людей в реальном времени) — верни {{"is_meeting": false}}.
@@ -180,6 +227,10 @@ def extract_meeting_from_task(
     Используется clickup_meeting_watch.py для автоматической (без подтверждения)
     постановки события в Google Calendar по любой новой задаче ClickUp workspace.
 
+    Явная дата/время в названии или описании (добавлено 01.10.2026, например «2.10 14:00»)
+    имеют ВЫСШИЙ приоритет: они разбираются детерминированно через parse_explicit_date_time
+    и перекрывают и weekday_hint_date_iso, и due_date_iso, и то, что вернул Claude.
+
     weekday_hint_date_iso (добавлено 01.10.2026) — календарная дата встречи для карточек
     доски WEEKLY TASKS: там статус карточки — день недели (например «пятница»), а не
     due_date, время написано прямо в названии, а due_date в ClickUp не заполнен (см.
@@ -200,6 +251,30 @@ def extract_meeting_from_task(
         )
     else:
         weekday_hint_block = ""
+
+    explicit_match = parse_explicit_date_time(f"{title or ''}\n{description or ''}", now)
+    explicit_start_dt = None
+    explicit_time_found = False
+    explicit_hint_block = ""
+    if explicit_match:
+        explicit_start_dt = explicit_match["start"]
+        explicit_time_found = explicit_match["time_found"]
+        explicit_hint_block = (
+            "\nВАЖНО: в названии/описании задачи явно указаны дата и время встречи в формате "
+            "«день.месяц» и «часы:минуты» (например «2.10 14:00» — это 2 октября, 14:00) — "
+            "по новой договорённости от 01.10.2026 сотрудники пишут их прямо в названии. "
+            "Это ВЫСШИЙ приоритет: игнорируй due_date, created_date и день недели. "
+            f"Дата и время начала встречи: {explicit_start_dt.isoformat()}. "
+        )
+        if explicit_time_found:
+            explicit_hint_block += (
+                "Время названо явно — используй именно его и поставь \"time_is_guessed\": false.\n"
+            )
+        else:
+            explicit_hint_block += (
+                "Дата названа явно, а время в тексте не указано — используй эту дату, время 12:00 "
+                "и поставь \"time_is_guessed\": true.\n"
+            )
     system_prompt = _TASK_SYSTEM_PROMPT_TEMPLATE.format(
         today=now.strftime("%Y-%m-%d %H:%M"),
         weekday=_WEEKDAY_NAMES[now.weekday()],
@@ -209,6 +284,7 @@ def extract_meeting_from_task(
         due_date=due_date_iso or "не задан",
         created_date=created_iso or "неизвестна",
         weekday_hint_block=weekday_hint_block,
+        explicit_hint_block=explicit_hint_block,
     )
 
     response = client.messages.create(
@@ -242,11 +318,26 @@ def extract_meeting_from_task(
     if not result_title:
         return None
 
+    # Явная дата/время из названия/описания (01.10.2026) — детерминированно перекрывают
+    # то, что вернул Claude: он мог ошибиться с годом/датой или проигнорировать подсказку.
+    if explicit_start_dt is not None:
+        duration = timedelta(hours=1)
+        if start and end:
+            try:
+                claude_duration = datetime.fromisoformat(end) - datetime.fromisoformat(start)
+                if claude_duration > timedelta(0):
+                    duration = claude_duration
+            except (ValueError, TypeError):
+                pass
+        start = explicit_start_dt.isoformat()
+        end = (explicit_start_dt + duration).isoformat()
+        time_is_guessed = not explicit_time_found
+
     # Claude иногда всё равно не подставляет start/end, даже когда явно попросили угадать —
     # в этом случае угадываем сами на стороне кода, а не отказываемся от результата, раз
     # текст явно похож на встречу (см. докстринг модуля выше — здесь мы всегда стараемся
     # что-то вернуть, а не молчать).
-    if not start:
+    elif not start:
         fallback_dt = None
         if weekday_hint_date_iso:
             try:
