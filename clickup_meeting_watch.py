@@ -489,10 +489,16 @@ async def reconcile_clickup_titles_in_calendar(horizon_days: int = 7) -> dict:
     ВРЕМЕНИ, а не по названию: иначе разница в названии помешала бы узнать, что это та же
     встреча, и привела бы к дублю вместо переименования. Если в окне ±30 минут вокруг
     времени встречи найдено РОВНО ОДНО существующее событие — либо подтверждаем совпадение
-    (названия совпали, ничего не делаем), либо переименовываем его. Если найдено несколько
-    событий в одном окне — пропускаем и отмечаем как "неоднозначно" (stats["ambiguous"]),
-    чтобы не угадывать, какое из них переименовывать; владелица разбирается сама. Если не
-    найдено ни одного — создаём новое событие, как ensure_period_clickup_meetings_in_calendar.
+    (названия совпали, ничего не делаем), либо переименовываем его. Если не найдено ни
+    одного — создаём новое событие, как ensure_period_clickup_meetings_in_calendar. Если
+    найдено НЕСКОЛЬКО событий в одном окне — непонятно, какое из них "то самое" (и
+    переименовывать наугад — опасно), поэтому НЕ трогаем ни одно из существующих, а
+    добавляем в это же время ЕЩЁ ОДНО новое событие с названием из ClickUp (исправлено
+    01.10.2026, по прямой просьбе владелицы — раньше такие задачи просто пропускались и
+    могли вообще не попасть в календарь); такая задача попадает сразу и в
+    stats["created"], и в stats["ambiguous"] — владелица видит в отчёте, что встреча
+    поставлена, но рядом есть другие события того же времени, которые стоит проверить
+    вручную (возможно, старые дубли пора убрать).
 
     Источники кандидатов — те же три, что и у ensure_period_clickup_meetings_in_calendar
     (см. _collect_period_meeting_candidates): due_date в периоде, доска WEEKLY TASKS,
@@ -584,6 +590,24 @@ async def reconcile_clickup_titles_in_calendar(horizon_days: int = 7) -> dict:
             continue
 
         if len(nearby) > 1:
+            try:
+                calendar_client.create_event(
+                    meeting["title"],
+                    meeting["start"],
+                    meeting["end"],
+                    location=meeting.get("location") or None,
+                    description=f"Авто-поставлено из ClickUp-задачи: {task.get('url') or task_id}",
+                )
+            except Exception:
+                logger.exception(
+                    "Не удалось создать доп. событие для неоднозначного времени, задача ClickUp %s "
+                    "(/calendarclickup)",
+                    task_id,
+                )
+                stats["errors"] += 1
+                continue
+            storage.mark_seen_clickup_meeting_task(task_id)
+            stats["created"].append({"title": meeting["title"], "when": when})
             stats["ambiguous"].append({"title": meeting["title"], "when": when, "count": len(nearby)})
             continue
 
