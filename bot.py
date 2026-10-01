@@ -2029,6 +2029,36 @@ async def handle_calendarclickup_command(update: Update, context: ContextTypes.D
     await update.message.reply_text(text)
 
 
+async def handle_mygroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/mygroups — только в личке, только владелице: разовая диагностическая команда
+    (добавлено 01.10.2026, по прямой просьбе владелицы). Telegram не показывает chat_id
+    группы в обычном интерфейсе, а он нужен, чтобы ограничить доступ к /calendar для
+    config.CALENDAR_VIEWER_USERNAMES КОНКРЕТНЫМИ рабочими группами (например "HR Ирина
+    Алтын"/"TEAM TASKS"/"ONBOARDING START POINT"), а не любой группой, где бот состоит
+    с нужным человеком (см. _calendar_access_denied_reason — туда это ограничение
+    добавится отдельным шагом, после того как владелица скажет, какие id каким группам
+    соответствуют). Список берётся из storage.get_known_group_chats — те же группы, где
+    бот уже видел хоть одно сообщение, свежие сверху."""
+    chat = update.effective_chat
+    if chat.type != "private":
+        await update.message.reply_text("Эта команда работает только в личке.")
+        return
+    if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
+        await update.message.reply_text("Эта команда только для владелицы.")
+        return
+    groups = storage.get_known_group_chats()
+    if not groups:
+        await update.message.reply_text("Пока не видела ни одного сообщения в группах.")
+        return
+    lines = ["📋 Группы, где я была (свежие сверху):"]
+    for chat_id, chat_title in groups:
+        lines.append(f"{chat_id} — {chat_title}")
+    text = "\n".join(lines)
+    if len(text) > TELEGRAM_MESSAGE_LIMIT:
+        text = text[: TELEGRAM_MESSAGE_LIMIT - 50] + "\n\n...список обрезан."
+    await update.message.reply_text(text)
+
+
 """Один и тот же чат может попасть на выгрузку из двух разных мест почти одновременно:
 сразу после нового сообщения (см. handle_group_message) и по расписанию
 (periodic_flush_job, независимый job на том же event loop). Раньше это иногда
@@ -3410,6 +3440,7 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
         "с днём недели и месяцем, из календаря + ClickUp\n"
         "/calendarclick — выбрать период (как у /calendar) и увидеть все встречи за него, подтянув из ClickUp то, чего ещё нет в календаре\n"
         "/calendarclickup — сверить встречи ClickUp за ближайшую неделю с календарём: переписать название, если встреча уже стоит под другим именем, и доставить то, чего не хватает\n"
+        "/mygroups — разовая диагностика: список chat_id групп, где я была (нужно, чтобы настроить, кому в каких группах можно смотреть расписание)\n"
         "/cancelall — снять все висящие вопросы из групповых чатов, на которые ещё не ответила\n"
         "/stop — остановить рассылку задач в режиме правки, если нажала по ошибке"
     )
@@ -3483,6 +3514,10 @@ def build_application() -> Application:
     # handle_calendarclickup_command / clickup_meeting_watch.reconcile_clickup_titles_in_calendar),
     # по прямой просьбе владелицы 01.10.2026.
     app.add_handler(CommandHandler("calendarclickup", handle_calendarclickup_command))
+    # /mygroups — разовая диагностика, только в личке, только владелице: показывает
+    # chat_id групп, где бот был, чтобы прописать конкретные рабочие группы в
+    # config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS (по прямой просьбе владелицы 01.10.2026).
+    app.add_handler(CommandHandler("mygroups", handle_mygroups_command))
     # Персональные команды по сотрудникам: /lili /olga /sveta /ilya /nazgul /alex /ub /marina
     # /nikolay /nick — только в личке, только владелице (см. config.EMPLOYEE_COMMANDS /
     # _send_employee_report). Плюс для каждого — "weekly"-версия (например
