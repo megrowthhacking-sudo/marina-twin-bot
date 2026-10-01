@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 import config
 
@@ -181,6 +182,29 @@ def update_event(
     service = _get_service()
     service.events().patch(calendarId=config.GOOGLE_CALENDAR_ID, eventId=event_id, body=body).execute()
     logger.info("Событие календаря %s обновлено: %s", event_id, body)
+
+
+def delete_event(event_id: str) -> None:
+    """Удаляет событие из личного календаря Марины (config.GOOGLE_CALENDAR_ID) по его id
+    (см. "id" в list_events выше). Добавлено 01.10.2026, по прямой просьбе владелицы:
+    автоматическая зачистка точных дублей в календаре (см.
+    clickup_meeting_watch.dedupe_calendar_events) — после того, как найдена группа
+    событий с полностью одинаковым названием и временем, одно оставляют, а остальные
+    удаляют этой функцией. Если событие уже удалено (повторный вызов, гонка) — Google
+    Calendar API отвечает 404/410, это не ошибка вызывающего кода: ловим и тихо
+    пропускаем, чтобы повторный запуск зачистки не падал. Любая другая ошибка API
+    (сеть, права и т.п.) пробрасывается дальше — вызывающий код сам решает, как это
+    залогировать."""
+    service = _get_service()
+    try:
+        service.events().delete(calendarId=config.GOOGLE_CALENDAR_ID, eventId=event_id).execute()
+    except HttpError as e:
+        status = getattr(e.resp, "status", None)
+        if status in (404, 410):
+            logger.info("Событие %s уже было удалено (status=%s) — пропускаю", event_id, status)
+            return
+        raise
+    logger.info("Событие календаря %s удалено как дубликат", event_id)
 
 
 def find_overlapping_events(start_iso: str, end_iso: str) -> list[dict]:
