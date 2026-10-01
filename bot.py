@@ -139,10 +139,11 @@ def _maybe_capture_calendar_viewer_telegram_id(update: Update) -> None:
 def _is_calendar_viewer(user) -> bool:
     """True, если user — владелица ИЛИ один из config.CALENDAR_VIEWER_USERNAMES, для
     которого уже распознан telegram_user_id (см. _maybe_capture_calendar_viewer_telegram_id
-    выше — человеку нужно хоть раз написать боту в личку, чтобы бот узнал его числовой
-    id). Используется в handle_calendar_command/handle_calendar_view_callback (добавлено
-    01.10.2026, по прямой просьбе владелицы) — доступ только на просмотр, ставить/менять
-    события всё ещё может только владелица, остальные личные команды это не трогает."""
+    выше — человеку нужно хоть раз написать боту что угодно, чтобы бот узнал его числовой
+    id). Только проверка "кто это" — где именно (личка/группа) ему можно звать /calendar,
+    решает _calendar_access_denied_reason ниже, не эта функция. Доступ только на просмотр,
+    ставить/менять события всё ещё может только владелица, остальные личные команды это
+    не трогает."""
     if user is None:
         return False
     if config.OWNER_USER_ID is not None and user.id == config.OWNER_USER_ID:
@@ -154,6 +155,29 @@ def _is_calendar_viewer(user) -> bool:
         return False
     stored_id = storage.get_employee_telegram_id(f"calview:{username_lower}")
     return stored_id == user.id
+
+
+def _calendar_access_denied_reason(user, chat) -> str | None:
+    """Решает, можно ли ЭТОМУ user в ЭТОМ chat вызывать /calendar — и если нет, какой
+    текст отказа показать. None — доступ есть. Правило разное для владелицы и для
+    остальных (добавлено/исправлено 01.10.2026, по прямой просьбе владелицы — исходно
+    было наоборот, см. комментарий у config.CALENDAR_VIEWER_USERNAMES):
+    — владелица — как и раньше, ТОЛЬКО в личке с ботом;
+    — все из config.CALENDAR_VIEWER_USERNAMES (см. _is_calendar_viewer) — НАОБОРОТ,
+    ТОЛЬКО в групповых чатах, где бот состоит вместе с ними (например те же рабочие
+    группы, где они получают задачи), а не в личке с ботом. Отдельного списка id
+    групп нет и не нужен — Telegram сам по себе не даст им вызвать команду там, где
+    их с ботом нет, так что любая группа, где оба состоят, и есть "разрешённый чат"."""
+    is_owner = user is not None and config.OWNER_USER_ID is not None and user.id == config.OWNER_USER_ID
+    if is_owner:
+        if chat.type != "private":
+            return "Эта команда работает только в личке."
+        return None
+    if chat.type == "private":
+        return "Эта команда работает только в групповых чатах, где я есть."
+    if not _is_calendar_viewer(user):
+        return "У тебя нет доступа к этой команде."
+    return None
 
 
 def _split_for_telegram(text: str) -> list[str]:
@@ -1558,21 +1582,18 @@ def _format_calendar_event_line(event: dict, tz: ZoneInfo) -> str:
 
 
 async def handle_calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/calendar — в личке: владелице, а также тем из config.CALENDAR_VIEWER_USERNAMES,
-    чей telegram_user_id уже распознан (см. _is_calendar_viewer; добавлено 01.10.2026,
-    по прямой просьбе владелицы — она сама назвала конкретные @username, которым можно
-    смотреть её расписание). Доступ для не-владелицы — только на просмотр: предлагает
-    выбрать период кнопками (Сегодня/Завтра/Текущая неделя/Следующая неделя/Текущий
-    месяц), см. handle_calendar_view_callback — там и происходит реальный запрос к
-    Google Calendar по нажатию кнопки. Ставить/менять события всё так же может только
-    владелица — остальные команды это не трогает."""
+    """/calendar — владелице и тем из config.CALENDAR_VIEWER_USERNAMES, кому разрешён
+    просмотр её расписания (добавлено/исправлено 01.10.2026, по прямой просьбе
+    владелицы — см. _calendar_access_denied_reason: владелице только в личке, а
+    остальным, наоборот, только в групповых чатах). Доступ для не-владелицы — только на
+    просмотр: предлагает выбрать период кнопками (Сегодня/Завтра/Текущая неделя/
+    Следующая неделя/Текущий месяц), см. handle_calendar_view_callback — там и
+    происходит реальный запрос к Google Calendar по нажатию кнопки. Ставить/менять
+    события всё так же может только владелица — остальные команды это не трогает."""
     _maybe_capture_calendar_viewer_telegram_id(update)
-    chat = update.effective_chat
-    if chat.type != "private":
-        await update.message.reply_text("Эта команда работает только в личке.")
-        return
-    if not _is_calendar_viewer(update.effective_user):
-        await update.message.reply_text("У тебя нет доступа к этой команде.")
+    denial = _calendar_access_denied_reason(update.effective_user, update.effective_chat)
+    if denial:
+        await update.message.reply_text(denial)
         return
     if not config.GOOGLE_CALENDAR_ENABLED:
         await update.message.reply_text("Google Calendar пока не настроен.")
@@ -1588,13 +1609,13 @@ async def handle_calendar_view_callback(update: Update, context: ContextTypes.DE
     списком, оставляя те же кнопки — можно переключать период дальше, не вызывая
     /calendar заново. Список обрезается под лимит сообщения Telegram, если событий
     очень много (см. TELEGRAM_MESSAGE_LIMIT) — это команда просмотра одним
-    сообщением, а не постраничный отчёт. Доступ — тот же, что у /calendar (владелица
-    + config.CALENDAR_VIEWER_USERNAMES, см. _is_calendar_viewer; добавлено 01.10.2026,
-    по прямой просьбе владелицы)."""
+    сообщением, а не постраничный отчёт. Доступ — тот же, что у /calendar (см.
+    _calendar_access_denied_reason; добавлено/исправлено 01.10.2026, по прямой просьбе
+    владелицы)."""
     query = update.callback_query
     await query.answer()
 
-    if not _is_calendar_viewer(query.from_user):
+    if _calendar_access_denied_reason(query.from_user, update.effective_chat) is not None:
         return
 
     _, _, period = (query.data or "").partition(":")
@@ -1956,9 +1977,11 @@ async def handle_calendarclickup_command(update: Update, context: ContextTypes.D
     переписывает название события на то, как оно написано в ClickUp. Отсутствующие
     встречи при этом тоже создаёт (по просьбе владелицы — одна команда и достраивает, и
     чистит разночтения). См. clickup_meeting_watch.reconcile_clickup_titles_in_calendar —
-    там же про сопоставление по времени (не по названию) и про "неоднозначно", если в
-    одном временном окне несколько существующих событий (тогда ничего не трогаем, только
-    предупреждаем)."""
+    там же про сопоставление по времени и названию, и про "неоднозначно" (исправлено
+    01.10.2026): если в одном временном окне несколько существующих событий — ни одно из
+    них не трогаем (не угадываем, какое переименовывать), а добавляем ещё одно новое
+    событие с названием из ClickUp и всё равно предупреждаем, что рядом есть другие
+    события того же времени — стоит проверить вручную на дубли."""
     chat = update.effective_chat
     if chat.type != "private":
         await update.message.reply_text("Эта команда работает только в личке.")
@@ -1990,9 +2013,12 @@ async def handle_calendarclickup_command(update: Update, context: ContextTypes.D
         for c in stats["created"]:
             lines.append(f"«{c['title']}» — {c['when']}")
     if stats["ambiguous"]:
-        lines.append(f"\n⚠️ Неоднозначно, проверь вручную ({len(stats['ambiguous'])}):")
+        lines.append(f"\n⚠️ Неоднозначно, проверь на дубли ({len(stats['ambiguous'])}):")
         for a in stats["ambiguous"]:
-            lines.append(f"«{a['title']}» — {a['when']} (рядом {a['count']} событий календаря)")
+            lines.append(
+                f"«{a['title']}» — {a['when']} (поставила новым событием, но рядом уже "
+                f"{a['count']} событий календаря на это время)"
+            )
     if stats["errors"]:
         lines.append(f"\n❌ Ошибок при обработке: {stats['errors']}")
     if not (stats["renamed"] or stats["created"] or stats["ambiguous"] or stats["errors"]):
