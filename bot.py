@@ -162,7 +162,11 @@ def _calendar_access_denied_reason(user, chat) -> str | None:
     текст отказа показать. None — доступ есть. Правило разное для владелицы и для
     остальных (добавлено/исправлено 01.10.2026, по прямой просьбе владелицы — исходно
     было наоборот, см. комментарий у config.CALENDAR_VIEWER_USERNAMES):
-    — владелица — как и раньше, ТОЛЬКО в личке с ботом;
+    — владелица — в личке с ботом (как и раньше) И ТАКЖЕ в тех же 3 рабочих группах
+    из config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS, что и у остальных ниже (расширено
+    01.10.2026, по прямой просьбе владелицы — её собственный аккаунт/юзернейм тот же,
+    которым она пишет боту в личку, так что это именно владелица, а не отдельный
+    viewer), но не в любой другой группе;
     — все из config.CALENDAR_VIEWER_USERNAMES (см. _is_calendar_viewer) — НАОБОРОТ,
     ТОЛЬКО в конкретных групповых чатах из config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS (не
     в любой группе, где бот состоит вместе с ними — уточнено 01.10.2026, владелица
@@ -170,9 +174,11 @@ def _calendar_access_denied_reason(user, chat) -> str | None:
     группы, а не любая), и не в личке с ботом."""
     is_owner = user is not None and config.OWNER_USER_ID is not None and user.id == config.OWNER_USER_ID
     if is_owner:
-        if chat.type != "private":
-            return "Эта команда работает только в личке."
-        return None
+        if chat.type == "private":
+            return None
+        if chat.id in config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS:
+            return None
+        return "Эта команда работает только в личке или в рабочих группах, где я её веду."
     if chat.type == "private":
         return "Эта команда работает только в групповых чатах, где я есть."
     if chat.id not in config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS:
@@ -1587,8 +1593,9 @@ def _format_calendar_event_line(event: dict, tz: ZoneInfo) -> str:
 async def handle_calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/calendar — владелице и тем из config.CALENDAR_VIEWER_USERNAMES, кому разрешён
     просмотр её расписания (добавлено/исправлено 01.10.2026, по прямой просьбе
-    владелицы — см. _calendar_access_denied_reason: владелице только в личке, а
-    остальным, наоборот, только в групповых чатах). Доступ для не-владелицы — только на
+    владелицы — см. _calendar_access_denied_reason: владелице — в личке и в тех же 3
+    рабочих группах из config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS, остальным — только в
+    этих же группах, не в личке). Доступ для не-владелицы — только на
     просмотр: предлагает выбрать период кнопками (Сегодня/Завтра/Текущая неделя/
     Следующая неделя/Текущий месяц), см. handle_calendar_view_callback — там и
     происходит реальный запрос к Google Calendar по нажатию кнопки. Ставить/менять
@@ -1984,7 +1991,14 @@ async def handle_calendarclickup_command(update: Update, context: ContextTypes.D
     01.10.2026): если в одном временном окне несколько существующих событий — ни одно из
     них не трогаем (не угадываем, какое переименовывать), а добавляем ещё одно новое
     событие с названием из ClickUp и всё равно предупреждаем, что рядом есть другие
-    события того же времени — стоит проверить вручную на дубли."""
+    события того же времени — стоит проверить вручную на дубли.
+
+    Второй шаг (добавлено 01.10.2026, по прямой следующей просьбе владелицы, сразу
+    после первой): после сверки отдельно зачищает в календаре ТОЧНЫЕ дубли за тот же
+    период — см. clickup_meeting_watch.dedupe_calendar_events. "Точный" — одно и то же
+    название И одно и то же время начала/конца; события с другим названием в то же
+    окно (тот самый "неоднозначно" выше) НЕ трогаются и дублями не считаются, чтобы не
+    снести по ошибке две разные встречи."""
     chat = update.effective_chat
     if chat.type != "private":
         await update.message.reply_text("Эта команда работает только в личке.")
@@ -2006,6 +2020,12 @@ async def handle_calendarclickup_command(update: Update, context: ContextTypes.D
         await update.message.reply_text("Не смогла сверить ClickUp с календарём — попробуй ещё раз чуть позже.")
         return
 
+    try:
+        dedupe_stats = await clickup_meeting_watch.dedupe_calendar_events(horizon_days=7)
+    except Exception:
+        logger.exception("/calendarclickup: не удалось зачистить дубли календаря")
+        dedupe_stats = {"scanned": 0, "deleted": [], "errors": 1}
+
     lines = [f"📅 Сверка за ближайшую неделю (проверено задач: {stats['scanned']}):"]
     if stats["renamed"]:
         lines.append(f"\n✏️ Переименовано в календаре ({len(stats['renamed'])}):")
@@ -2022,10 +2042,18 @@ async def handle_calendarclickup_command(update: Update, context: ContextTypes.D
                 f"«{a['title']}» — {a['when']} (поставила новым событием, но рядом уже "
                 f"{a['count']} событий календаря на это время)"
             )
-    if stats["errors"]:
-        lines.append(f"\n❌ Ошибок при обработке: {stats['errors']}")
-    if not (stats["renamed"] or stats["created"] or stats["ambiguous"] or stats["errors"]):
-        lines.append("\nВсё совпадает, менять нечего.")
+    if dedupe_stats["deleted"]:
+        total_removed = sum(d["removed"] for d in dedupe_stats["deleted"])
+        lines.append(f"\n🗑 Убрала точных дублей в календаре ({total_removed}):")
+        for d in dedupe_stats["deleted"]:
+            lines.append(f"«{d['title']}» — {d['when']} (оставила 1, удалила {d['removed']})")
+    if stats["errors"] or dedupe_stats["errors"]:
+        lines.append(f"\n❌ Ошибок при обработке: {stats['errors'] + dedupe_stats['errors']}")
+    if not (
+        stats["renamed"] or stats["created"] or stats["ambiguous"]
+        or dedupe_stats["deleted"] or stats["errors"] or dedupe_stats["errors"]
+    ):
+        lines.append("\nВсё совпадает, менять нечего, дублей нет.")
     text = "\n".join(lines)
     if len(text) > TELEGRAM_MESSAGE_LIMIT:
         text = text[: TELEGRAM_MESSAGE_LIMIT - 50] + "\n\n...список обрезан."
