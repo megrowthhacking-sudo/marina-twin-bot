@@ -74,8 +74,15 @@ def _format_notification(meeting: dict, task_name: str, task_url: str | None, tz
     return "\n".join(lines)
 
 
-async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Раз в config.CLICKUP_MEETING_SCAN_INTERVAL_MINUTES сканирует пространства ClickUp
+async def scan_and_schedule_clickup_meetings(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """Общая логика скана для фонового job'а (check_new_clickup_meetings_job) и команды
+    /calendarclick (bot.py::handle_calendarclick_command). Возвращает статистику:
+    {"scanned": int, "created": [{"title", "when", "task_name"}, ...], "errors": int} —
+    scanned: сколько ещё не виденных задач разобрано, created: успешно поставленные
+    встречи (when — вида "01.10 14:30"), errors: сколько задач не удалось обработать.
+    Проверки конфигурации остаются на вызывающей стороне.
+
+    Сканирует пространства ClickUp
     config.CLICKUP_MEETING_WATCH_SPACE_IDS ("РАСПИСАНИЕ" и "ATLAS" — не весь workspace, см.
     докстринг модуля выше) на предмет задач, НАЗНАЧЕННЫХ НА ВЛАДЕЛИЦУ
     (config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID — серверная фильтрация ClickUp API, та же,
@@ -89,8 +96,7 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
     встречу/созвон/звонок — сразу создаёт событие в Google Calendar (без подтверждения) и
     шлёт владелице пост-фактум уведомление. Любая ошибка на отдельной задаче только
     логируется — не должна останавливать обработку остальных задач этого скана."""
-    if not (config.CLICKUP_TEAM_WIDE_ENABLED and config.GOOGLE_CALENDAR_ENABLED and config.OWNER_USER_ID):
-        return
+    stats: dict = {"scanned": 0, "created": [], "errors": 0}
 
     tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
     now = datetime.now(tz)
@@ -121,7 +127,7 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
         due_soon_tasks = []
 
     if not new_tasks and not due_soon_tasks:
-        return
+        return stats
 
     due_soon_ids = {task.get("id") for task in due_soon_tasks if task.get("id")}
     tasks_by_id: dict[str, dict] = {}
@@ -142,10 +148,12 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
         if storage.has_seen_clickup_meeting_task(task_id):
             continue
 
+        stats["scanned"] += 1
         try:
             full_task = clickup_client.get_task(task_id)
         except Exception:
             logger.exception("Не удалось прочитать полную задачу ClickUp %s для анализа встречи", task_id)
+            stats["errors"] += 1
             continue
         if not full_task:
             storage.mark_seen_clickup_meeting_task(task_id)
@@ -166,6 +174,7 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception:
             logger.exception("Ошибка при разборе задачи ClickUp %s на предмет встречи", task_id)
             storage.mark_seen_clickup_meeting_task(task_id)
+            stats["errors"] += 1
             continue
 
         if not meeting:
@@ -185,11 +194,26 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
                 "Не удалось создать событие Google Calendar из ClickUp-задачи %s («%s»)",
                 task_id, task.get("name"),
             )
+            stats["errors"] += 1
             continue
 
         storage.mark_seen_clickup_meeting_task(task_id)
-        await _notify_owner(
-            context, _format_notification(meeting, task.get("name") or "(без названия)", task.get("url"), tz)
-        )
+        task_name = task.get("name") or "(без названия)"
+        try:
+            when = datetime.fromisoformat(meeting["start"]).astimezone(tz).strftime("%d.%m %H:%M")
+        except (ValueError, TypeError):
+            when = str(meeting.get("start") or "")
+        stats["created"].append({"title": meeting["title"], "when": when, "task_name": task_name})
+        await _notify_owner(context, _format_notification(meeting, task_name, task.get("url"), tz))
 
     storage.cleanup_old_seen_clickup_meeting_tasks()
+    return stats
+
+
+async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фоновый job (раз в config.CLICKUP_MEETING_SCAN_INTERVAL_MINUTES): проверяет
+    конфигурацию и делегирует скан в scan_and_schedule_clickup_meetings. Статистика
+    не нужна — это фон, обратной связи нет."""
+    if not (config.CLICKUP_TEAM_WIDE_ENABLED and config.GOOGLE_CALENDAR_ENABLED and config.OWNER_USER_ID):
+        return
+    await scan_and_schedule_clickup_meetings(context)
