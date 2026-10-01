@@ -135,6 +135,60 @@ def _collect_weekly_board_candidates(now: datetime) -> tuple[list[dict], dict[st
     return tasks, target_date_by_task_id
 
 
+def _collect_period_meeting_candidates(
+    start: datetime, end: datetime, now: datetime,
+) -> tuple[list[dict], dict[str, date]]:
+    """Общий сбор кандидатов-задач ClickUp за период [start, end) — вынесено 01.10.2026 из
+    ensure_period_clickup_meetings_in_calendar в отдельную функцию, чтобы тот же сбор
+    использовался и в reconcile_clickup_titles_in_calendar (см. ниже — команда
+    /calendarclickup, по прямой просьбе владелицы: сверить её встречи ClickUp с уже
+    стоящими в календаре и переименовать те, что названы по-другому). Источники (см.
+    были в докстринге ensure_period_clickup_meetings_in_calendar, не повторяем здесь):
+    (1) due_date внутри периода, (2) доска WEEKLY TASKS по дню недели в периоде,
+    (3) любая задача workspace с явной датой в названии, попадающей в период. Возвращает
+    (объединённый по id список сырых задач ClickUp, {task_id: дата дня недели с доски
+    WEEKLY TASKS}) — второе нужно вызывающему коду для weekday_hint_date_iso при вызове
+    meeting_extractor.extract_meeting_from_task."""
+    try:
+        due_tasks = clickup_client.get_open_tasks_team_wide(
+            assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
+            due_date_gt_ms=int(start.timestamp() * 1000),
+            due_date_lt_ms=int(end.timestamp() * 1000),
+            space_ids=None,
+        )
+    except Exception:
+        logger.exception("Не удалось получить задачи ClickUp с due_date в периоде")
+        due_tasks = []
+    weekly_board_tasks, weekly_target_date_by_task_id = _collect_weekly_board_candidates(now)
+    start_date = start.date()
+    end_date = end.date()
+    weekly_board_tasks = [
+        task
+        for task in weekly_board_tasks
+        if start_date <= weekly_target_date_by_task_id.get(task.get("id"), start_date - timedelta(days=1)) < end_date
+    ]
+    try:
+        all_own_tasks = clickup_client.get_open_tasks_team_wide(
+            assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
+            space_ids=None,
+        )
+    except Exception:
+        logger.exception("Не удалось получить все задачи ClickUp владелицы за период")
+        all_own_tasks = []
+    explicit_date_tasks = []
+    for task in all_own_tasks:
+        name = task.get("name") or ""
+        explicit_match = meeting_extractor.parse_explicit_date_time(name, now)
+        if explicit_match and start_date <= explicit_match["start"].date() < end_date:
+            explicit_date_tasks.append(task)
+    tasks_by_id: dict[str, dict] = {}
+    for task in due_tasks + weekly_board_tasks + explicit_date_tasks:
+        task_id = task.get("id")
+        if task_id:
+            tasks_by_id.setdefault(task_id, task)
+    return list(tasks_by_id.values()), weekly_target_date_by_task_id
+
+
 def _format_notification(meeting: dict, task_name: str, task_url: str | None, tz: ZoneInfo) -> str:
     start_dt = datetime.fromisoformat(meeting["start"]).astimezone(tz)
     when = start_dt.strftime("%d.%m %H:%M")
@@ -358,45 +412,9 @@ async def ensure_period_clickup_meetings_in_calendar(start: datetime, end: datet
     вызовом."""
     stats: dict = {"scanned": 0, "created_or_confirmed": 0, "errors": 0}
     tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
-    try:
-        due_tasks = clickup_client.get_open_tasks_team_wide(
-            assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
-            due_date_gt_ms=int(start.timestamp() * 1000),
-            due_date_lt_ms=int(end.timestamp() * 1000),
-            space_ids=None,
-        )
-    except Exception:
-        logger.exception("Не удалось получить задачи ClickUp с due_date в периоде для /calendarclick")
-        due_tasks = []
     now = datetime.now(tz)
-    weekly_board_tasks, weekly_target_date_by_task_id = _collect_weekly_board_candidates(now)
-    start_date = start.date()
-    end_date = end.date()
-    weekly_board_tasks = [
-        task
-        for task in weekly_board_tasks
-        if start_date <= weekly_target_date_by_task_id.get(task.get("id"), start_date - timedelta(days=1)) < end_date
-    ]
-    try:
-        all_own_tasks = clickup_client.get_open_tasks_team_wide(
-            assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
-            space_ids=None,
-        )
-    except Exception:
-        logger.exception("Не удалось получить все задачи ClickUp владелицы для /calendarclick за период")
-        all_own_tasks = []
-    explicit_date_tasks = []
-    for task in all_own_tasks:
-        name = task.get("name") or ""
-        explicit_match = meeting_extractor.parse_explicit_date_time(name, now)
-        if explicit_match and start_date <= explicit_match["start"].date() < end_date:
-            explicit_date_tasks.append(task)
-    tasks_by_id: dict[str, dict] = {}
-    for task in due_tasks + weekly_board_tasks + explicit_date_tasks:
-        task_id = task.get("id")
-        if task_id:
-            tasks_by_id.setdefault(task_id, task)
-    for task in tasks_by_id.values():
+    tasks, weekly_target_date_by_task_id = _collect_period_meeting_candidates(start, end, now)
+    for task in tasks:
         task_id = task.get("id")
         if not task_id:
             continue
@@ -452,4 +470,143 @@ async def ensure_period_clickup_meetings_in_calendar(start: datetime, end: datet
             continue
         storage.mark_seen_clickup_meeting_task(task_id)
         stats["created_or_confirmed"] += 1
+    return stats
+
+
+async def reconcile_clickup_titles_in_calendar(horizon_days: int = 7) -> dict:
+    """/calendarclickup (добавлено 01.10.2026, по прямой просьбе владелицы): сверяет её
+    встречи ClickUp за ближайшие horizon_days дней (владелица попросила неделю — см.
+    bot.py::handle_calendarclickup_command) с личным календарём (m@altyn.one) и, если
+    встреча УЖЕ стоит в календаре на то же время, но названа по-другому — ПЕРЕПИСЫВАЕТ
+    название события на то, как оно написано в ClickUp (calendar_client.update_event).
+    Если встречи в календаре в это время вовсе нет — создаёт её (как
+    ensure_period_clickup_meetings_in_calendar//calendarclick, по прямой просьбе
+    владелицы — эта команда одновременно и достраивает отсутствующие встречи, и чистит
+    разночтения в названиях уже существующих).
+
+    В отличие от calendar_client.create_event (дедуп по СОВПАДАЮЩЕМУ названию в окне
+    ±30 минут — см. calendar_client._find_duplicate_event) здесь сопоставление идёт по
+    ВРЕМЕНИ, а не по названию: иначе разница в названии помешала бы узнать, что это та же
+    встреча, и привела бы к дублю вместо переименования. Если в окне ±30 минут вокруг
+    времени встречи найдено РОВНО ОДНО существующее событие — либо подтверждаем совпадение
+    (названия совпали, ничего не делаем), либо переименовываем его. Если найдено несколько
+    событий в одном окне — пропускаем и отмечаем как "неоднозначно" (stats["ambiguous"]),
+    чтобы не угадывать, какое из них переименовывать; владелица разбирается сама. Если не
+    найдено ни одного — создаём новое событие, как ensure_period_clickup_meetings_in_calendar.
+
+    Источники кандидатов — те же три, что и у ensure_period_clickup_meetings_in_calendar
+    (см. _collect_period_meeting_candidates): due_date в периоде, доска WEEKLY TASKS,
+    явная дата в названии любой задачи workspace.
+
+    Возвращает {"scanned": int, "renamed": [{"old_title", "new_title", "when"}, ...],
+    "created": [{"title", "when"}, ...], "unchanged": int, "ambiguous": [{"title", "when",
+    "count"}, ...], "errors": int} — используется bot.py::handle_calendarclickup_command
+    для итогового отчёта владелице."""
+    stats: dict = {
+        "scanned": 0, "renamed": [], "created": [], "unchanged": 0, "ambiguous": [], "errors": 0,
+    }
+    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+    now = datetime.now(tz)
+    start = now
+    end = now + timedelta(days=horizon_days)
+    tasks, weekly_target_date_by_task_id = _collect_period_meeting_candidates(start, end, now)
+
+    for task in tasks:
+        task_id = task.get("id")
+        if not task_id:
+            continue
+        stats["scanned"] += 1
+        try:
+            full_task = clickup_client.get_task(task_id)
+        except Exception:
+            logger.exception("Не удалось прочитать задачу ClickUp %s для /calendarclickup", task_id)
+            stats["errors"] += 1
+            continue
+        if not full_task:
+            continue
+        description = full_task.get("description") or ""
+        due_iso = _iso_or_none(task.get("due_date"), tz)
+        created_iso = _iso_or_none(task.get("date_created"), tz)
+        weekday_target_date = weekly_target_date_by_task_id.get(task_id)
+        weekday_hint_date_iso = f"{weekday_target_date.isoformat()}T00:00:00" if weekday_target_date else None
+        try:
+            meeting = meeting_extractor.extract_meeting_from_task(
+                title=task.get("name") or full_task.get("name") or "(без названия)",
+                description=description,
+                due_date_iso=due_iso,
+                created_iso=created_iso,
+                tz_name=config.MARINATWIN_TIMEZONE,
+                weekday_hint_date_iso=weekday_hint_date_iso,
+            )
+        except Exception:
+            logger.exception("Ошибка разбора задачи ClickUp %s для /calendarclickup", task_id)
+            stats["errors"] += 1
+            continue
+        if not meeting:
+            continue
+        try:
+            meeting_start = datetime.fromisoformat(meeting["start"]).astimezone(tz)
+            meeting_end = datetime.fromisoformat(meeting["end"]).astimezone(tz)
+        except (ValueError, KeyError, TypeError):
+            continue
+        if not (start <= meeting_start < end):
+            continue
+
+        try:
+            nearby = calendar_client.list_events(
+                (meeting_start - timedelta(minutes=30)).isoformat(),
+                (meeting_end + timedelta(minutes=30)).isoformat(),
+            )
+        except Exception:
+            logger.exception("Не удалось прочитать календарь рядом с %s для /calendarclickup", meeting_start)
+            stats["errors"] += 1
+            continue
+        nearby = [e for e in nearby if not e.get("all_day")]
+        when = meeting_start.strftime("%d.%m %H:%M")
+
+        if not nearby:
+            try:
+                calendar_client.create_event(
+                    meeting["title"],
+                    meeting["start"],
+                    meeting["end"],
+                    location=meeting.get("location") or None,
+                    description=f"Авто-поставлено из ClickUp-задачи: {task.get('url') or task_id}",
+                )
+            except Exception:
+                logger.exception(
+                    "Не удалось создать событие для задачи ClickUp %s (/calendarclickup)", task_id,
+                )
+                stats["errors"] += 1
+                continue
+            storage.mark_seen_clickup_meeting_task(task_id)
+            stats["created"].append({"title": meeting["title"], "when": when})
+            continue
+
+        if len(nearby) > 1:
+            stats["ambiguous"].append({"title": meeting["title"], "when": when, "count": len(nearby)})
+            continue
+
+        existing = nearby[0]
+        if existing.get("title", "").strip().lower() == meeting["title"].strip().lower():
+            stats["unchanged"] += 1
+            continue
+
+        event_id = existing.get("id")
+        if not event_id:
+            stats["ambiguous"].append({"title": meeting["title"], "when": when, "count": 1})
+            continue
+        try:
+            calendar_client.update_event(event_id, title=meeting["title"])
+        except Exception:
+            logger.exception(
+                "Не удалось переименовать событие календаря %s в «%s» (/calendarclickup)",
+                event_id, meeting["title"],
+            )
+            stats["errors"] += 1
+            continue
+        stats["renamed"].append(
+            {"old_title": existing.get("title", ""), "new_title": meeting["title"], "when": when}
+        )
+
     return stats
