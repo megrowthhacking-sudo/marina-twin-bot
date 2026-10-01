@@ -124,7 +124,7 @@ def _maybe_capture_calendar_viewer_telegram_id(update: Update) -> None:
         return
     storage_key = f"calview:{username_lower}"
     if storage.get_employee_telegram_id(storage_key) == user.id:
-        return # уже сохранён этот же id — не дёргаем базу заново на каждое сообщение
+        return  # уже сохранён этот же id — не дёргаем базу заново на каждое сообщение
     try:
         storage.save_employee_telegram_id(storage_key, user.id, user.username)
         logger.info(
