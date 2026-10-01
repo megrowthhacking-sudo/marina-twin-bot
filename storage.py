@@ -46,6 +46,25 @@ def _connect() -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_group_messages_chat_flushed ON group_messages(chat_id, flushed)")
+    # Лёгкий реестр "в каких группах бот вообще бывал" — ОТДЕЛЬНО от group_messages
+    # (буфера под ClickUp-задачи): туда попадает НЕ каждое сообщение группы, а только то,
+    # что дошло до storage.add_group_message (т.е. не "адресовано Марине" и не фраза
+    # привязки чата к проекту — см. bot.py::handle_group_message, там оба случая
+    # возвращаются раньше). Из-за этого группа, где все сообщения были только такими
+    # (например только обращения к Марине), не попадала бы в список /mygroups — именно
+    # так и получилось с одной из групп владелицы при первом запуске (добавлено
+    # 01.10.2026, исправлено тем же числом). Эта таблица обновляется в самом начале
+    # handle_group_message, на КАЖДОЕ текстовое сообщение, без исключений — не хранит
+    # текст сообщений, только chat_id/название/когда видели последний раз.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS seen_group_chats (
+        chat_id INTEGER PRIMARY KEY,
+        chat_title TEXT,
+        last_seen_at REAL NOT NULL
+        )
+        """
+    )
     # telegram_username — реальный @username автора сообщения (в отличие от user_name,
     # который для экстрактора задач — first_name, см. bot.py::handle_group_message) — по
     # прямой просьбе владелицы, часть 33: нужен, чтобы потом показать "от кого задача"
@@ -420,20 +439,53 @@ def get_chats_with_pending() -> list[tuple[int, str]]:
     return [(r[0], r[1] or str(r[0])) for r in rows]
 
 
+def note_group_chat_seen(chat_id: int, chat_title: str) -> None:
+    """Отмечает, что бот только что видел текстовое сообщение в этой группе — для
+    get_known_group_chats//mygroups (см. комментарий у seen_group_chats выше). Вызывать
+    на КАЖДОЕ текстовое сообщение группы, в самом начале обработки, до любых "раньше
+    возвращаемся" веток — иначе группа, где все сообщения обрабатываются особым образом
+    (адресованы Марине, фраза привязки к проекту), не попадёт в список."""
+    _conn.execute(
+        """
+        INSERT INTO seen_group_chats (chat_id, chat_title, last_seen_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+        chat_title = excluded.chat_title,
+        last_seen_at = excluded.last_seen_at
+        """,
+        (chat_id, chat_title, time.time()),
+    )
+    _conn.commit()
+
+
 def get_known_group_chats(limit: int = 50) -> list[tuple[int, str]]:
     """Список (chat_id, chat_title) ВСЕХ групповых чатов, где бот хоть раз видел
-    сообщение (а не только тех, у кого сейчас есть невыгруженное, как у
-    get_chats_with_pending) — отсортирован по последней активности (свежие сверху).
-    Добавлено 01.10.2026, по прямой просьбе владелицы: нужен для /mygroups —
-    разового диагностического способа узнать числовой chat_id конкретных её рабочих
-    групп (чтобы потом прописать их в config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS), раз
-    Telegram не показывает chat_id в обычном интерфейсе."""
+    сообщение — отсортирован по последней активности (свежие сверху). Добавлено
+    01.10.2026, по прямой просьбе владелицы: нужен для /mygroups — разового
+    диагностического способа узнать числовой chat_id конкретных её рабочих групп
+    (чтобы потом прописать их в config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS), раз Telegram
+    не показывает chat_id в обычном интерфейсе. Берёт данные из ДВУХ источников —
+    seen_group_chats (отмечается на каждое текстовое сообщение, см.
+    note_group_chat_seen) и group_messages (старый буфер, только то, что реально дошло
+    до storage.add_group_message) — так группы, уже засветившиеся в group_messages до
+    этого исправления, не выпадают из списка, пока в них не придёт новое сообщение.
+    Название каждого чата берём из строки с САМЫМ СВЕЖИМ ts (через ROW_NUMBER, не через
+    MAX(chat_title) — MAX на строке сравнивает алфавитно, а не по времени, и при разных
+    title у одного chat_id в двух источниках отдал бы не тот, что реально последний)."""
     rows = _conn.execute(
         """
-        SELECT chat_id, MAX(chat_title), MAX(ts)
-        FROM group_messages
-        GROUP BY chat_id
-        ORDER BY MAX(ts) DESC
+        WITH combined AS (
+        SELECT chat_id, chat_title, last_seen_at AS ts FROM seen_group_chats
+        UNION ALL
+        SELECT chat_id, chat_title, ts FROM group_messages
+        ),
+        ranked AS (
+        SELECT chat_id, chat_title, ts,
+        ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY ts DESC) AS rn
+        FROM combined
+        )
+        SELECT chat_id, chat_title, ts FROM ranked WHERE rn = 1
+        ORDER BY ts DESC
         LIMIT ?
         """,
         (limit,),
