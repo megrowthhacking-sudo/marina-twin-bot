@@ -164,10 +164,10 @@ def _calendar_access_denied_reason(user, chat) -> str | None:
     было наоборот, см. комментарий у config.CALENDAR_VIEWER_USERNAMES):
     — владелица — как и раньше, ТОЛЬКО в личке с ботом;
     — все из config.CALENDAR_VIEWER_USERNAMES (см. _is_calendar_viewer) — НАОБОРОТ,
-    ТОЛЬКО в групповых чатах, где бот состоит вместе с ними (например те же рабочие
-    группы, где они получают задачи), а не в личке с ботом. Отдельного списка id
-    групп нет и не нужен — Telegram сам по себе не даст им вызвать команду там, где
-    их с ботом нет, так что любая группа, где оба состоят, и есть "разрешённый чат"."""
+    ТОЛЬКО в конкретных групповых чатах из config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS (не
+    в любой группе, где бот состоит вместе с ними — уточнено 01.10.2026, владелица
+    сначала просила именно так, но на деле нужны были строго определённые 3 рабочие
+    группы, а не любая), и не в личке с ботом."""
     is_owner = user is not None and config.OWNER_USER_ID is not None and user.id == config.OWNER_USER_ID
     if is_owner:
         if chat.type != "private":
@@ -175,6 +175,8 @@ def _calendar_access_denied_reason(user, chat) -> str | None:
         return None
     if chat.type == "private":
         return "Эта команда работает только в групповых чатах, где я есть."
+    if chat.id not in config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS:
+        return "Эта команда здесь не работает."
     if not _is_calendar_viewer(user):
         return "У тебя нет доступа к этой команде."
     return None
