@@ -3262,7 +3262,7 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
         "/calendar — события календаря по периодам (сегодня/завтра/неделя/месяц)\n"
         f"/meetm — все встречи подряд по датам на {_MEETM_HORIZON_DAYS} дней вперёд, "
         "с днём недели и месяцем, из календаря + ClickUp\n"
-        "/calendarclick — сразу проверить весь ClickUp на новые встречи и поставить их в календарь, не дожидаясь автоскана\n"
+        "/calendarclick — выбрать период (как у /calendar) и увидеть все встречи за него, подтянув из ClickUp то, чего ещё нет в календаре\n"
         "/cancelall — снять все висящие вопросы из групповых чатов, на которые ещё не ответила\n"
         "/stop — остановить рассылку задач в режиме правки, если нажала по ошибке"
     )
@@ -3324,10 +3324,12 @@ def build_application() -> Application:
     # встреч (календарь + ClickUp) на _MEETM_HORIZON_DAYS дней вперёд (см.
     # handle_meetm_command), по прямой просьбе владелицы 24.09.2026.
     app.add_handler(CommandHandler("meetm", handle_meetm_command))
-    # /calendarclick — on-demand вариант фонового job'а check_new_clickup_meetings_job:
-    # тот же скан ClickUp на новые встречи, но по команде владелицы, без ожидания
-    # интервала (см. handle_calendarclick_command).
+    # /calendarclick — только в личке, только владелице: кнопки периода (как у /calendar) +
+    # подтверждение/постановка ClickUp-встреч за период в календарь + живой список (см.
+    # handle_calendarclick_command / handle_calendarclick_view_callback), по прямой просьбе
+    # владелицы 01.10.2026.
     app.add_handler(CommandHandler("calendarclick", handle_calendarclick_command))
+    app.add_handler(CallbackQueryHandler(handle_calendarclick_view_callback, pattern=r"^ccview:"))
     # Персональные команды по сотрудникам: /lili /olga /sveta /ilya /nazgul /alex /ub /marina
     # /nikolay /nick — только в личке, только владелице (см. config.EMPLOYEE_COMMANDS /
     # _send_employee_report). Плюс для каждого — "weekly"-версия (например
