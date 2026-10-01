@@ -139,7 +139,7 @@ _TASK_SYSTEM_PROMPT_TEMPLATE = """Ты анализируешь задачу и�
 - Описание: {description}
 - Дедлайн (due_date), если задан: {due_date}
 - Дата создания задачи (created_date): {created_date}
-
+{weekday_hint_block}
 Правила:
 - Если задача явно НЕ про встречу/созвон/звонок (обычная рабочая задача, документ, напоминание \
 без участия других людей в реальном времени) — верни {{"is_meeting": false}}.
@@ -170,6 +170,7 @@ def extract_meeting_from_task(
     due_date_iso: str | None = None,
     created_iso: str | None = None,
     tz_name: str | None = None,
+    weekday_hint_date_iso: str | None = None,
 ) -> dict | None:
     """Возвращает {"title", "start", "end", "location", "time_is_guessed"}, если задача
     ClickUp похожа на встречу/созвон/звонок, иначе None. В отличие от extract_meeting
@@ -177,10 +178,28 @@ def extract_meeting_from_task(
     времени в тексте — при нехватке данных время угадывается (см. модульный докстринг
     выше) и результат помечается "time_is_guessed": true, вместо молчаливого None.
     Используется clickup_meeting_watch.py для автоматической (без подтверждения)
-    постановки события в Google Calendar по любой новой задаче ClickUp workspace."""
+    постановки события в Google Calendar по любой новой задаче ClickUp workspace.
+
+    weekday_hint_date_iso (добавлено 01.10.2026) — календарная дата встречи для карточек
+    доски WEEKLY TASKS: там статус карточки — день недели (например «пятница»), а не
+    due_date, время написано прямо в названии, а due_date в ClickUp не заполнен (см.
+    clickup_meeting_watch.py::_collect_weekly_board_candidates). Если параметр передан,
+    он используется как дата встречи ВМЕСТО due_date_iso/created_iso — и в подсказке для
+    Claude, и в запасном расчёте даты, когда Claude не вернул start/end."""
     tz_name = tz_name or config.MARINATWIN_TIMEZONE
     tz = ZoneInfo(tz_name)
     now = datetime.now(tz)
+    if weekday_hint_date_iso:
+        weekday_hint_block = (
+            "\nВАЖНО: это карточка с доски WEEKLY TASKS — её статус в ClickUp это день недели, "
+            "а не срок. Датой встречи считай "
+            f"{weekday_hint_date_iso[:10]} (а НЕ due_date и НЕ created_date). "
+            "Собери \"start\" и \"end\" из этой даты и явного времени из текста (например "
+            "\"11:00\" в названии), если оно есть; если времени в тексте нет — используй эту "
+            "дату, время 12:00 и поставь \"time_is_guessed\": true.\n"
+        )
+    else:
+        weekday_hint_block = ""
     system_prompt = _TASK_SYSTEM_PROMPT_TEMPLATE.format(
         today=now.strftime("%Y-%m-%d %H:%M"),
         weekday=_WEEKDAY_NAMES[now.weekday()],
@@ -189,6 +208,7 @@ def extract_meeting_from_task(
         description=description or "(без описания)",
         due_date=due_date_iso or "не задан",
         created_date=created_iso or "неизвестна",
+        weekday_hint_block=weekday_hint_block,
     )
 
     response = client.messages.create(
@@ -228,7 +248,13 @@ def extract_meeting_from_task(
     # что-то вернуть, а не молчать).
     if not start:
         fallback_dt = None
-        if due_date_iso:
+        if weekday_hint_date_iso:
+            try:
+                hint_dt = datetime.fromisoformat(weekday_hint_date_iso)
+                fallback_dt = hint_dt.replace(hour=12, minute=0, second=0, microsecond=0)
+            except ValueError:
+                fallback_dt = None
+        if fallback_dt is None and due_date_iso:
             try:
                 fallback_dt = datetime.fromisoformat(due_date_iso)
             except ValueError:

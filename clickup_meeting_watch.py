@@ -19,7 +19,7 @@ check_new_clickup_meetings_job регистрируется в bot.py::build_app
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram.ext import ContextTypes
@@ -58,6 +58,66 @@ async def _notify_owner(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         logger.exception("Не удалось отправить пост-фактум уведомление о ClickUp-встрече")
 
 
+def _collect_weekly_board_candidates(now: datetime) -> tuple[list[dict], dict[str, date]]:
+    """Третий источник кандидатов во встречи (добавлен 01.10.2026): доска WEEKLY TASKS
+    (config.CLICKUP_LIST_WEEKLY), просканированная по СТАТУСУ-ДНЮ НЕДЕЛИ.
+
+    Зачем это нужно. Жалоба владелицы «0 встреч в календаре»: большинство её
+    повторяющихся встреч живёт карточками именно на доске WEEKLY TASKS, где (1) статус
+    карточки — название дня недели (например «пятница»), а не due_date, (2) время
+    написано прямо в названии карточки (например «11:00 Тетра зум») и (3) поле due_date
+    в ClickUp вообще не заполнено. Два прежних запроса (по date_created и по due_date)
+    таких карточек принципиально не видят — отсюда «0 встреч».
+
+    Почему ровно 7 дней. Доска — это один полный недельный цикл: каждый из семи
+    статусов-дней встречается ровно один раз, поэтому, пройдя дни от сегодняшнего и
+    дальше на 7 дней вперёд, мы покрываем всю доску и каждой карточке однозначно
+    сопоставляем БЛИЖАЙШУЮ календарную дату её дня недели (сегодняшний статус — на
+    сегодня, «завтрашний» — на завтра и т.д.). Это же окно совпадает с окном очистки
+    дедупа в storage.cleanup_old_seen_clickup_meeting_tasks (7 суток): запись о том, что
+    карточка уже разобрана, живёт неделю и затем удаляется — как раз к моменту, когда
+    доска делает полный круг и та же карточка снова становится актуальной на следующей
+    неделе, поэтому повторяющаяся встреча ставится в календарь заново каждую неделю, а
+    в течение одной недели не дублируется.
+
+    Фильтрация по ответственной (config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID) выполняется на
+    стороне ClickUp API. Возвращает (список задач, {task_id: календарная дата дня
+    недели}); если config.CLICKUP_WEEKLY_ENABLED выключен — пустые список и словарь.
+    Ошибка запроса по одному дню только логируется и не мешает остальным дням."""
+    if not config.CLICKUP_WEEKLY_ENABLED:
+        return [], {}
+
+    weekday_statuses = [
+        config.CLICKUP_WEEKLY_STATUS_COMMANDS[key]["status"]
+        for key in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    ]
+
+    tasks: list[dict] = []
+    target_date_by_task_id: dict[str, date] = {}
+    today = now.date()
+    for offset in range(7):
+        target_date = today + timedelta(days=offset)
+        status = weekday_statuses[target_date.weekday()]
+        try:
+            day_tasks = clickup_client.get_open_tasks(
+                config.CLICKUP_LIST_WEEKLY,
+                assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
+                statuses=[status],
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось получить карточки WEEKLY TASKS со статусом «%s» для сканирования встреч", status,
+            )
+            continue
+        for task in day_tasks:
+            task_id = task.get("id")
+            if not task_id or task_id in target_date_by_task_id:
+                continue
+            target_date_by_task_id[task_id] = target_date
+            tasks.append(task)
+    return tasks, target_date_by_task_id
+
+
 def _format_notification(meeting: dict, task_name: str, task_url: str | None, tz: ZoneInfo) -> str:
     start_dt = datetime.fromisoformat(meeting["start"]).astimezone(tz)
     when = start_dt.strftime("%d.%m %H:%M")
@@ -86,11 +146,15 @@ async def scan_and_schedule_clickup_meetings(context: ContextTypes.DEFAULT_TYPE)
     config.CLICKUP_MEETING_WATCH_SPACE_IDS ("РАСПИСАНИЕ" и "ATLAS" — не весь workspace, см.
     докстринг модуля выше) на предмет задач, НАЗНАЧЕННЫХ НА ВЛАДЕЛИЦУ
     (config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID — серверная фильтрация ClickUp API, та же,
-    что и у команд по сотрудникам), ДВУМЯ независимыми запросами: (1) созданные за
-    последние сутки (ловит вновь заведённые задачи быстро) и (2) с due_date в ближайшие
+    что и у команд по сотрудникам), ТРЕМЯ независимыми источниками кандидатов: (1) созданные
+    за последние сутки (ловит вновь заведённые задачи быстро), (2) с due_date в ближайшие
     config.CLICKUP_MEETING_DUE_LOOKAHEAD_DAYS дней (ловит задачи, заведённые заранее кем-то
     другим, но с приближающимся сроком — см. докстринг модуля выше про инцидент с Clear
-    Junction). Результаты объединяются по id задачи. Для каждой ещё не виденной задачи (см.
+    Junction) и (3) добавлено 01.10.2026 — скан доски WEEKLY TASKS по статусу-дню недели
+    (см. _collect_weekly_board_candidates): повторяющиеся встречи там заведены карточками
+    со статусом «пятница» и т.п., временем прямо в названии и БЕЗ due_date, поэтому
+    первые два запроса их не видят (жалоба «0 встреч в календаре»). Результаты
+    объединяются по id задачи. Для каждой ещё не виденной задачи (см.
     storage.has_seen_clickup_meeting_task) прогоняет её полный текст (название + описание)
     через meeting_extractor.extract_meeting_from_task. Если задача похожа на
     встречу/созвон/звонок — сразу создаёт событие в Google Calendar (без подтверждения) и
@@ -126,12 +190,17 @@ async def scan_and_schedule_clickup_meetings(context: ContextTypes.DEFAULT_TYPE)
         logger.exception("Не удалось получить задачи ClickUp с приближающимся due_date для сканирования встреч")
         due_soon_tasks = []
 
-    if not new_tasks and not due_soon_tasks:
+    weekly_board_tasks, weekly_target_date_by_task_id = _collect_weekly_board_candidates(now)
+
+    if not new_tasks and not due_soon_tasks and not weekly_board_tasks:
         return stats
 
-    due_soon_ids = {task.get("id") for task in due_soon_tasks if task.get("id")}
+    # Для due_soon и карточек WEEKLY TASKS проверка устаревшего date_created не нужна:
+    # они могли быть заведены давно, но всё равно актуальны на ближайшие дни.
+    skip_staleness_check_ids = {task.get("id") for task in due_soon_tasks if task.get("id")}
+    skip_staleness_check_ids |= {task.get("id") for task in weekly_board_tasks if task.get("id")}
     tasks_by_id: dict[str, dict] = {}
-    for task in new_tasks + due_soon_tasks:
+    for task in new_tasks + due_soon_tasks + weekly_board_tasks:
         task_id = task.get("id")
         if task_id:
             tasks_by_id.setdefault(task_id, task)
@@ -141,7 +210,7 @@ async def scan_and_schedule_clickup_meetings(context: ContextTypes.DEFAULT_TYPE)
         task_id = task.get("id")
         if not task_id:
             continue
-        if task_id not in due_soon_ids:
+        if task_id not in skip_staleness_check_ids:
             created = task.get("date_created") or 0
             if created and created < cutoff.timestamp():
                 continue
@@ -163,6 +232,9 @@ async def scan_and_schedule_clickup_meetings(context: ContextTypes.DEFAULT_TYPE)
         due_iso = _iso_or_none(task.get("due_date"), tz)
         created_iso = _iso_or_none(task.get("date_created"), tz)
 
+        weekday_target_date = weekly_target_date_by_task_id.get(task_id)
+        weekday_hint_date_iso = f"{weekday_target_date.isoformat()}T00:00:00" if weekday_target_date else None
+
         try:
             meeting = meeting_extractor.extract_meeting_from_task(
                 title=task.get("name") or full_task.get("name") or "(без названия)",
@@ -170,6 +242,7 @@ async def scan_and_schedule_clickup_meetings(context: ContextTypes.DEFAULT_TYPE)
                 due_date_iso=due_iso,
                 created_iso=created_iso,
                 tz_name=config.MARINATWIN_TIMEZONE,
+                weekday_hint_date_iso=weekday_hint_date_iso,
             )
         except Exception:
             logger.exception("Ошибка при разборе задачи ClickUp %s на предмет встречи", task_id)
@@ -212,8 +285,10 @@ async def scan_and_schedule_clickup_meetings(context: ContextTypes.DEFAULT_TYPE)
 
 async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Фоновый job (раз в config.CLICKUP_MEETING_SCAN_INTERVAL_MINUTES): проверяет
-    конфигурацию и делегирует скан в scan_and_schedule_clickup_meetings. Статистика
-    не нужна — это фон, обратной связи нет."""
+    конфигурацию и делегирует скан в scan_and_schedule_clickup_meetings (у которого с
+    01.10.2026 есть третий источник кандидатов — скан доски WEEKLY TASKS по статусу-дню
+    недели, см. _collect_weekly_board_candidates). Статистика не нужна — это фон,
+    обратной связи нет."""
     if not (config.CLICKUP_TEAM_WIDE_ENABLED and config.GOOGLE_CALENDAR_ENABLED and config.OWNER_USER_ID):
         return
     await scan_and_schedule_clickup_meetings(context)
