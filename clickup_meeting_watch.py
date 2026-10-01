@@ -80,14 +80,19 @@ def _collect_weekly_board_candidates(now: datetime) -> tuple[list[dict], dict[st
     неделе, поэтому повторяющаяся встреча ставится в календарь заново каждую неделю, а
     в течение одной недели не дублируется.
 
-    Без фильтра по ответственной (изменено 01.10.2026, по факту жалобы владелицы — её
-    собственные карточки-встречи на этой доске вида «11:00 собес юрист BS» почти всегда
-    БЕЗ назначенного исполнителя в ClickUp (assignees: []), поэтому фильтр
-    assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID на стороне ClickUp API их
-    отсеивал целиком — ни автосканер, ни /calendarclick их не видели). Семантическая
-    проверка "это реально похоже на встречу" остаётся на meeting_extractor.extract_meeting_from_task
-    ниже — он и отсеивает обычные задачи других сотрудников, которые просто тоже лежат в
-    статусах-днях недели этой доски, но не являются встречами.
+    Фильтр по ответственной — клиентский, не через ClickUp API (изменено 01.10.2026,
+    дважды). Сначала фильтр assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID вообще
+    убрали на стороне ClickUp API-запроса: собственные карточки-встречи владелицы на этой
+    доске вида «11:00 собес юрист BS» почти всегда БЕЗ назначенного исполнителя в ClickUp
+    (assignees: []), и такой фильтр их отсеивал целиком. Но без какого-либо фильтра стали
+    проскакивать обычные задачи ДРУГИХ сотрудников, которые просто тоже лежат в
+    статусах-днях недели этой доски (это общий kanban этой доски, не только её личное
+    расписание) — например задача, назначенная только на Юрия, иногда звучит достаточно
+    похоже на созвон, чтобы meeting_extractor её пропустил, хотя это не встреча владелицы.
+    Поэтому ниже оставляем карточку кандидатом, только если у неё НЕТ назначенных (так
+    устроены её собственные карточки-встречи) ИЛИ среди назначенных есть она сама
+    (сравнение имени из ClickUp через config.CLICKUP_ASSIGNEE_MAP) — карточки, назначенные
+    только на кого-то ещё, отбрасываются сразу, до вызова meeting_extractor.
     Возвращает (список задач, {task_id: календарная дата дня недели}); если
     config.CLICKUP_WEEKLY_ENABLED выключен — пустые список и словарь. Ошибка запроса по
     одному дню только логируется и не мешает остальным дням."""
@@ -118,6 +123,12 @@ def _collect_weekly_board_candidates(now: datetime) -> tuple[list[dict], dict[st
         for task in day_tasks:
             task_id = task.get("id")
             if not task_id or task_id in target_date_by_task_id:
+                continue
+            assignees = task.get("assignees") or []
+            if assignees and not any(
+                config.CLICKUP_ASSIGNEE_MAP.get(name.lower()) == config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID
+                for name in assignees
+            ):
                 continue
             target_date_by_task_id[task_id] = target_date
             tasks.append(task)
