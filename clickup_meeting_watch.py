@@ -134,7 +134,10 @@ def _format_notification(meeting: dict, task_name: str, task_url: str | None, tz
     return "\n".join(lines)
 
 
-async def scan_and_schedule_clickup_meetings(context: ContextTypes.DEFAULT_TYPE) -> dict:
+async def scan_and_schedule_clickup_meetings(
+    context: ContextTypes.DEFAULT_TYPE,
+    space_ids: list[str] | None = config.CLICKUP_MEETING_WATCH_SPACE_IDS,
+) -> dict:
     """Общая логика скана для фонового job'а (check_new_clickup_meetings_job) и команды
     /calendarclick (bot.py::handle_calendarclick_command). Возвращает статистику:
     {"scanned": int, "created": [{"title", "when", "task_name"}, ...], "errors": int} —
@@ -171,7 +174,7 @@ async def scan_and_schedule_clickup_meetings(context: ContextTypes.DEFAULT_TYPE)
         new_tasks = clickup_client.get_open_tasks_team_wide(
             assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
             date_created_gt_ms=cutoff_ms,
-            space_ids=config.CLICKUP_MEETING_WATCH_SPACE_IDS,
+            space_ids=space_ids,
         )
     except Exception:
         logger.exception("Не удалось получить новые задачи ClickUp для сканирования встреч")
@@ -184,7 +187,7 @@ async def scan_and_schedule_clickup_meetings(context: ContextTypes.DEFAULT_TYPE)
             assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
             due_date_gt_ms=due_from_ms,
             due_date_lt_ms=due_to_ms,
-            space_ids=config.CLICKUP_MEETING_WATCH_SPACE_IDS,
+            space_ids=space_ids,
         )
     except Exception:
         logger.exception("Не удалось получить задачи ClickUp с приближающимся due_date для сканирования встреч")
