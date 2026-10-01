@@ -80,10 +80,17 @@ def _collect_weekly_board_candidates(now: datetime) -> tuple[list[dict], dict[st
     неделе, поэтому повторяющаяся встреча ставится в календарь заново каждую неделю, а
     в течение одной недели не дублируется.
 
-    Фильтрация по ответственной (config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID) выполняется на
-    стороне ClickUp API. Возвращает (список задач, {task_id: календарная дата дня
-    недели}); если config.CLICKUP_WEEKLY_ENABLED выключен — пустые список и словарь.
-    Ошибка запроса по одному дню только логируется и не мешает остальным дням."""
+    Без фильтра по ответственной (изменено 01.10.2026, по факту жалобы владелицы — её
+    собственные карточки-встречи на этой доске вида «11:00 собес юрист BS» почти всегда
+    БЕЗ назначенного исполнителя в ClickUp (assignees: []), поэтому фильтр
+    assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID на стороне ClickUp API их
+    отсеивал целиком — ни автосканер, ни /calendarclick их не видели). Семантическая
+    проверка "это реально похоже на встречу" остаётся на meeting_extractor.extract_meeting_from_task
+    ниже — он и отсеивает обычные задачи других сотрудников, которые просто тоже лежат в
+    статусах-днях недели этой доски, но не являются встречами.
+    Возвращает (список задач, {task_id: календарная дата дня недели}); если
+    config.CLICKUP_WEEKLY_ENABLED выключен — пустые список и словарь. Ошибка запроса по
+    одному дню только логируется и не мешает остальным дням."""
     if not config.CLICKUP_WEEKLY_ENABLED:
         return [], {}
 
@@ -101,7 +108,6 @@ def _collect_weekly_board_candidates(now: datetime) -> tuple[list[dict], dict[st
         try:
             day_tasks = clickup_client.get_open_tasks(
                 config.CLICKUP_LIST_WEEKLY,
-                assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
                 statuses=[status],
             )
         except Exception:
