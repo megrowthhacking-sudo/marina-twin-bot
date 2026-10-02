@@ -138,12 +138,12 @@ def _collect_weekly_board_candidates(now: datetime) -> tuple[list[dict], dict[st
 def _collect_period_meeting_candidates(
     start: datetime, end: datetime, now: datetime,
 ) -> tuple[list[dict], dict[str, date]]:
-    """Общий сбор кандидатов-задач ClickUp за период [start, end) — вынесено 01.10.2026 из
-    ensure_period_clickup_meetings_in_calendar в отдельную функцию, чтобы тот же сбор
-    использовался и в reconcile_clickup_titles_in_calendar (см. ниже — команда
-    /calendarclickup, по прямой просьбе владелицы: сверить её встречи ClickUp с уже
-    стоящими в календаре и переименовать те, что названы по-другому). Источники (см.
-    были в докстринге ensure_period_clickup_meetings_in_calendar, не повторяем здесь):
+    """Общий сбор кандидатов-задач ClickUp за период [start, end) — используется
+    reconcile_clickup_titles_in_calendar (см. ниже — единая команда /calendarclickup, по
+    прямой просьбе владелицы: сверить её встречи ClickUp с уже стоящими в календаре,
+    переименовать те, что названы по-другому, доставить отсутствующие и убрать точные
+    дубли; до 02.10.2026 было две отдельные команды — /calendarclick и /calendarclickup —
+    объединены в одну по прямой просьбе владелицы, слишком похожи и путали). Источники:
     (1) due_date внутри периода, (2) доска WEEKLY TASKS по дню недели в периоде,
     (3) любая задача workspace с явной датой в названии, попадающей в период. Возвращает
     (объединённый по id список сырых задач ClickUp, {task_id: дата дня недели с доски
@@ -209,8 +209,13 @@ async def scan_and_schedule_clickup_meetings(
     context: ContextTypes.DEFAULT_TYPE,
     space_ids: list[str] | None = config.CLICKUP_MEETING_WATCH_SPACE_IDS,
 ) -> dict:
-    """Общая логика скана для фонового job'а (check_new_clickup_meetings_job) и команды
-    /calendarclick (bot.py::handle_calendarclick_command). Возвращает статистику:
+    """Общая логика скана для фонового job'а (check_new_clickup_meetings_job) — раньше
+    её же вызывала и команда /calendarclick, пока та сама сразу сканировала только
+    новые задачи; с 01.10.2026 /calendarclick переключилась на
+    ensure_period_clickup_meetings_in_calendar (полный обзор периода), а с 02.10.2026
+    обе отдельные команды /calendarclick и /calendarclickup объединены в одну — см.
+    reconcile_clickup_titles_in_calendar. Эта функция теперь используется только фоном.
+    Возвращает статистику:
     {"scanned": int, "created": [{"title", "when", "task_name"}, ...], "errors": int} —
     scanned: сколько ещё не виденных задач разобрано, created: успешно поставленные
     встречи (when — вида "01.10 14:30"), errors: сколько задач не удалось обработать.
@@ -364,7 +369,7 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
     недели, см. _collect_weekly_board_candidates). Статистика не нужна — это фон,
     обратной связи нет.
     space_ids=None (01.10.2026, по прямой просьбе владелицы) — скан, как и у
-    /calendarclick, идёт по ВСЕМУ workspace, а не только по config.CLICKUP_MEETING_WATCH_SPACE_IDS
+    /calendarclickup, идёт по ВСЕМУ workspace, а не только по config.CLICKUP_MEETING_WATCH_SPACE_IDS
     (РАСПИСАНИЕ + ATLAS). Раньше фон был уже сужен специально, чтобы не захламлять
     календарь встречами коллег (24.09.2026) — это сознательно отменено по новой просьбе
     владелицы: теперь любая похожая на встречу задача, назначенная на неё, из любого
@@ -374,115 +379,15 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
     await scan_and_schedule_clickup_meetings(context, space_ids=None)
 
 
-async def ensure_period_clickup_meetings_in_calendar(start: datetime, end: datetime) -> dict:
-    """Часть команды /calendarclick с кнопками периода (добавлено 01.10.2026, по просьбе
-    владелицы — раньше /calendarclick показывал только НОВЫЕ, ещё не виденные задачи, из-за
-    чего не показывал "все встречи"; см. bot.py::handle_calendarclick_view_callback и
-    bot.py::_calendar_period_bounds). В отличие от scan_and_schedule_clickup_meetings (там
-    задачи, которые storage.has_seen_clickup_meeting_task уже видел, пропускаются), здесь
-    проверка "уже видели" не используется вообще — цель именно показать ВСЁ, что ClickUp
-    считает встречей в выбранном периоде, а не только то, что появилось с прошлого скана.
-    Безопасно звать повторно для одного и того же периода любое число раз: для каждой
-    распознанной встречи зовём calendar_client.create_event, а он сам ищет в календаре
-    существующее событие с тем же названием в районе того же времени (окно ±30 минут, см.
-    calendar_client._find_duplicate_event) и, если находит, НЕ создаёт новое — просто
-    подтверждает, что оно уже есть. Новых дублей в календаре поэтому не возникает.
-    Источники кандидатов — по всему workspace (space_ids=None, по той же более ранней
-    просьбе владелицы, что и у /calendarclick и у фонового job'а):
-    (1) clickup_client.get_open_tasks_team_wide с due_date внутри [start, end);
-    (2) доска WEEKLY TASKS (_collect_weekly_board_candidates) — она устроена как "ближайшие
-    7 дней от сегодня", поэтому реально даёт кандидатов только если выбранный период
-    пересекается с этим окном (для «Сегодня»/«Завтра»/«Текущая неделя» — как правило
-    полностью; для «Следующая неделя»/«Текущий месяц» эта доска почти ничего не добавляет —
-    у неё просто нет данных о датах дальше недели вперёд, карточка на доске всего одна на
-    каждый день недели, не по одной на каждую будущую неделю);
-    (3) добавлено 01.10.2026, по просьбе владелицы — ВСЕ открытые задачи workspace,
-    назначенные на владелицу, БЕЗ фильтра по due_date/дате создания, клиентски
-    отфильтрованные по явной дате в названии (meeting_extractor.parse_explicit_date_time,
-    без вызова Claude — дёшево), попадающей в [start, end). Это снимает ограничение
-    источника (2): теперь сотрудники пишут дату/время прямо в названии задачи (формат
-    "дата, время, компания, тип, тема" — договорённость от 01.10.2026), due_date в ClickUp
-    при этом может быть не заполнен вовсе, поэтому такие задачи не попадали бы ни в (1),
-    ни в (2) для дальних периодов («Следующая неделя»/«Текущий месяц») — здесь ищем их
-    напрямую по тексту названия, независимо от того, насколько далеко вперёд стоит дата.
-    Возвращает {"scanned": int, "created_or_confirmed": int, "errors": int} — только для
-    лога; сама команда после вызова показывает владелице финальный список обычным
-    calendar_client.list_events, а не то, что вернула эта функция, — так в списке видны и
-    уже существовавшие ручные встречи, и только что подтверждённые из ClickUp, одним
-    вызовом."""
-    stats: dict = {"scanned": 0, "created_or_confirmed": 0, "errors": 0}
-    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
-    now = datetime.now(tz)
-    tasks, weekly_target_date_by_task_id = _collect_period_meeting_candidates(start, end, now)
-    for task in tasks:
-        task_id = task.get("id")
-        if not task_id:
-            continue
-        stats["scanned"] += 1
-        try:
-            full_task = clickup_client.get_task(task_id)
-        except Exception:
-            logger.exception("Не удалось прочитать задачу ClickUp %s для /calendarclick за период", task_id)
-            stats["errors"] += 1
-            continue
-        if not full_task:
-            continue
-        description = full_task.get("description") or ""
-        due_iso = _iso_or_none(task.get("due_date"), tz)
-        created_iso = _iso_or_none(task.get("date_created"), tz)
-        weekday_target_date = weekly_target_date_by_task_id.get(task_id)
-        weekday_hint_date_iso = f"{weekday_target_date.isoformat()}T00:00:00" if weekday_target_date else None
-        try:
-            meeting = meeting_extractor.extract_meeting_from_task(
-                title=task.get("name") or full_task.get("name") or "(без названия)",
-                description=description,
-                due_date_iso=due_iso,
-                created_iso=created_iso,
-                tz_name=config.MARINATWIN_TIMEZONE,
-                weekday_hint_date_iso=weekday_hint_date_iso,
-            )
-        except Exception:
-            logger.exception("Ошибка разбора задачи ClickUp %s на предмет встречи (/calendarclick период)", task_id)
-            stats["errors"] += 1
-            continue
-        if not meeting:
-            continue
-        try:
-            meeting_start = datetime.fromisoformat(meeting["start"]).astimezone(tz)
-        except (ValueError, KeyError, TypeError):
-            continue
-        if not (start <= meeting_start < end):
-            continue
-        try:
-            calendar_client.create_event(
-                meeting["title"],
-                meeting["start"],
-                meeting["end"],
-                location=meeting.get("location") or None,
-                description=f"Авто-поставлено из ClickUp-задачи: {task.get('url') or task_id}",
-            )
-        except Exception:
-            logger.exception(
-                "Не удалось создать/подтвердить событие календаря для задачи ClickUp %s («%s»)",
-                task_id, task.get("name"),
-            )
-            stats["errors"] += 1
-            continue
-        storage.mark_seen_clickup_meeting_task(task_id)
-        stats["created_or_confirmed"] += 1
-    return stats
-
-
-async def reconcile_clickup_titles_in_calendar(horizon_days: int = 7) -> dict:
-    """/calendarclickup (добавлено 01.10.2026, по прямой просьбе владелицы): сверяет её
-    встречи ClickUp за ближайшие horizon_days дней (владелица попросила неделю — см.
-    bot.py::handle_calendarclickup_command) с личным календарём (m@altyn.one) и, если
-    встреча УЖЕ стоит в календаре на то же время, но названа по-другому — ПЕРЕПИСЫВАЕТ
-    название события на то, как оно написано в ClickUp (calendar_client.update_event).
-    Если встречи в календаре в это время вовсе нет — создаёт её (как
-    ensure_period_clickup_meetings_in_calendar//calendarclick, по прямой просьбе
-    владелицы — эта команда одновременно и достраивает отсутствующие встречи, и чистит
-    разночтения в названиях уже существующих).
+async def reconcile_clickup_titles_in_calendar(start: datetime, end: datetime) -> dict:
+    """Единая команда /calendarclickup (добавлено 01.10.2026, по прямой просьбе
+    владелицы; 02.10.2026 в неё же объединена бывшая /calendarclick — две команды были
+    слишком похожи и путали): сверяет её встречи ClickUp за период [start, end) с личным
+    календарём (m@altyn.one). Период выбирается кнопками в bot.py (см.
+    bot.py::_calendar_period_bounds), start/end передаются явно. Если встреча УЖЕ стоит в
+    календаре на то же время, но названа по-другому — ПЕРЕПИСЫВАЕТ название события на то,
+    как оно написано в ClickUp (calendar_client.update_event). Если встречи в календаре в
+    это время вовсе нет — создаёт её.
 
     В отличие от calendar_client.create_event (дедуп по СОВПАДАЮЩЕМУ названию в окне
     ±30 минут — см. calendar_client._find_duplicate_event) здесь сопоставление идёт по
@@ -490,31 +395,26 @@ async def reconcile_clickup_titles_in_calendar(horizon_days: int = 7) -> dict:
     встреча, и привела бы к дублю вместо переименования. Если в окне ±30 минут вокруг
     времени встречи найдено РОВНО ОДНО существующее событие — либо подтверждаем совпадение
     (названия совпали, ничего не делаем), либо переименовываем его. Если не найдено ни
-    одного — создаём новое событие, как ensure_period_clickup_meetings_in_calendar. Если
-    найдено НЕСКОЛЬКО событий в одном окне — непонятно, какое из них "то самое" (и
-    переименовывать наугад — опасно), поэтому НЕ трогаем ни одно из существующих, а
-    добавляем в это же время ЕЩЁ ОДНО новое событие с названием из ClickUp (исправлено
-    01.10.2026, по прямой просьбе владелицы — раньше такие задачи просто пропускались и
-    могли вообще не попасть в календарь); такая задача попадает сразу и в
-    stats["created"], и в stats["ambiguous"] — владелица видит в отчёте, что встреча
-    поставлена, но рядом есть другие события того же времени, которые стоит проверить
-    вручную (возможно, старые дубли пора убрать).
+    одного — создаём новое событие. Если найдено НЕСКОЛЬКО событий в одном окне —
+    непонятно, какое из них "то самое" (и переименовывать наугад — опасно), поэтому НЕ
+    трогаем ни одно из существующих, а добавляем в это же время ЕЩЁ ОДНО новое событие с
+    названием из ClickUp (исправлено 01.10.2026, по прямой просьбе владелицы — раньше
+    такие задачи просто пропускались и могли вообще не попасть в календарь); такая задача
+    попадает сразу и в stats["created"], и в stats["ambiguous"] — владелица видит в
+    отчёте, что встреча поставлена, но рядом есть другие события того же времени, которые
+    стоит проверить вручную (возможно, старые дубли пора убрать).
 
-    Источники кандидатов — те же три, что и у ensure_period_clickup_meetings_in_calendar
-    (см. _collect_period_meeting_candidates): due_date в периоде, доска WEEKLY TASKS,
-    явная дата в названии любой задачи workspace.
+    Источники кандидатов — три (см. _collect_period_meeting_candidates): due_date в
+    периоде, доска WEEKLY TASKS, явная дата в названии любой задачи workspace.
 
     Возвращает {"scanned": int, "renamed": [{"old_title", "new_title", "when"}, ...],
     "created": [{"title", "when"}, ...], "unchanged": int, "ambiguous": [{"title", "when",
-    "count"}, ...], "errors": int} — используется bot.py::handle_calendarclickup_command
-    для итогового отчёта владелице."""
+    "count"}, ...], "errors": int} — используется bot.py для итогового отчёта владелице."""
     stats: dict = {
         "scanned": 0, "renamed": [], "created": [], "unchanged": 0, "ambiguous": [], "errors": 0,
     }
     tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
     now = datetime.now(tz)
-    start = now
-    end = now + timedelta(days=horizon_days)
     tasks, weekly_target_date_by_task_id = _collect_period_meeting_candidates(start, end, now)
 
     for task in tasks:
@@ -636,12 +536,14 @@ async def reconcile_clickup_titles_in_calendar(horizon_days: int = 7) -> dict:
     return stats
 
 
-async def dedupe_calendar_events(horizon_days: int = 7) -> dict:
-    """Ищет в личном календаре (config.GOOGLE_CALENDAR_ID) ТОЧНЫЕ дубли за ближайшие
-    horizon_days дней и удаляет лишние копии, оставляя одну (добавлено 01.10.2026, по
-    прямой просьбе владелицы, сразу следом за /calendarclickup — вызывается из того же
-    bot.py::handle_calendarclickup_command, после reconcile_clickup_titles_in_calendar,
-    и попадает в тот же отчёт).
+async def dedupe_calendar_events(start: datetime, end: datetime) -> dict:
+    """Ищет в личном календаре (config.GOOGLE_CALENDAR_ID) ТОЧНЫЕ дубли за период
+    [start, end) и удаляет лишние копии, оставляя одну (добавлено 01.10.2026, по
+    прямой просьбе владелицы). Период выбирается кнопками в /calendarclickup (см.
+    bot.py) — start/end передаются явно, а не считаются здесь от «сейчас». Вызывается
+    из bot.py сразу после reconcile_clickup_titles_in_calendar и попадает в тот же
+    отчёт; с 02.10.2026 это единая команда /calendarclickup (бывшие /calendarclick и
+    /calendarclickup объединены).
 
     "Точный дубль" — намеренно строгое определение (по прямой просьбе владелицы, чтобы
     не снести по ошибке две разные встречи, которые просто совпали по времени): ОДНО И
@@ -651,9 +553,9 @@ async def dedupe_calendar_events(horizon_days: int = 7) -> dict:
     и не трогается — это разные, хоть и совпадающие по времени, встречи; удалять их
     "на всякий случай" владелица явно не просила.
 
-    Диапазон — та же неделя, что и у /calendarclickup (по прямой просьбе владелицы), а
-    не весь календарь: один вызов calendar_client.list_events за [сегодня,
-    сегодня+horizon_days), события группируются по (название.strip().lower(), start,
+    Диапазон — тот же период, что выбран в /calendarclickup (по прямой просьбе
+    владелицы), а не весь календарь: один вызов calendar_client.list_events за
+    [start, end), события группируются по (название.strip().lower(), start,
     end). all_day события не участвуют (та же оговорка, что и в
     reconcile_clickup_titles_in_calendar — там действительно сравнивались только
     некруглосуточные события). Внутри группы из 2+ одинаковых событий первое (в
@@ -669,9 +571,6 @@ async def dedupe_calendar_events(horizon_days: int = 7) -> dict:
     логируется и не мешает обработке остальных."""
     stats: dict = {"scanned": 0, "deleted": [], "errors": 0}
     tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
-    now = datetime.now(tz)
-    start = now
-    end = now + timedelta(days=horizon_days)
 
     try:
         events = calendar_client.list_events(start.isoformat(), end.isoformat())
