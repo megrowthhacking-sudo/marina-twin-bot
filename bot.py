@@ -1599,7 +1599,11 @@ async def handle_calendar_command(update: Update, context: ContextTypes.DEFAULT_
     просмотр: предлагает выбрать период кнопками (Сегодня/Завтра/Текущая неделя/
     Следующая неделя/Текущий месяц), см. handle_calendar_view_callback — там и
     происходит реальный запрос к Google Calendar по нажатию кнопки. Ставить/менять
-    события всё так же может только владелица — остальные команды это не трогает."""
+    события всё так же может только владелица — остальные команды это не трогает.
+    Для владелицы в личке при включённом ClickUp (config.CLICKUP_TEAM_WIDE_ENABLED)
+    по нажатию кнопки перед показом списка автоматически выполняется сверка
+    ClickUp-встреч с календарём и зачистка точных дублей (бывшая /calendarclickup,
+    объединена с /calendar по прямой просьбе владелицы)."""
     _maybe_capture_calendar_viewer_telegram_id(update)
     denial = _calendar_access_denied_reason(update.effective_user, update.effective_chat)
     if denial:
@@ -1621,7 +1625,15 @@ async def handle_calendar_view_callback(update: Update, context: ContextTypes.DE
     очень много (см. TELEGRAM_MESSAGE_LIMIT) — это команда просмотра одним
     сообщением, а не постраничный отчёт. Доступ — тот же, что у /calendar (см.
     _calendar_access_denied_reason; добавлено/исправлено 01.10.2026, по прямой просьбе
-    владелицы)."""
+    владелицы).
+
+    Если нажала владелица в личке и включён ClickUp (config.CLICKUP_TEAM_WIDE_ENABLED),
+    перед показом списка для выбранного периода [start, end) по порядку:
+    1) clickup_meeting_watch.reconcile_clickup_titles_in_calendar(start, end) — сверяет
+    ClickUp-встречи с календарём: переписывает название уже стоящего события, ставит
+    отсутствующие; 2) clickup_meeting_watch.dedupe_calendar_events(start, end) — убирает
+    ТОЧНЫЕ дубли. Отчёт об этих шагах выводится над списком событий (бывшая
+    /calendarclickup, объединена с /calendar по прямой просьбе владелицы)."""
     query = update.callback_query
     await query.answer()
 
@@ -1635,29 +1647,93 @@ async def handle_calendar_view_callback(update: Update, context: ContextTypes.DE
     start, end = bounds
     label = _CALENDAR_PERIOD_LABELS.get(period, period)
 
+    report = ""
+    chat = update.effective_chat
+    do_clickup_sync = bool(
+        chat is not None
+        and chat.type == "private"
+        and config.OWNER_USER_ID
+        and query.from_user.id == config.OWNER_USER_ID
+        and config.CLICKUP_TEAM_WIDE_ENABLED
+    )
+    if do_clickup_sync:
+        await query.edit_message_text(f"Сверяю ClickUp с календарём за период «{label}»...")
+        try:
+            stats = await clickup_meeting_watch.reconcile_clickup_titles_in_calendar(start, end)
+        except Exception:
+            logger.exception("/calendar: не удалось сверить ClickUp с календарём за период %s", period)
+            await query.edit_message_text(
+                f"Не смогла сверить ClickUp с календарём за период «{label}» — попробуй ещё раз чуть позже.",
+                reply_markup=_calendar_period_keyboard(),
+            )
+            return
+
+        try:
+            dedupe_stats = await clickup_meeting_watch.dedupe_calendar_events(start, end)
+        except Exception:
+            logger.exception("/calendar: не удалось зачистить дубли календаря за период %s", period)
+            dedupe_stats = {"scanned": 0, "deleted": [], "errors": 1}
+
+        report_lines = [f"📅 Сверка за период «{label}» (проверено задач: {stats['scanned']}):"]
+        if stats["renamed"]:
+            report_lines.append(f"\n✏️ Переименовано в календаре ({len(stats['renamed'])}):")
+            for r in stats["renamed"]:
+                report_lines.append(f"«{r['old_title']}» → «{r['new_title']}» — {r['when']}")
+        if stats["created"]:
+            report_lines.append(f"\n➕ Поставлено новых ({len(stats['created'])}):")
+            for c in stats["created"]:
+                report_lines.append(f"«{c['title']}» — {c['when']}")
+        if stats["ambiguous"]:
+            report_lines.append(f"\n⚠️ Неоднозначно, проверь на дубли ({len(stats['ambiguous'])}):")
+            for a in stats["ambiguous"]:
+                report_lines.append(
+                    f"«{a['title']}» — {a['when']} (поставила новым событием, но рядом уже "
+                    f"{a['count']} событий календаря на это время)"
+                )
+        if dedupe_stats["deleted"]:
+            total_removed = sum(d["removed"] for d in dedupe_stats["deleted"])
+            report_lines.append(f"\n🗑 Убрала точных дублей в календаре ({total_removed}):")
+            for d in dedupe_stats["deleted"]:
+                report_lines.append(f"«{d['title']}» — {d['when']} (оставила 1, удалила {d['removed']})")
+        if stats["errors"] or dedupe_stats["errors"]:
+            report_lines.append(f"\n❌ Ошибок при обработке: {stats['errors'] + dedupe_stats['errors']}")
+        if not (
+            stats["renamed"] or stats["created"] or stats["ambiguous"]
+            or dedupe_stats["deleted"] or stats["errors"] or dedupe_stats["errors"]
+        ):
+            report_lines.append("\nВсё совпадает, менять нечего, дублей нет.")
+
+        report = "\n".join(report_lines)
+        if len(report) > TELEGRAM_MESSAGE_LIMIT - 200:
+            report = report[: TELEGRAM_MESSAGE_LIMIT - 250] + "\n\n...отчёт обрезан."
+        report += "\n\n"
+
     try:
         events = calendar_client.list_events(start.isoformat(), end.isoformat())
     except Exception:
         logger.exception("Не удалось получить события календаря за период %s", period)
-        await query.edit_message_text(
-            f"Не смогла получить события календаря ({label}) — попробуй ещё раз чуть позже.",
-            reply_markup=_calendar_period_keyboard(),
-        )
+        if report:
+            text = report.rstrip() + "\n\nНе смогла получить итоговый список календаря — попробуй ещё раз."
+            if len(text) > TELEGRAM_MESSAGE_LIMIT:
+                text = text[: TELEGRAM_MESSAGE_LIMIT - 50] + "\n\n...список обрезан."
+        else:
+            text = f"Не смогла получить события календаря ({label}) — попробуй ещё раз чуть позже."
+        await query.edit_message_text(text, reply_markup=_calendar_period_keyboard())
         return
 
     tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
     if not events:
-        text = f"📅 {label}: событий нет."
+        text = f"{report}📅 {label}: событий нет."
     else:
         lines = [_format_calendar_event_line(e, tz) for e in events]
-        header = f"📅 {label} ({len(events)}):\n\n"
+        header = f"{report}📅 {label} ({len(events)}):\n\n"
         body = "\n".join(lines)
         if len(header) + len(body) > TELEGRAM_MESSAGE_LIMIT:
             # Слишком много событий для одного сообщения-превью — показываем сколько
             # влезает и честно говорим, что список неполный, а не режем список молча
             # или падаем на превышении лимита Telegram.
             budget = TELEGRAM_MESSAGE_LIMIT - len(header) - 80
-            truncated = body[:budget]
+            truncated = body[:budget] if budget > 0 else ""
             cut = truncated.rfind("\n")
             if cut != -1:
                 truncated = truncated[:cut]
@@ -1870,146 +1946,6 @@ async def handle_meetm_command(update: Update, context: ContextTypes.DEFAULT_TYP
     text = "\n".join(lines)
     for chunk in _split_for_telegram(text):
         await update.message.reply_text(chunk)
-
-
-def _calendarclickup_period_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Сегодня", callback_data="ccu:today"),
-                InlineKeyboardButton("Завтра", callback_data="ccu:tomorrow"),
-            ],
-            [
-                InlineKeyboardButton("Текущая неделя", callback_data="ccu:this_week"),
-                InlineKeyboardButton("Следующая неделя", callback_data="ccu:next_week"),
-            ],
-            [InlineKeyboardButton("Текущий месяц", callback_data="ccu:this_month")],
-        ]
-    )
-
-
-async def handle_calendarclickup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/calendarclickup — единая команда (02.10.2026, по прямой просьбе владелицы
-    объединены бывшие /calendarclick и /calendarclickup: две команды были слишком похожи
-    и путали). Только в личке, только для владелицы: предлагает выбрать период кнопками,
-    как /calendar (Сегодня/Завтра/Текущая неделя/Следующая неделя/Текущий месяц, см.
-    _calendarclickup_period_keyboard и _calendar_period_bounds) — реальная работа
-    происходит по нажатию кнопки, см. handle_calendarclickup_view_callback: доставить
-    в календарь ClickUp-встречи за период, переписать название уже стоящих событий под
-    ClickUp, убрать точные дубли и показать итоговый список встреч календаря."""
-    chat = update.effective_chat
-    if chat.type != "private":
-        await update.message.reply_text("Эта команда работает только в личке.")
-        return
-    if config.OWNER_USER_ID is None or update.effective_user.id != config.OWNER_USER_ID:
-        await update.message.reply_text("Эта команда только для владелицы.")
-        return
-    if not (config.CLICKUP_TEAM_WIDE_ENABLED and config.GOOGLE_CALENDAR_ENABLED and config.OWNER_USER_ID):
-        await update.message.reply_text(
-            "Для этой команды нужны ClickUp (CLICKUP_TEAM_ID + CLICKUP_API_TOKEN) и Google Calendar — "
-            "что-то из этого пока не настроено."
-        )
-        return
-    await update.message.reply_text("Какой период проверить?", reply_markup=_calendarclickup_period_keyboard())
-
-
-async def handle_calendarclickup_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает кнопки периода под /calendarclickup (см. handle_calendarclickup_command
-    и _calendarclickup_period_keyboard). Для выбранного периода [start, end) по порядку:
-    1) clickup_meeting_watch.reconcile_clickup_titles_in_calendar(start, end) — сверяет
-    ClickUp-встречи с календарём: переписывает название уже стоящего события, ставит
-    отсутствующие; 2) clickup_meeting_watch.dedupe_calendar_events(start, end) — убирает
-    ТОЧНЫЕ дубли; 3) читает получившийся список calendar_client.list_events и показывает его
-    тем же форматом, что и /calendar (_format_calendar_event_line, _calendar_period_bounds,
-    _CALENDAR_PERIOD_LABELS). Итоговый отчёт объединяет оба шага и список встреч; кнопки
-    периода остаются под сообщением, так что можно сразу переключить период."""
-    query = update.callback_query
-    await query.answer()
-    if config.OWNER_USER_ID is not None and query.from_user.id != config.OWNER_USER_ID:
-        return
-    _, _, period = (query.data or "").partition(":")
-    bounds = _calendar_period_bounds(period)
-    if not bounds:
-        return
-    start, end = bounds
-    label = _CALENDAR_PERIOD_LABELS.get(period, period)
-    await query.edit_message_text(f"Сверяю ClickUp с календарём за период «{label}»...")
-    try:
-        stats = await clickup_meeting_watch.reconcile_clickup_titles_in_calendar(start, end)
-    except Exception:
-        logger.exception("/calendarclickup: не удалось сверить ClickUp с календарём за период %s", period)
-        await query.edit_message_text(
-            f"Не смогла сверить ClickUp с календарём за период «{label}» — попробуй ещё раз чуть позже.",
-            reply_markup=_calendarclickup_period_keyboard(),
-        )
-        return
-
-    try:
-        dedupe_stats = await clickup_meeting_watch.dedupe_calendar_events(start, end)
-    except Exception:
-        logger.exception("/calendarclickup: не удалось зачистить дубли календаря за период %s", period)
-        dedupe_stats = {"scanned": 0, "deleted": [], "errors": 1}
-
-    lines = [f"📅 Сверка за период «{label}» (проверено задач: {stats['scanned']}):"]
-    if stats["renamed"]:
-        lines.append(f"\n✏️ Переименовано в календаре ({len(stats['renamed'])}):")
-        for r in stats["renamed"]:
-            lines.append(f"«{r['old_title']}» → «{r['new_title']}» — {r['when']}")
-    if stats["created"]:
-        lines.append(f"\n➕ Поставлено новых ({len(stats['created'])}):")
-        for c in stats["created"]:
-            lines.append(f"«{c['title']}» — {c['when']}")
-    if stats["ambiguous"]:
-        lines.append(f"\n⚠️ Неоднозначно, проверь на дубли ({len(stats['ambiguous'])}):")
-        for a in stats["ambiguous"]:
-            lines.append(
-                f"«{a['title']}» — {a['when']} (поставила новым событием, но рядом уже "
-                f"{a['count']} событий календаря на это время)"
-            )
-    if dedupe_stats["deleted"]:
-        total_removed = sum(d["removed"] for d in dedupe_stats["deleted"])
-        lines.append(f"\n🗑 Убрала точных дублей в календаре ({total_removed}):")
-        for d in dedupe_stats["deleted"]:
-            lines.append(f"«{d['title']}» — {d['when']} (оставила 1, удалила {d['removed']})")
-    if stats["errors"] or dedupe_stats["errors"]:
-        lines.append(f"\n❌ Ошибок при обработке: {stats['errors'] + dedupe_stats['errors']}")
-    if not (
-        stats["renamed"] or stats["created"] or stats["ambiguous"]
-        or dedupe_stats["deleted"] or stats["errors"] or dedupe_stats["errors"]
-    ):
-        lines.append("\nВсё совпадает, менять нечего, дублей нет.")
-
-    report = "\n".join(lines)
-
-    try:
-        events = calendar_client.list_events(start.isoformat(), end.isoformat())
-    except Exception:
-        logger.exception("Не удалось получить события календаря за период %s (/calendarclickup)", period)
-        text = report + "\n\nНе смогла получить итоговый список календаря — попробуй ещё раз."
-        if len(text) > TELEGRAM_MESSAGE_LIMIT:
-            text = text[: TELEGRAM_MESSAGE_LIMIT - 50] + "\n\n...список обрезан."
-        await query.edit_message_text(text, reply_markup=_calendarclickup_period_keyboard())
-        return
-
-    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
-    if len(report) > TELEGRAM_MESSAGE_LIMIT - 200:
-        report = report[: TELEGRAM_MESSAGE_LIMIT - 250] + "\n\n...отчёт обрезан."
-    if not events:
-        text = f"{report}\n\n📅 {label}: встреч нет."
-    else:
-        lines = [_format_calendar_event_line(e, tz) for e in events]
-        header = f"{report}\n\n📅 {label} ({len(events)}):\n\n"
-        body = "\n".join(lines)
-        if len(header) + len(body) > TELEGRAM_MESSAGE_LIMIT:
-            budget = TELEGRAM_MESSAGE_LIMIT - len(header) - 80
-            truncated = body[:budget] if budget > 0 else ""
-            cut = truncated.rfind("\n")
-            if cut != -1:
-                truncated = truncated[:cut]
-            shown = truncated.count("\n") + 1 if truncated else 0
-            body = f"{truncated}\n\n...и ещё {len(events) - shown} событий, не поместились — сузь период."
-        text = header + body
-    await query.edit_message_text(text, reply_markup=_calendarclickup_period_keyboard())
 
 
 async def handle_mygroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3418,10 +3354,9 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
 
     sections.append(
         "🗓 Календарь и прочее:\n"
-        "/calendar — события календаря по периодам (сегодня/завтра/неделя/месяц)\n"
+        "/calendar — события календаря по периодам (сегодня/завтра/неделя/месяц); у владелицы в личке при включённом ClickUp перед показом списка автоматически доставляет в календарь встречи из ClickUp, которых там ещё нет, переписывает название, если встреча уже стоит под другим именем, и убирает точные дубли\n"
         f"/meetm — все встречи подряд по датам на {_MEETM_HORIZON_DAYS} дней вперёд, "
         "с днём недели и месяцем, из календаря + ClickUp\n"
-        "/calendarclickup — выбрать период (как у /calendar) и одной командой: доставить в календарь встречи из ClickUp, которых там ещё нет, переписать название, если встреча уже стоит под другим именем, убрать точные дубли и показать список встреч за период\n"
         "/mygroups — разовая диагностика: список chat_id групп, где я была (нужно, чтобы настроить, кому в каких группах можно смотреть расписание)\n"
         "/cancelall — снять все висящие вопросы из групповых чатов, на которые ещё не ответила\n"
         "/stop — остановить рассылку задач в режиме правки, если нажала по ошибке"
@@ -3475,24 +3410,19 @@ def build_application() -> Application:
     app.add_handler(
         CallbackQueryHandler(handle_calendar_callback, pattern=r"^cal_(confirm|cancel|edit):")
     )
-    # /calendar — только в личке, только владелице: кнопки периода + живой список
-    # событий из Google Calendar за выбранный период (см. handle_calendar_command /
-    # handle_calendar_view_callback).
+    # /calendar — кнопки периода + живой список событий из Google Calendar за выбранный
+    # период (см. handle_calendar_command / handle_calendar_view_callback). Для владелицы
+    # в личке при включённом ClickUp перед показом списка автоматически выполняется
+    # сверка ClickUp-встреч с календарём (переименование + постановка отсутствующих, см.
+    # clickup_meeting_watch.reconcile_clickup_titles_in_calendar) и зачистка точных
+    # дублей (clickup_meeting_watch.dedupe_calendar_events) — бывшая /calendarclickup
+    # объединена с /calendar по прямой просьбе владелицы.
     app.add_handler(CommandHandler("calendar", handle_calendar_command))
     app.add_handler(CallbackQueryHandler(handle_calendar_view_callback, pattern=r"^calview:"))
     # /meetm — только в личке, только владелице: единый последовательный список ВСЕХ
     # встреч (календарь + ClickUp) на _MEETM_HORIZON_DAYS дней вперёд (см.
     # handle_meetm_command), по прямой просьбе владелицы 24.09.2026.
     app.add_handler(CommandHandler("meetm", handle_meetm_command))
-    # /calendarclickup — единая команда (02.10.2026, по прямой просьбе владелицы объединены
-    # бывшие /calendarclick и /calendarclickup), только в личке, только владелице: кнопки
-    # периода (как у /calendar); по нажатию — сверка ClickUp-встреч за период с личным
-    # календарём (переименование + постановка отсутствующих, см.
-    # clickup_meeting_watch.reconcile_clickup_titles_in_calendar), зачистка точных дублей
-    # (clickup_meeting_watch.dedupe_calendar_events) и итоговый список встреч (см.
-    # handle_calendarclickup_command / handle_calendarclickup_view_callback).
-    app.add_handler(CommandHandler("calendarclickup", handle_calendarclickup_command))
-    app.add_handler(CallbackQueryHandler(handle_calendarclickup_view_callback, pattern=r"^ccu:"))
     # /mygroups — разовая диагностика, только в личке, только владелице: показывает
     # chat_id групп, где бот был, чтобы прописать конкретные рабочие группы в
     # config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS (по прямой просьбе владелицы 01.10.2026).
