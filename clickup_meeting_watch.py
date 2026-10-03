@@ -58,6 +58,21 @@ async def _notify_owner(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         logger.exception("Не удалось отправить пост-фактум уведомление о ClickUp-встрече")
 
 
+def _is_owner_task(task: dict) -> bool:
+    """Клиентский фильтр по ответственной (03.10.2026). True, если у карточки НЕТ
+    назначенных (собственные карточки-встречи владелицы почти всегда без исполнителя) ИЛИ
+    среди назначенных есть сама владелица (имя из ClickUp сопоставляется через
+    config.CLICKUP_ASSIGNEE_MAP с config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID). Карточки,
+    назначенные только на кого-то ещё, отбрасываются."""
+    assignees = task.get("assignees") or []
+    if not assignees:
+        return True
+    return any(
+        config.CLICKUP_ASSIGNEE_MAP.get(name.lower()) == config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID
+        for name in assignees
+    )
+
+
 def _collect_weekly_board_candidates(now: datetime) -> tuple[list[dict], dict[str, date]]:
     """Третий источник кандидатов во встречи (добавлен 01.10.2026): доска WEEKLY TASKS
     (config.CLICKUP_LIST_WEEKLY), просканированная по СТАТУСУ-ДНЮ НЕДЕЛИ.
@@ -124,11 +139,7 @@ def _collect_weekly_board_candidates(now: datetime) -> tuple[list[dict], dict[st
             task_id = task.get("id")
             if not task_id or task_id in target_date_by_task_id:
                 continue
-            assignees = task.get("assignees") or []
-            if assignees and not any(
-                config.CLICKUP_ASSIGNEE_MAP.get(name.lower()) == config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID
-                for name in assignees
-            ):
+            if not _is_owner_task(task):
                 continue
             target_date_by_task_id[task_id] = target_date
             tasks.append(task)
@@ -145,20 +156,23 @@ def _collect_period_meeting_candidates(
     дубли; до 02.10.2026 было две отдельные команды — /calendarclick и /calendarclickup —
     объединены в одну по прямой просьбе владелицы, слишком похожи и путали). Источники:
     (1) due_date внутри периода, (2) доска WEEKLY TASKS по дню недели в периоде,
-    (3) любая задача workspace с явной датой в названии, попадающей в период. Возвращает
+    (3) любая задача workspace с явной датой в названии, попадающей в период. Источники (1)
+    и (3) фильтруются по ответственной на клиенте через _is_owner_task (с 03.10.2026, а не
+    серверным assignee_id): карточки владелицы без назначенного исполнителя вне доски
+    WEEKLY TASKS раньше отсекались серверным фильтром. Возвращает
     (объединённый по id список сырых задач ClickUp, {task_id: дата дня недели с доски
     WEEKLY TASKS}) — второе нужно вызывающему коду для weekday_hint_date_iso при вызове
     meeting_extractor.extract_meeting_from_task."""
     try:
-        due_tasks = clickup_client.get_open_tasks_team_wide(
-            assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
+        due_tasks_raw = clickup_client.get_open_tasks_team_wide(
             due_date_gt_ms=int(start.timestamp() * 1000),
             due_date_lt_ms=int(end.timestamp() * 1000),
             space_ids=None,
         )
     except Exception:
         logger.exception("Не удалось получить задачи ClickUp с due_date в периоде")
-        due_tasks = []
+        due_tasks_raw = []
+    due_tasks = [task for task in due_tasks_raw if _is_owner_task(task)]
     weekly_board_tasks, weekly_target_date_by_task_id = _collect_weekly_board_candidates(now)
     start_date = start.date()
     end_date = end.date()
@@ -168,13 +182,13 @@ def _collect_period_meeting_candidates(
         if start_date <= weekly_target_date_by_task_id.get(task.get("id"), start_date - timedelta(days=1)) < end_date
     ]
     try:
-        all_own_tasks = clickup_client.get_open_tasks_team_wide(
-            assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
+        all_tasks_raw = clickup_client.get_open_tasks_team_wide(
             space_ids=None,
         )
     except Exception:
         logger.exception("Не удалось получить все задачи ClickUp владелицы за период")
-        all_own_tasks = []
+        all_tasks_raw = []
+    all_own_tasks = [task for task in all_tasks_raw if _is_owner_task(task)]
     explicit_date_tasks = []
     for task in all_own_tasks:
         name = task.get("name") or ""
@@ -223,9 +237,13 @@ async def scan_and_schedule_clickup_meetings(
 
     Сканирует пространства ClickUp
     config.CLICKUP_MEETING_WATCH_SPACE_IDS ("РАСПИСАНИЕ" и "ATLAS" — не весь workspace, см.
-    докстринг модуля выше) на предмет задач, НАЗНАЧЕННЫХ НА ВЛАДЕЛИЦУ
-    (config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID — серверная фильтрация ClickUp API, та же,
-    что и у команд по сотрудникам), ТРЕМЯ независимыми источниками кандидатов: (1) созданные
+    докстринг модуля выше) на предмет задач ВЛАДЕЛИЦЫ ИЛИ БЕЗ НАЗНАЧЕННОГО ИСПОЛНИТЕЛЯ
+    (config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID). Фильтр по ответственной перенесён с
+    сервера ClickUp на клиент (_is_owner_task, 03.10.2026): серверный assignee_id отсекал
+    собственные карточки владелицы без исполнителя вне доски WEEKLY TASKS — жалоба
+    владелицы 03.10.2026 «не тянет корректно все мои зумы и встречи». Теперь карточки,
+    назначенные только на других, по-прежнему отбрасываются, а неназначенные —
+    попадают в кандидаты. ТРЕМЯ независимыми источниками кандидатов: (1) созданные
     за последние сутки (ловит вновь заведённые задачи быстро), (2) с due_date в ближайшие
     config.CLICKUP_MEETING_DUE_LOOKAHEAD_DAYS дней (ловит задачи, заведённые заранее кем-то
     другим, но с приближающимся сроком — см. докстринг модуля выше про инцидент с Clear
@@ -247,27 +265,27 @@ async def scan_and_schedule_clickup_meetings(
     cutoff_ms = int(cutoff.timestamp() * 1000)
 
     try:
-        new_tasks = clickup_client.get_open_tasks_team_wide(
-            assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
+        new_tasks_raw = clickup_client.get_open_tasks_team_wide(
             date_created_gt_ms=cutoff_ms,
             space_ids=space_ids,
         )
     except Exception:
         logger.exception("Не удалось получить новые задачи ClickUp для сканирования встреч")
-        new_tasks = []
+        new_tasks_raw = []
+    new_tasks = [task for task in new_tasks_raw if _is_owner_task(task)]
 
     due_from_ms = int(now.timestamp() * 1000)
     due_to_ms = int((now + timedelta(days=config.CLICKUP_MEETING_DUE_LOOKAHEAD_DAYS)).timestamp() * 1000)
     try:
-        due_soon_tasks = clickup_client.get_open_tasks_team_wide(
-            assignee_id=config.CLICKUP_MEETING_WATCH_ASSIGNEE_ID,
+        due_soon_tasks_raw = clickup_client.get_open_tasks_team_wide(
             due_date_gt_ms=due_from_ms,
             due_date_lt_ms=due_to_ms,
             space_ids=space_ids,
         )
     except Exception:
         logger.exception("Не удалось получить задачи ClickUp с приближающимся due_date для сканирования встреч")
-        due_soon_tasks = []
+        due_soon_tasks_raw = []
+    due_soon_tasks = [task for task in due_soon_tasks_raw if _is_owner_task(task)]
 
     weekly_board_tasks, weekly_target_date_by_task_id = _collect_weekly_board_candidates(now)
 
