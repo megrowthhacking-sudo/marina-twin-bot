@@ -398,243 +398,6 @@ async def check_new_clickup_meetings_job(context: ContextTypes.DEFAULT_TYPE) -> 
     await scan_and_schedule_clickup_meetings(context, space_ids=None)
 
 
-async def reconcile_clickup_titles_in_calendar(start: datetime, end: datetime) -> dict:
-    """Единая команда /calendarclickup (добавлено 01.10.2026, по прямой просьбе
-    владелицы; 02.10.2026 в неё же объединена бывшая /calendarclick — две команды были
-    слишком похожи и путали): сверяет её встречи ClickUp за период [start, end) с личным
-    календарём (m@altyn.one). Период выбирается кнопками в bot.py (см.
-    bot.py::_calendar_period_bounds), start/end передаются явно. Если встреча УЖЕ стоит в
-    календаре на то же время, но названа по-другому — ПЕРЕПИСЫВАЕТ название события на то,
-    как оно написано в ClickUp (calendar_client.update_event). Если встречи в календаре в
-    это время вовсе нет — создаёт её.
-
-    В отличие от calendar_client.create_event (дедуп по СОВПАДАЮЩЕМУ названию в окне
-    ±30 минут — см. calendar_client._find_duplicate_event) здесь сопоставление идёт по
-    ВРЕМЕНИ, а не по названию: иначе разница в названии помешала бы узнать, что это та же
-    встреча, и привела бы к дублю вместо переименования. Если в окне ±30 минут вокруг
-    времени встречи найдено РОВНО ОДНО существующее событие — либо подтверждаем совпадение
-    (названия совпали, ничего не делаем), либо переименовываем его. Если не найдено ни
-    одного — создаём новое событие. Если найдено НЕСКОЛЬКО событий в одном окне —
-    непонятно, какое из них "то самое" (и переименовывать наугад — опасно), поэтому НЕ
-    трогаем ни одно из существующих, а добавляем в это же время ЕЩЁ ОДНО новое событие с
-    названием из ClickUp (исправлено 01.10.2026, по прямой просьбе владелицы — раньше
-    такие задачи просто пропускались и могли вообще не попасть в календарь); такая задача
-    попадает сразу и в stats["created"], и в stats["ambiguous"] — владелица видит в
-    отчёте, что встреча поставлена, но рядом есть другие события того же времени, которые
-    стоит проверить вручную (возможно, старые дубли пора убрать).
-
-    Источники кандидатов — три (см. _collect_period_meeting_candidates): due_date в
-    периоде, доска WEEKLY TASKS, явная дата в названии любой задачи workspace.
-
-    Возвращает {"scanned": int, "renamed": [{"old_title", "new_title", "when"}, ...],
-    "created": [{"title", "when"}, ...], "unchanged": int, "ambiguous": [{"title", "when",
-    "count"}, ...], "errors": int} — используется bot.py для итогового отчёта владелице."""
-    stats: dict = {
-        "scanned": 0, "renamed": [], "created": [], "unchanged": 0, "ambiguous": [], "errors": 0,
-    }
-    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
-    now = datetime.now(tz)
-    tasks, weekly_target_date_by_task_id = _collect_period_meeting_candidates(start, end, now)
-
-    for task in tasks:
-        task_id = task.get("id")
-        if not task_id:
-            continue
-        stats["scanned"] += 1
-        try:
-            full_task = clickup_client.get_task(task_id)
-        except Exception:
-            logger.exception("Не удалось прочитать задачу ClickUp %s для /calendarclickup", task_id)
-            stats["errors"] += 1
-            continue
-        if not full_task:
-            continue
-        description = full_task.get("description") or ""
-        due_iso = _iso_or_none(task.get("due_date"), tz)
-        created_iso = _iso_or_none(task.get("date_created"), tz)
-        weekday_target_date = weekly_target_date_by_task_id.get(task_id)
-        weekday_hint_date_iso = f"{weekday_target_date.isoformat()}T00:00:00" if weekday_target_date else None
-        try:
-            meeting = meeting_extractor.extract_meeting_from_task(
-                title=task.get("name") or full_task.get("name") or "(без названия)",
-                description=description,
-                due_date_iso=due_iso,
-                created_iso=created_iso,
-                tz_name=config.MARINATWIN_TIMEZONE,
-                weekday_hint_date_iso=weekday_hint_date_iso,
-            )
-        except Exception:
-            logger.exception("Ошибка разбора задачи ClickUp %s для /calendarclickup", task_id)
-            stats["errors"] += 1
-            continue
-        if not meeting:
-            continue
-        try:
-            meeting_start = datetime.fromisoformat(meeting["start"]).astimezone(tz)
-            meeting_end = datetime.fromisoformat(meeting["end"]).astimezone(tz)
-        except (ValueError, KeyError, TypeError):
-            continue
-        if not (start <= meeting_start < end):
-            continue
-
-        try:
-            nearby = calendar_client.list_events(
-                (meeting_start - timedelta(minutes=30)).isoformat(),
-                (meeting_end + timedelta(minutes=30)).isoformat(),
-            )
-        except Exception:
-            logger.exception("Не удалось прочитать календарь рядом с %s для /calendarclickup", meeting_start)
-            stats["errors"] += 1
-            continue
-        nearby = [e for e in nearby if not e.get("all_day")]
-        when = meeting_start.strftime("%d.%m %H:%M")
-
-        if not nearby:
-            try:
-                calendar_client.create_event(
-                    meeting["title"],
-                    meeting["start"],
-                    meeting["end"],
-                    location=meeting.get("location") or None,
-                    description=f"Авто-поставлено из ClickUp-задачи: {task.get('url') or task_id}",
-                )
-            except Exception:
-                logger.exception(
-                    "Не удалось создать событие для задачи ClickUp %s (/calendarclickup)", task_id,
-                )
-                stats["errors"] += 1
-                continue
-            storage.mark_seen_clickup_meeting_task(task_id)
-            stats["created"].append({"title": meeting["title"], "when": when})
-            continue
-
-        if len(nearby) > 1:
-            try:
-                calendar_client.create_event(
-                    meeting["title"],
-                    meeting["start"],
-                    meeting["end"],
-                    location=meeting.get("location") or None,
-                    description=f"Авто-поставлено из ClickUp-задачи: {task.get('url') or task_id}",
-                )
-            except Exception:
-                logger.exception(
-                    "Не удалось создать доп. событие для неоднозначного времени, задача ClickUp %s "
-                    "(/calendarclickup)",
-                    task_id,
-                )
-                stats["errors"] += 1
-                continue
-            storage.mark_seen_clickup_meeting_task(task_id)
-            stats["created"].append({"title": meeting["title"], "when": when})
-            stats["ambiguous"].append({"title": meeting["title"], "when": when, "count": len(nearby)})
-            continue
-
-        existing = nearby[0]
-        if existing.get("title", "").strip().lower() == meeting["title"].strip().lower():
-            stats["unchanged"] += 1
-            continue
-
-        event_id = existing.get("id")
-        if not event_id:
-            stats["ambiguous"].append({"title": meeting["title"], "when": when, "count": 1})
-            continue
-        try:
-            calendar_client.update_event(event_id, title=meeting["title"])
-        except Exception:
-            logger.exception(
-                "Не удалось переименовать событие календаря %s в «%s» (/calendarclickup)",
-                event_id, meeting["title"],
-            )
-            stats["errors"] += 1
-            continue
-        stats["renamed"].append(
-            {"old_title": existing.get("title", ""), "new_title": meeting["title"], "when": when}
-        )
-
-    return stats
-
-
-async def dedupe_calendar_events(start: datetime, end: datetime) -> dict:
-    """Ищет в личном календаре (config.GOOGLE_CALENDAR_ID) ТОЧНЫЕ дубли за период
-    [start, end) и удаляет лишние копии, оставляя одну (добавлено 01.10.2026, по
-    прямой просьбе владелицы). Период выбирается кнопками в /calendarclickup (см.
-    bot.py) — start/end передаются явно, а не считаются здесь от «сейчас». Вызывается
-    из bot.py сразу после reconcile_clickup_titles_in_calendar и попадает в тот же
-    отчёт; с 02.10.2026 это единая команда /calendarclickup (бывшие /calendarclick и
-    /calendarclickup объединены).
-
-    "Точный дубль" — намеренно строгое определение (по прямой просьбе владелицы, чтобы
-    не снести по ошибке две разные встречи, которые просто совпали по времени): ОДНО И
-    ТО ЖЕ название (без учёта регистра и пробелов по краям) И ОДНО И ТО ЖЕ время
-    начала/конца. Событие с ДРУГИМ названием в то же окно времени (ровно тот случай
-    stats["ambiguous"] у reconcile_clickup_titles_in_calendar выше) дублем НЕ считается
-    и не трогается — это разные, хоть и совпадающие по времени, встречи; удалять их
-    "на всякий случай" владелица явно не просила.
-
-    Диапазон — тот же период, что выбран в /calendarclickup (по прямой просьбе
-    владелицы), а не весь календарь: один вызов calendar_client.list_events за
-    [start, end), события группируются по (название.strip().lower(), start,
-    end). all_day события не участвуют (та же оговорка, что и в
-    reconcile_clickup_titles_in_calendar — там действительно сравнивались только
-    некруглосуточные события). Внутри группы из 2+ одинаковых событий первое (в
-    порядке, в котором Google Calendar вернул список — он сортирован по startTime)
-    остаётся, остальные удаляются через calendar_client.delete_event; list_events не
-    возвращает дату создания события, так что внутри по-настоящему идентичной пары
-    выбор "что оставить" произвольный, но безопасный — события неразличимы по
-    содержанию.
-
-    Возвращает {"scanned": int (всего некруглосуточных событий в периоде), "deleted":
-    [{"title", "when", "removed"}, ...] (removed — сколько лишних копий удалено для
-    этой встречи), "errors": int}. Ошибка удаления одной группы/события только
-    логируется и не мешает обработке остальных."""
-    stats: dict = {"scanned": 0, "deleted": [], "errors": 0}
-    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
-
-    try:
-        events = calendar_client.list_events(start.isoformat(), end.isoformat())
-    except Exception:
-        logger.exception("Не удалось прочитать календарь для поиска дублей (/calendarclickup)")
-        stats["errors"] += 1
-        return stats
-
-    events = [e for e in events if not e.get("all_day")]
-    stats["scanned"] = len(events)
-
-    groups: dict[tuple[str, str, str], list[dict]] = {}
-    for e in events:
-        key = (e.get("title", "").strip().lower(), e.get("start"), e.get("end"))
-        groups.setdefault(key, []).append(e)
-
-    for (_title_key, start_iso, _end_iso), group in groups.items():
-        if len(group) < 2:
-            continue
-        keep, *extra = group
-        display_title = keep.get("title") or "(без названия)"
-        try:
-            when = datetime.fromisoformat(start_iso).astimezone(tz).strftime("%d.%m %H:%M")
-        except (ValueError, TypeError):
-            when = start_iso or ""
-
-        removed = 0
-        for dup in extra:
-            event_id = dup.get("id")
-            if not event_id:
-                continue
-            try:
-                calendar_client.delete_event(event_id)
-                removed += 1
-            except Exception:
-                logger.exception(
-                    "Не удалось удалить дубль события «%s» (id=%s, /calendarclickup)", display_title, event_id,
-                )
-                stats["errors"] += 1
-        if removed:
-            stats["deleted"].append({"title": display_title, "when": when, "removed": removed})
-
-    return stats
-
-
 def _fmt_when(iso: str, tz: ZoneInfo) -> str:
     try:
         return datetime.fromisoformat(iso).astimezone(tz).strftime("%d.%m %H:%M")
@@ -865,3 +628,129 @@ def apply_calendar_actions(actions: list[dict]) -> dict:
                 deleted_by_key[key] = entry
                 result["deleted"].append(entry)
     return result
+async def reconcile_clickup_titles_in_calendar(start: datetime, end: datetime) -> dict:
+ """Прямая сверка без подтверждения (план + сразу применение) — оставлена как обёртка
+ для совместимости; команда /calendarclickup с 03.10.2026 использует
+ plan_clickup_calendar_sync + кнопки подтверждения + apply_calendar_actions.
+ Возвращает {"scanned", "renamed", "created", "unchanged", "ambiguous", "errors"}."""
+ plan = await plan_clickup_calendar_sync(start, end)
+ applied = apply_calendar_actions(plan["actions"])
+ return {
+ "scanned": plan["scanned"],
+ "renamed": applied["renamed"],
+ "created": applied["created"],
+ "unchanged": plan["unchanged"],
+ "ambiguous": applied["ambiguous"] + plan["ambiguous_skipped"],
+ "errors": plan["errors"] + applied["errors"],
+ }
+async def dedupe_calendar_events(start: datetime, end: datetime) -> dict:
+ """Прямая зачистка точных дублей без подтверждения (план + сразу применение) —
+ обёртка для совместимости, см. plan_calendar_dedupe. Возвращает {"scanned",
+ "deleted": [{"title", "when", "removed"}], "errors"}."""
+ plan = await plan_calendar_dedupe(start, end)
+ applied = apply_calendar_actions(plan["actions"])
+ return {"scanned": plan["scanned"], "deleted": applied["deleted"], "errors": plan["errors"] + applied["errors"]}
+_REVISE_SYSTEM_PROMPT = """Ты помогаешь владелице поправить ПЛАН изменений её Google Calendar перед публикацией.
+Сейчас {today} ({tz_name}). План — нумерованный список действий (JSON). Владелица прислала правку своими словами.
+Типы действий: "create" (добавить встречу: title, start, end, location), "rename" (переименовать событие: new_title), "delete" (удалить точный дубль).
+Что можно: убрать действие из плана (не включать его в ответ); изменить title/start/end/location у "create"; изменить new_title у "rename"; добавить новое "create" (ref = null), если она просит добавить встречу.
+Что нельзя: менять тип существующего действия, придумывать event_id.
+start/end — ISO 8601 с таймзоной {tz_name} (например 2026-10-05T15:00:00+03:00); если конец не указан — start + 1 час. Всё, что владелица не просила менять, оставь как есть.
+Если правка непонятна — верни {{"ok": false}}.
+Ответ — ТОЛЬКО JSON без пояснений: {{"ok": true, "actions": [{{"ref": <номер из плана или null для нового>, "title": "...", "new_title": "...", "start": "...", "end": "...", "location": "..."}}]}} (поля — только те, что нужны для типа)."""
+def revise_calendar_plan(actions: list[dict], user_text: str) -> list[dict] | None:
+ """Применяет правку владелицы (свободный текст) к плану /calendarclickup через
+ лёгкую модель. Возвращает новый список действий (в порядке create → rename → delete)
+ или None, если правку не удалось понять/ответ модели невалиден. Код сам проверяет
+ ответ: типы существующих действий и event_id берутся ТОЛЬКО из исходного плана,
+ модель их изменить не может; новые действия — только "create" с валидными ISO-датами
+ и end > start."""
+ from claude_client import client # локальный импорт: тесты подменяют модуль
+ tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+ now = datetime.now(tz)
+ listing = []
+ for i, a in enumerate(actions, start=1):
+ item = {"n": i, "type": a["type"]}
+ if a["type"] == "create":
+ item.update(title=a["title"], start=a["start"], end=a["end"], location=a.get("location"))
+ elif a["type"] == "rename":
+ item.update(old_title=a["old_title"], new_title=a["new_title"], when=a.get("when"))
+ else:
+ item.update(title=a["title"], when=a.get("when"))
+ listing.append(item)
+ system_prompt = _REVISE_SYSTEM_PROMPT.format(today=now.strftime("%Y-%m-%d %H:%M, %A"), tz_name=config.MARINATWIN_TIMEZONE)
+ response = client.messages.create(
+ model=config.LIGHT_MODEL_NAME,
+ max_tokens=2048,
+ system=system_prompt,
+ messages=[
+ {
+ "role": "user",
+ "content": "ПЛАН:\n" + json.dumps(listing, ensure_ascii=False) + "\n\nПРАВКА ВЛАДЕЛИЦЫ:\n" + user_text,
+ }
+ ],
+ )
+ raw = "\n".join(block.text for block in response.content if block.type == "text").strip()
+ if raw.startswith("```"):
+ raw = raw.strip("`")
+ if raw.lower().startswith("json"):
+ raw = raw[4:]
+ raw = raw.strip()
+ try:
+ parsed = json.loads(raw)
+ except json.JSONDecodeError:
+ logger.warning("revise_calendar_plan: невалидный JSON от модели: %s", raw[:500])
+ return None
+ if not isinstance(parsed, dict) or not parsed.get("ok") or not isinstance(parsed.get("actions"), list):
+ return None
+ revised: list[dict] = []
+ used_refs: set[int] = set()
+ for item in parsed["actions"]:
+ if not isinstance(item, dict):
+ return None
+ ref = item.get("ref")
+ if ref is None:
+ title = (item.get("title") or "").strip()
+ try:
+ new_start = datetime.fromisoformat(item.get("start") or "")
+ new_end = datetime.fromisoformat(item.get("end") or "")
+ except ValueError:
+ return None
+ if not title or new_start.tzinfo is None or new_end.tzinfo is None or new_end <= new_start:
+ return None
+ revised.append(
+ {
+ "type": "create", "title": title, "start": new_start.isoformat(), "end": new_end.isoformat(),
+ "location": (item.get("location") or None), "description": "Добавлено вручную через /calendarclickup",
+ "task_id": None, "ambiguous_count": None,
+ }
+ )
+ continue
+ if not isinstance(ref, int) or not (1 <= ref <= len(actions)) or ref in used_refs:
+ return None
+ used_refs.add(ref)
+ original = dict(actions[ref - 1])
+ if original["type"] == "create":
+ title = (item.get("title") or original["title"]).strip()
+ start_iso = item.get("start") or original["start"]
+ end_iso = item.get("end") or original["end"]
+ try:
+ new_start = datetime.fromisoformat(start_iso)
+ new_end = datetime.fromisoformat(end_iso)
+ except ValueError:
+ return None
+ if not title or new_start.tzinfo is None or new_end.tzinfo is None or new_end <= new_start:
+ return None
+ original.update(
+ title=title, start=new_start.isoformat(), end=new_end.isoformat(),
+ location=(item.get("location") if "location" in item else original.get("location")) or None,
+ )
+ elif original["type"] == "rename":
+ new_title = (item.get("new_title") or original["new_title"]).strip()
+ if not new_title:
+ return None
+ original["new_title"] = new_title
+ revised.append(original)
+ order = {"create": 0, "rename": 1, "delete": 2}
+ revised.sort(key=lambda a: order[a["type"]])
+ return revised
