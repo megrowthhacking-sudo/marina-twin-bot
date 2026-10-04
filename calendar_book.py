@@ -33,7 +33,7 @@ COUNT_KEY = "cfree_book_count"
 STATE_TTL = 900
 MEETING_MINUTES = 60
 MAX_DAYS_AHEAD = 60
-MAX_BOOKINGS_PER_DAY = 3
+MAX_BOOKINGS_PER_DAY = 5
 QUESTION_TEXT = "Вы бы хотели запланировать встречу?"
 _WHEN_RE = re.compile(
     r"^\s*(\d{1,2})[./](\d{1,2})[./](\d{4}|\d{2})\s*(?:в|,)?\s*(\d{1,2})[:.](\d{2})\s*(?:мск|msk)?\s*$",
@@ -97,6 +97,10 @@ def _confirm_kb(uid: int) -> InlineKeyboardMarkup:
 
 
 TOPIC_MAX = 100
+
+
+def _more_kb(uid: int) -> InlineKeyboardMarkup:
+    return _kb(uid, ("Записать ещё", "more"), ("Хватит", "stop"))
 
 
 def _topic_kb(uid: int) -> InlineKeyboardMarkup:
@@ -171,6 +175,25 @@ async def handle_book_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     states = _states(context)
     key = (chat.id, user.id)
     state = states.get(key)
+    if action == "stop":
+        states.pop(key, None)
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+    if action == "more":
+        await query.edit_message_reply_markup(reply_markup=None)
+        if state is None or time.time() - state["ts"] > STATE_TTL:
+            states.pop(key, None)
+            await query.message.reply_text("Запрос устарел. Напишите /calendarfree, чтобы записаться снова.")
+            return
+        if _bookings_left(context, user.id) <= 0:
+            states.pop(key, None)
+            await query.message.reply_text(
+                "За сутки уже забронировано максимум встреч. Если нужно ещё, напишите владелице напрямую."
+            )
+            return
+        sent = await query.message.reply_text(_prompt_html(), parse_mode="HTML", reply_markup=_await_kb(user.id))
+        state.update(stage="await", topic="", ts=time.time(), msg_id=sent.message_id)
+        return
     if action in ("no", "cancel"):
         states.pop(key, None)
         await query.edit_message_text("Хорошо. Если понадобится, напишите /calendarfree.")
@@ -243,10 +266,14 @@ async def _finish_booking(query, context, chat, user, state, tz) -> None:
             "Не получилось записать встречу, попробуйте ещё раз чуть позже.", reply_markup=_confirm_kb(user.id)
         )
         return
-    states.pop(key, None)
+    state.update(stage="done", ts=time.time())
     context.application.bot_data.setdefault(COUNT_KEY, {}).setdefault(user.id, []).append(time.time())
     when = f"{_fmt_day(start.date())}, {start.strftime('%H:%M')}-{end.strftime('%H:%M')}"
-    await query.edit_message_text(f"Готово, встреча забронирована: {when} ({_tz_label()}).")
+    topic_line = f"\nТема: {topic}" if topic else ""
+    await query.edit_message_text(
+        f"Готово, встреча забронирована: {when} ({_tz_label()}).{topic_line}\nЗаписать ещё одну встречу?",
+        reply_markup=_more_kb(user.id),
+    )
     if config.OWNER_USER_ID is not None and user.id != config.OWNER_USER_ID:
         try:
             await context.bot.send_message(
