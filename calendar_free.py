@@ -119,3 +119,50 @@ def render(period: str, days: list[date], busy: list[tuple[datetime, datetime]],
         parts = [f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')} ({_duration(s, e)})" for s, e in slots]
         lines.append(f"\n{label}:\n" + "\n".join(parts))
     return "\n".join(lines)
+
+
+async def handle_calendarfree_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat is None or chat.type != "private" or user is None:
+        return
+    if config.OWNER_USER_ID is None or user.id != config.OWNER_USER_ID:
+        return
+    if not config.GOOGLE_CALENDAR_ENABLED:
+        await update.message.reply_text("Календарь сейчас не подключён.")
+        return
+    await update.message.reply_text("За какой период показать свободные слоты?", reply_markup=_keyboard())
+
+
+async def handle_calendarfree_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        return
+    if config.OWNER_USER_ID is None or query.from_user.id != config.OWNER_USER_ID:
+        return
+    _, _, period = (query.data or "").partition(":")
+    if period not in PERIOD_LABELS:
+        return
+    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+    now = datetime.now(tz)
+    days = period_days(period, now.date())
+    range_start = datetime.combine(days[0], time(0), tz)
+    range_end = datetime.combine(days[-1] + timedelta(days=1), time(0), tz)
+    try:
+        events = calendar_client.list_events(range_start.isoformat(), range_end.isoformat())
+    except Exception:
+        logger.exception("/calendarfree: не удалось получить события календаря за период %s", period)
+        await query.edit_message_text(
+            "Не смогла прочитать календарь, попробуй ещё раз чуть позже.", reply_markup=_keyboard()
+        )
+        return
+    text = render(period, days, _parse_busy(events, tz), tz, now)
+    await query.edit_message_text(text[:4000], reply_markup=_keyboard())
+
+
+def register(app) -> None:
+    """Регистрирует /calendarfree и кнопки периода. Вызывать в build_application."""
+    app.add_handler(CommandHandler("calendarfree", handle_calendarfree_command))
+    app.add_handler(CallbackQueryHandler(handle_calendarfree_callback, pattern=r"^cfree:"))
