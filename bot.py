@@ -31,6 +31,7 @@ from telegram.ext import (
 import altyn_registry
 import bg_off
 import calendar_client
+import ccu_flow
 import chat_memory
 import claude_client
 import clickup_client
@@ -724,6 +725,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # или лог задач/встреч ниже. Проверяется раньше "pending = get_oldest_pending_
         # escalation()", чтобы правка встречи не была случайно принята за ответ на
         # старый висящий вопрос эскалации.
+        ccu_awaiting = ccu_flow.get_awaiting(context)
+        if ccu_awaiting and update.message.chat.type == "private":
+            await ccu_flow.apply_edit(context, user, ccu_awaiting, text)
+            return
         if config.GOOGLE_CALENDAR_ENABLED:
             awaiting_meeting = storage.get_meeting_awaiting_edit(user.id)
             if awaiting_meeting:
@@ -3431,7 +3436,7 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
     sections.append(
         "🗓 Календарь и прочее:\n"
         "/calendar — события календаря по периодам (сегодня/завтра/неделя/месяц)\n"
-        "/calendarclickup — сверка встреч ClickUp с календарём за выбранный период (сегодня/завтра/неделя/месяц): доставляет в календарь встречи из ClickUp, которых там ещё нет, переписывает название, если встреча уже стоит под другим именем, убирает точные дубли и показывает итоговый список\n"
+        "/calendarclickup — сверка встреч ClickUp с календарём за выбранный период (сегодня/завтра/неделя/месяц): сначала присылает мне план (что добавить, переименовать, какие точные дубли убрать) с кнопками «Опубликовать / Изменить / Отмена» и только после «Опубликовать» пишет в календарь; «Изменить» — присылаю правку текстом, план обновится, и так сколько нужно\n"
         f"/meetm — все встречи подряд по датам на {_MEETM_HORIZON_DAYS} дней вперёд, "
         "с днём недели и месяцем, из календаря + ClickUp\n"
         "/mygroups — разовая диагностика: список chat_id групп, где я была (нужно, чтобы настроить, кому в каких группах можно смотреть расписание)\n"
@@ -3451,6 +3456,16 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
     text = "\n\n".join(sections)
     for chunk in _split_for_telegram(text):
         await context.bot.send_message(chat_id=config.OWNER_USER_ID, text=chunk)
+
+
+ccu_flow.bind(
+    period_bounds=_calendar_period_bounds,
+    period_labels=_CALENDAR_PERIOD_LABELS,
+    period_keyboard=_calendarclickup_period_keyboard,
+    format_event_line=_format_calendar_event_line,
+    split_for_telegram=_split_for_telegram,
+    message_limit=TELEGRAM_MESSAGE_LIMIT,
+)
 
 
 def build_application() -> Application:
@@ -3501,6 +3516,7 @@ def build_application() -> Application:
     # дублей (clickup_meeting_watch.dedupe_calendar_events) и список событий за период
     # (см. handle_calendarclickup_command / handle_calendarclickup_view_callback).
     app.add_handler(CommandHandler("calendarclickup", handle_calendarclickup_command))
+    ccu_flow.register(app)
     app.add_handler(CallbackQueryHandler(handle_calendarclickup_view_callback, pattern=r"^ccu:"))
     # /mygroups — разовая диагностика, только в личке, только владелице: показывает
     # chat_id групп, где бот был, чтобы прописать конкретные рабочие группы в
