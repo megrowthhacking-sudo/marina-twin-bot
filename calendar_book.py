@@ -96,6 +96,21 @@ def _confirm_kb(uid: int) -> InlineKeyboardMarkup:
     return _kb(uid, ("Подтвердить", "ok"), ("Другое время", "redo"), ("Отмена", "cancel"))
 
 
+TOPIC_MAX = 100
+
+
+def _topic_kb(uid: int) -> InlineKeyboardMarkup:
+    return _kb(uid, ("Без темы", "notopic"), ("Отмена", "cancel"))
+
+
+def _confirm_text(state: dict) -> str:
+    start = datetime.fromisoformat(state["start"])
+    end = start + timedelta(minutes=MEETING_MINUTES)
+    when = f"{_fmt_day(start.date())}, {start.strftime('%H:%M')}-{end.strftime('%H:%M')}"
+    topic = state.get("topic") or "без темы"
+    return f"Записать встречу на {when} ({_tz_label()})? Длительность 1 час.\nТема: {topic}"
+
+
 def _states(context) -> dict:
     return context.application.bot_data.setdefault(STATE_KEY, {})
 
@@ -175,6 +190,10 @@ async def handle_book_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         state.update(stage="await", ts=time.time(), msg_id=query.message.message_id)
         await query.edit_message_text(_prompt_html(), parse_mode="HTML", reply_markup=_await_kb(user.id))
         return
+    if action == "notopic" and state.get("stage") == "topic":
+        state.update(stage="confirm", topic="", ts=time.time())
+        await query.edit_message_text(_confirm_text(state), reply_markup=_confirm_kb(user.id))
+        return
     if action == "ok" and state.get("stage") == "confirm":
         await _finish_booking(query, context, chat, user, state, tz)
         return
@@ -244,6 +263,20 @@ async def handle_when_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     states = _states(context)
     key = (chat.id, user.id)
     state = states.get(key)
+    if state is not None and state.get("stage") == "topic":
+        if time.time() - state["ts"] > STATE_TTL:
+            states.pop(key, None)
+            return
+        topic = " ".join(msg.text.split())
+        if len(topic) > TOPIC_MAX:
+            await msg.reply_text(
+                f"Тема слишком длинная, напишите короче (до {TOPIC_MAX} символов).", reply_markup=_topic_kb(user.id)
+            )
+            raise ApplicationHandlerStop
+        state.update(stage="confirm", topic=topic, ts=time.time())
+        sent = await msg.reply_text(_confirm_text(state), reply_markup=_confirm_kb(user.id))
+        state["msg_id"] = sent.message_id
+        raise ApplicationHandlerStop
     if state is None or state.get("stage") != "await":
         return
     if chat.type != "private" and (len(msg.text) > 40 or not any(c.isdigit() for c in msg.text)):
