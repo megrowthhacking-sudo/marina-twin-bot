@@ -427,3 +427,63 @@ async def _check_entries(items: list, tz: ZoneInfo, now: datetime) -> str | None
             return f"{label}это время занято или не входит в рабочие часы 8:00-20:00. {extra}"
         taken.append((start, start + timedelta(minutes=MEETING_MINUTES)))
     return None
+
+
+async def handle_when_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ловит сообщение с одной или несколькими строками "ДД.ММ.ГГ в ЧЧ:ММ Тема"."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if msg is None or chat is None or user is None or not msg.text:
+        return
+    states = _states(context)
+    key = (chat.id, user.id)
+    state = states.get(key)
+    if state is None or state.get("stage") != "await":
+        return
+    lines = [ln for ln in msg.text.splitlines() if ln.strip()]
+    if not lines:
+        return
+    if chat.type != "private" and not lines[0].lstrip()[:1].isdigit():
+        return
+    if time.time() - state["ts"] > STATE_TTL:
+        states.pop(key, None)
+        await msg.reply_text("Запрос устарел. Напишите /calendarfree и выберите период заново.")
+        raise ApplicationHandlerStop
+    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+    now = datetime.now(tz)
+    kb = _await_kb(user.id)
+    if len(lines) > MEETINGS_MAX:
+        await msg.reply_text(
+            f"За раз можно записать не больше {MEETINGS_MAX} встреч.\n\n" + _prompt_html(), parse_mode="HTML", reply_markup=kb
+        )
+        raise ApplicationHandlerStop
+    items = []
+    for n, line in enumerate(lines, 1):
+        try:
+            items.append(parse_entry(line, tz, now))
+        except ValueError as exc:
+            label = f"Строка {n}: " if len(lines) > 1 else ""
+            await msg.reply_text(f"{label}{exc}\n\n" + _prompt_html(), parse_mode="HTML", reply_markup=kb)
+            raise ApplicationHandlerStop
+    left = _bookings_left(context, user.id)
+    if left < len(items):
+        await msg.reply_text(
+            f"За сутки можно записать ещё не больше {max(left, 0)} встреч. Уберите лишние строки.\n\n" + _prompt_html(),
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        raise ApplicationHandlerStop
+    try:
+        err = await _check_entries(items, tz, now)
+    except Exception:
+        logger.exception("/calendarfree: не удалось проверить календарь для записи")
+        await msg.reply_text("Не получилось проверить календарь, попробуйте ещё раз чуть позже.", reply_markup=kb)
+        raise ApplicationHandlerStop
+    if err:
+        await msg.reply_text(err + "\n\n" + _prompt_html(), parse_mode="HTML", reply_markup=kb)
+        raise ApplicationHandlerStop
+    state.update(stage="confirm", ts=time.time(), items=[{"start": s.isoformat(), "topic": t} for s, t in items])
+    sent = await msg.reply_text(_confirm_text(state), reply_markup=_confirm_kb(user.id))
+    state["msg_id"] = sent.message_id
+    raise ApplicationHandlerStop
