@@ -227,3 +227,62 @@ async def on_group_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, tit
         storage._conn.commit()
         return
     await _send(context, config.OWNER_USER_ID, f"Коротко о новой группе «{title}»:\n\n{summary}")
+
+
+def _active_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Кратко о чате", callback_data="chd:sum"), InlineKeyboardButton("Закончить", callback_data="chd:end")]]
+    )
+async def handle_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/chat: список групп кнопками (только владелица, только личка)."""
+    chat = update.effective_chat
+    if chat is None or chat.type != "private" or not _is_owner(update.effective_user):
+        return
+    context.application.bot_data[ACTIVE_KEY] = None
+    groups = storage.get_known_group_chats(limit=30)
+    if not groups:
+        await update.message.reply_text("Я пока не видела ни одной группы.")
+        return
+    counts = dict(
+        storage._conn.execute("SELECT chat_id, COUNT(*) FROM group_messages GROUP BY chat_id").fetchall()
+    )
+    rows = [
+        [InlineKeyboardButton(f"{title[:40]} ({counts.get(cid, 0)})", callback_data=f"chd:pick:{cid}")]
+        for cid, title in groups
+    ]
+    await update.message.reply_text("По какому чату вопрос?", reply_markup=InlineKeyboardMarkup(rows))
+async def handle_chat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat = update.effective_chat
+    if chat is None or chat.type != "private" or not _is_owner(query.from_user):
+        return
+    bot_data = context.application.bot_data
+    parts = (query.data or "").split(":", 2)
+    action = parts[1] if len(parts) > 1 else ""
+    if action == "pick" and len(parts) == 3:
+        chat_id = int(parts[2])
+        title = dict(storage.get_known_group_chats(limit=100)).get(chat_id, str(chat_id))
+        bot_data[ACTIVE_KEY] = {"chat_id": chat_id, "title": title, "ts": time.time()}
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=f"Выбран чат «{title}». Напиши вопрос по нему или нажми «Кратко о чате».",
+            reply_markup=_active_keyboard(),
+        )
+        return
+    active = bot_data.get(ACTIVE_KEY)
+    if action == "end":
+        bot_data[ACTIVE_KEY] = None
+        await context.bot.send_message(chat_id=chat.id, text="Хорошо, закончили. Дальше обычный разговор.")
+        return
+    if action == "sum" and active:
+        active["ts"] = time.time()
+        await context.bot.send_message(chat_id=chat.id, text="Читаю переписку...")
+        try:
+            text = await summarize_chat(active["chat_id"], active["title"])
+        except Exception:
+            logger.exception("Не удалось собрать сводку чата %s", active["chat_id"])
+            text = "Не получилось собрать сводку, попробуй ещё раз чуть позже."
+        await _send(context, chat.id, text, reply_markup=_active_keyboard())
+        return
+    await context.bot.send_message(chat_id=chat.id, text="Этот выбор уже не актуален, запусти /chat заново.")
