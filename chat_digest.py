@@ -286,3 +286,35 @@ async def handle_chat_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await _send(context, chat.id, text, reply_markup=_active_keyboard())
         return
     await context.bot.send_message(chat_id=chat.id, text="Этот выбор уже не актуален, запусти /chat заново.")
+
+
+async def maybe_answer(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    """Вызывается из handle_message для текста в личке. Если владелица сейчас в режиме
+    вопросов по чату (после /chat), отвечает по переписке и возвращает True, иначе False."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat is None or chat.type != "private" or not _is_owner(user):
+        return False
+    active = context.application.bot_data.get(ACTIVE_KEY)
+    if not active:
+        return False
+    if time.time() - active["ts"] > MODE_TTL:
+        context.application.bot_data[ACTIVE_KEY] = None
+        return False
+    active["ts"] = time.time()
+    try:
+        answer = await answer_question(active["chat_id"], active["title"], text)
+    except Exception:
+        logger.exception("Не удалось ответить на вопрос по чату %s", active["chat_id"])
+        answer = "Не получилось ответить, попробуй ещё раз чуть позже."
+    await _send(context, chat.id, answer, reply_markup=_active_keyboard())
+    return True
+
+
+def register(app) -> None:
+    """Регистрирует /chat, кнопки и отслеживание добавления бота в группы. Вызывать в
+    build_application рядом с bg_off.apply(app)."""
+    init_db()
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(CommandHandler("chat", handle_chat_command))
+    app.add_handler(CallbackQueryHandler(handle_chat_callback, pattern=r"^chd:"))
