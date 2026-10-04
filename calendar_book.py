@@ -487,3 +487,69 @@ async def handle_when_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     sent = await msg.reply_text(_confirm_text(state), reply_markup=_confirm_kb(user.id))
     state["msg_id"] = sent.message_id
     raise ApplicationHandlerStop
+
+
+async def _finish_booking(query, context, chat, user, state, tz) -> None:
+    states = _states(context)
+    key = (chat.id, user.id)
+    now = datetime.now(tz)
+    items = [(datetime.fromisoformat(it["start"]), it.get("topic") or "") for it in state["items"]]
+    try:
+        err = await _check_entries(items, tz, now)
+    except Exception:
+        logger.exception("/calendarfree: не удалось перепроверить календарь перед записью")
+        await query.edit_message_text(
+            "Не получилось проверить календарь, попробуйте ещё раз чуть позже.", reply_markup=_confirm_kb(user.id)
+        )
+        return
+    if err:
+        state.update(stage="await", ts=time.time())
+        await query.edit_message_text(
+            "Пока вы подтверждали, что-то изменилось. " + err + "\n\n" + _prompt_html(),
+            parse_mode="HTML",
+            reply_markup=_await_kb(user.id),
+        )
+        return
+    name = (user.full_name or user.username or str(user.id))[:60]
+    handle = f" (@{user.username})" if user.username else ""
+    where = chat.title or "личная переписка с ботом"
+    done = []
+    failed = False
+    for start, topic in items:
+        end = start + timedelta(minutes=MEETING_MINUTES)
+        title = f"Встреча: {topic} ({name})" if topic else f"Встреча: {name}"
+        description = f"Записался(лась) через бота: {name}{handle}\nЧат: {where}"
+        if topic:
+            description += f"\nТема: {topic}"
+        try:
+            await asyncio.to_thread(
+                calendar_client.create_event, title, start.isoformat(), end.isoformat(), None, description
+            )
+        except Exception:
+            logger.exception("/calendarfree: не удалось создать событие")
+            failed = True
+            break
+        done.append((start, topic))
+    counts = context.application.bot_data.setdefault(COUNT_KEY, {}).setdefault(user.id, [])
+    counts.extend([time.time()] * len(done))
+    done_lines = "\n".join(f"{_item_when(s)}, тема: {t or 'без темы'}" for s, t in done)
+    if failed:
+        state["items"] = [{"start": s.isoformat(), "topic": t} for s, t in items[len(done):]]
+        state["ts"] = time.time()
+        head = f"Записано {len(done)} из {len(items)}:\n{done_lines}\n" if done else ""
+        await query.edit_message_text(
+            head + "Не получилось записать остальное, нажмите «Подтвердить» ещё раз чуть позже.\n\n" + _confirm_text(state),
+            reply_markup=_confirm_kb(user.id),
+        )
+    else:
+        states.pop(key, None)
+        word = "встреча забронирована" if len(done) == 1 else "встречи забронированы"
+        await query.edit_message_text(f"Готово, {word} ({_tz_label()}):\n{done_lines}")
+    if done and config.OWNER_USER_ID is not None and user.id != config.OWNER_USER_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=config.OWNER_USER_ID,
+                text=f"Новая запись на встречу через бота: {name}{handle}, {where}.\n{done_lines}\nСобытия уже в календаре.",
+            )
+        except Exception:
+            logger.exception("/calendarfree: не удалось уведомить владелицу о записи")
