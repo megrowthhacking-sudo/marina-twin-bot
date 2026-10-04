@@ -759,3 +759,109 @@ async def plan_clickup_calendar_sync(start: datetime, end: datetime) -> dict:
             }
         )
     return plan
+
+
+async def plan_calendar_dedupe(start: datetime, end: datetime) -> dict:
+    """ТОЛЬКО ЧИТАЕТ: ищет в личном календаре ТОЧНЫЕ дубли за период [start, end) и
+    возвращает действия "delete" для лишних копий (одну копию в каждой группе оставляет).
+    "Точный дубль" — намеренно строгое определение (по прямой просьбе владелицы, чтобы не
+    снести две разные встречи, которые просто совпали по времени): ОДНО И ТО ЖЕ название
+    (без учёта регистра и пробелов по краям) И ОДНО И ТО ЖЕ время начала/конца. Событие с
+    другим названием в то же время дублем НЕ считается. all_day события не участвуют.
+    Внутри группы остаётся первое событие (порядок Google Calendar — по startTime).
+    Возвращает {"scanned", "actions": [{"type": "delete", "event_id", "title", "when"}],
+    "errors"}."""
+    plan: dict = {"scanned": 0, "actions": [], "errors": 0}
+    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+    try:
+        events = calendar_client.list_events(start.isoformat(), end.isoformat())
+    except Exception:
+        logger.exception("Не удалось прочитать календарь для поиска дублей (/calendarclickup)")
+        plan["errors"] += 1
+        return plan
+    events = [e for e in events if not e.get("all_day")]
+    plan["scanned"] = len(events)
+    groups: dict[tuple[str, str, str], list[dict]] = {}
+    for e in events:
+        key = (e.get("title", "").strip().lower(), e.get("start"), e.get("end"))
+        groups.setdefault(key, []).append(e)
+
+    for (_title_key, start_iso, _end_iso), group in groups.items():
+        if len(group) < 2:
+            continue
+        keep, *extra = group
+        display_title = keep.get("title") or "(без названия)"
+        when = _fmt_when(start_iso, tz)
+        for dup in extra:
+            event_id = dup.get("id")
+            if not event_id:
+                continue
+            plan["actions"].append(
+                {"type": "delete", "event_id": event_id, "title": display_title, "when": when}
+            )
+    return plan
+
+
+def apply_calendar_actions(actions: list[dict]) -> dict:
+    """Единственное место, где /calendarclickup ПИШЕТ в календарь (после "Опубликовать"
+    владелицы): выполняет действия плана по порядку. Ошибка одного действия только
+    логируется и не мешает остальным. Для "create" с task_id помечает задачу ClickUp как
+    уже обработанную (storage.mark_seen_clickup_meeting_task) — чтобы фоновый автоскан не
+    поставил её второй раз.
+    Возвращает {"created": [{"title", "when"}], "renamed": [{"old_title", "new_title",
+    "when"}], "deleted": [{"title", "when", "removed"}], "ambiguous": [{"title", "when",
+    "count"}], "errors": int}."""
+    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+    result: dict = {"created": [], "renamed": [], "deleted": [], "ambiguous": [], "errors": 0}
+    deleted_by_key: dict[tuple[str, str], dict] = {}
+    for action in actions:
+        kind = action.get("type")
+        if kind == "create":
+            when = _fmt_when(action["start"], tz)
+            try:
+                calendar_client.create_event(
+                    action["title"],
+                    action["start"],
+                    action["end"],
+                    location=action.get("location") or None,
+                    description=action.get("description") or None,
+                )
+            except Exception:
+                logger.exception("Не удалось создать событие «%s» (/calendarclickup)", action.get("title"))
+                result["errors"] += 1
+                continue
+            if action.get("task_id"):
+                storage.mark_seen_clickup_meeting_task(action["task_id"])
+            result["created"].append({"title": action["title"], "when": when})
+            if action.get("ambiguous_count"):
+                result["ambiguous"].append(
+                    {"title": action["title"], "when": when, "count": action["ambiguous_count"]}
+                )
+        elif kind == "rename":
+            try:
+                calendar_client.update_event(action["event_id"], title=action["new_title"])
+            except Exception:
+                logger.exception(
+                    "Не удалось переименовать событие %s в «%s» (/calendarclickup)",
+                    action.get("event_id"), action.get("new_title"),
+                )
+                result["errors"] += 1
+                continue
+            result["renamed"].append(
+                {"old_title": action.get("old_title", ""), "new_title": action["new_title"], "when": action.get("when", "")}
+            )
+        elif kind == "delete":
+            try:
+                calendar_client.delete_event(action["event_id"])
+            except Exception:
+                logger.exception("Не удалось удалить дубль «%s» (/calendarclickup)", action.get("title"))
+                result["errors"] += 1
+                continue
+            key = (action.get("title", ""), action.get("when", ""))
+            if key in deleted_by_key:
+                deleted_by_key[key]["removed"] += 1
+            else:
+                entry = {"title": key[0], "when": key[1], "removed": 1}
+                deleted_by_key[key] = entry
+                result["deleted"].append(entry)
+    return result
