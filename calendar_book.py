@@ -246,6 +246,8 @@ async def handle_when_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     state = states.get(key)
     if state is None or state.get("stage") != "await":
         return
+    if chat.type != "private" and (len(msg.text) > 40 or not any(c.isdigit() for c in msg.text)):
+        return
     if time.time() - state["ts"] > STATE_TTL:
         states.pop(key, None)
         await msg.reply_text("Запрос устарел. Напишите /calendarfree и выберите период заново.")
