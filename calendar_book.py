@@ -361,3 +361,69 @@ def register(app) -> None:
     """
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_when_reply), group=-1)
     app.add_handler(CallbackQueryHandler(handle_book_callback, pattern="^cfbk:"))
+
+
+# --- Несколько встреч одним сообщением (04.10.2026, по просьбе владелицы) ---
+# Формат каждой строки: "ДД.ММ.ГГ в ЧЧ:ММ Тема". Определения ниже переопределяют
+# одноимённые выше (последнее в модуле побеждает), старые шаги "тема отдельным
+# сообщением" и "Записать ещё" больше не используются.
+MEETINGS_MAX = 5
+_ENTRY_RE = re.compile(
+    r"^\s*(\d{1,2})[./](\d{1,2})[./](\d{4}|\d{2})\s*(?:в|,)?\s*(\d{1,2})[:.](\d{2})(?!\d)\s*(?:(?:мск|msk)\b)?\s*(.*?)\s*$",
+    re.IGNORECASE,
+)
+def parse_entry(line: str, tz: ZoneInfo, now: datetime) -> tuple[datetime, str]:
+    """Строка "9.10.26 в 14:00 Тема" в (начало, тема). ValueError(текст для человека)."""
+    m = _ENTRY_RE.match(line or "")
+    if not m:
+        raise ValueError("Не получилось разобрать дату и время.")
+    day, month, year, hour, minute, topic = m.groups()
+    start = parse_when(f"{day}.{month}.{year} в {hour}:{minute}", tz, now)
+    topic = topic.lstrip("-–—:,; ").strip()
+    if len(topic) > TOPIC_MAX:
+        raise ValueError(f"Тема слишком длинная (до {TOPIC_MAX} символов).")
+    return start, topic
+def _prompt_html() -> str:
+    return (
+        "Напишите удобные дату и время, а также тему встречи одним сообщением в формате:\n"
+        "<b>ДД.ММ.ГГ в ЧЧ:ММ Тема</b>\n"
+        "Например: <code>9.10.26 в 14:00 Зум с банком X</code>\n\n"
+        f"Встреча длится 1 час, {_tz_label()}, рабочие часы 8:00-20:00. "
+        "Потом останется нажать «Подтвердить».\n\n"
+        "Можно добавить несколько встреч подряд, например:\n"
+        "<code>9.10.26 в 14:00 Зум с банком X\n10.10.26 в 11:00 Зум с банком Y</code>"
+    )
+def _item_when(start: datetime) -> str:
+    end = start + timedelta(minutes=MEETING_MINUTES)
+    return f"{_fmt_day(start.date())}, {start.strftime('%H:%M')}-{end.strftime('%H:%M')}"
+def _confirm_text(state: dict) -> str:
+    items = state["items"]
+    if len(items) == 1:
+        start = datetime.fromisoformat(items[0]["start"])
+        topic = items[0].get("topic") or "без темы"
+        return f"Записать встречу ({_tz_label()}, 1 час)?\n{_item_when(start)}\nТема: {topic}"
+    lines = []
+    for n, it in enumerate(items, 1):
+        start = datetime.fromisoformat(it["start"])
+        lines.append(f"{n}) {_item_when(start)}, тема: {it.get('topic') or 'без темы'}")
+    return f"Записать встречи ({_tz_label()}, по 1 часу)?\n" + "\n".join(lines)
+async def _check_entries(items: list, tz: ZoneInfo, now: datetime) -> str | None:
+    """items: [(начало, тема)]. Текст ошибки для человека или None, если все часы свободны."""
+    busy_by_day = {}
+    taken = []
+    for n, (start, _topic) in enumerate(items, 1):
+        day = start.date()
+        if day not in busy_by_day:
+            busy_by_day[day] = await _day_busy(start, tz)
+        busy = busy_by_day[day] + [(s, e) for s, e in taken if s.date() == day]
+        ok, long_slots = check_slot(start, busy, tz, now)
+        if not ok:
+            label = f"Строка {n}: " if len(items) > 1 else ""
+            extra = (
+                f"Свободные окна на {_fmt_day(day)}: {_slots_text(long_slots)}."
+                if long_slots
+                else f"На {_fmt_day(day)} свободных окон на час нет."
+            )
+            return f"{label}это время занято или не входит в рабочие часы 8:00-20:00. {extra}"
+        taken.append((start, start + timedelta(minutes=MEETING_MINUTES)))
+    return None
