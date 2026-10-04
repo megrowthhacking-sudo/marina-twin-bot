@@ -2,12 +2,13 @@
 Команда спрашивает период кнопками (сегодня / завтра / текущая неделя / следующая неделя)
 и показывает только СВОБОДНЫЕ окна с 8:00 до 20:00 по каждому дню, считая занятыми все
 события основного календаря (config.GOOGLE_CALENDAR_ID) кроме событий на весь день. Для
-сегодняшнего дня окна считаются от текущего момента. Доступна всем, кто пишет боту, но только в личке (04.10.2026 по просьбе владелицы); показывает лишь свободные окна, без названий событий.
+сегодняшнего дня окна считаются от текущего момента. Доступна всем в личке и участникам трёх рабочих групп (config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS); показывает лишь свободные окна, без названий событий. После слотов предлагает забронировать встречу (calendar_book.py).
 Модуль отдельный, потому что bot.py запускается как __main__; bot.py вызывает register(app)."""
 import logging
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 import calendar_client
 import config
@@ -41,6 +42,15 @@ def _keyboard() -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def _allowed_chat(chat) -> bool:
+    """Личка с кем угодно или одна из трёх рабочих групп (config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS)."""
+    if chat is None:
+        return False
+    if chat.type == "private":
+        return True
+    return chat.id in config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS
 
 
 def period_days(period: str, today: date) -> list[date]:
@@ -124,7 +134,7 @@ def render(period: str, days: list[date], busy: list[tuple[datetime, datetime]],
 async def handle_calendarfree_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     user = update.effective_user
-    if chat is None or chat.type != "private" or user is None:
+    if user is None or not _allowed_chat(chat):
         return
     if not config.GOOGLE_CALENDAR_ENABLED:
         await update.message.reply_text("Календарь сейчас не подключён.")
@@ -136,7 +146,7 @@ async def handle_calendarfree_callback(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     await query.answer()
     chat = update.effective_chat
-    if chat is None or chat.type != "private":
+    if not _allowed_chat(chat):
         return
     _, _, period = (query.data or "").partition(":")
     if period not in PERIOD_LABELS:
@@ -155,10 +165,23 @@ async def handle_calendarfree_callback(update: Update, context: ContextTypes.DEF
         )
         return
     text = render(period, days, _parse_busy(events, tz), tz, now)
-    await query.edit_message_text(text[:4000], reply_markup=_keyboard())
+    try:
+        await query.edit_message_text(text[:4000], reply_markup=_keyboard())
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+        try:
+            import calendar_book
+
+            await calendar_book.offer(update, context)
+        except Exception:
+            logger.exception("/calendarfree: не удалось предложить запись на встречу")
 
 
 def register(app) -> None:
     """Регистрирует /calendarfree и кнопки периода. Вызывать в build_application."""
     app.add_handler(CommandHandler("calendarfree", handle_calendarfree_command))
     app.add_handler(CallbackQueryHandler(handle_calendarfree_callback, pattern=r"^cfree:"))
+    import calendar_book
+
+    calendar_book.register(app)
