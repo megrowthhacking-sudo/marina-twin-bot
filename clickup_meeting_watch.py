@@ -628,28 +628,34 @@ def apply_calendar_actions(actions: list[dict]) -> dict:
                 deleted_by_key[key] = entry
                 result["deleted"].append(entry)
     return result
+
+
 async def reconcile_clickup_titles_in_calendar(start: datetime, end: datetime) -> dict:
- """Прямая сверка без подтверждения (план + сразу применение) — оставлена как обёртка
- для совместимости; команда /calendarclickup с 03.10.2026 использует
- plan_clickup_calendar_sync + кнопки подтверждения + apply_calendar_actions.
- Возвращает {"scanned", "renamed", "created", "unchanged", "ambiguous", "errors"}."""
- plan = await plan_clickup_calendar_sync(start, end)
- applied = apply_calendar_actions(plan["actions"])
- return {
- "scanned": plan["scanned"],
- "renamed": applied["renamed"],
- "created": applied["created"],
- "unchanged": plan["unchanged"],
- "ambiguous": applied["ambiguous"] + plan["ambiguous_skipped"],
- "errors": plan["errors"] + applied["errors"],
- }
+    """Прямая сверка без подтверждения (план + сразу применение) — оставлена как обёртка
+    для совместимости; команда /calendarclickup с 03.10.2026 использует
+    plan_clickup_calendar_sync + кнопки подтверждения + apply_calendar_actions.
+    Возвращает {"scanned", "renamed", "created", "unchanged", "ambiguous", "errors"}."""
+    plan = await plan_clickup_calendar_sync(start, end)
+    applied = apply_calendar_actions(plan["actions"])
+    return {
+        "scanned": plan["scanned"],
+        "renamed": applied["renamed"],
+        "created": applied["created"],
+        "unchanged": plan["unchanged"],
+        "ambiguous": applied["ambiguous"] + plan["ambiguous_skipped"],
+        "errors": plan["errors"] + applied["errors"],
+    }
+
+
 async def dedupe_calendar_events(start: datetime, end: datetime) -> dict:
- """Прямая зачистка точных дублей без подтверждения (план + сразу применение) —
- обёртка для совместимости, см. plan_calendar_dedupe. Возвращает {"scanned",
- "deleted": [{"title", "when", "removed"}], "errors"}."""
- plan = await plan_calendar_dedupe(start, end)
- applied = apply_calendar_actions(plan["actions"])
- return {"scanned": plan["scanned"], "deleted": applied["deleted"], "errors": plan["errors"] + applied["errors"]}
+    """Прямая зачистка точных дублей без подтверждения (план + сразу применение) —
+    обёртка для совместимости, см. plan_calendar_dedupe. Возвращает {"scanned",
+    "deleted": [{"title", "when", "removed"}], "errors"}."""
+    plan = await plan_calendar_dedupe(start, end)
+    applied = apply_calendar_actions(plan["actions"])
+    return {"scanned": plan["scanned"], "deleted": applied["deleted"], "errors": plan["errors"] + applied["errors"]}
+
+
 _REVISE_SYSTEM_PROMPT = """Ты помогаешь владелице поправить ПЛАН изменений её Google Calendar перед публикацией.
 Сейчас {today} ({tz_name}). План — нумерованный список действий (JSON). Владелица прислала правку своими словами.
 Типы действий: "create" (добавить встречу: title, start, end, location), "rename" (переименовать событие: new_title), "delete" (удалить точный дубль).
@@ -658,99 +664,101 @@ _REVISE_SYSTEM_PROMPT = """Ты помогаешь владелице попра
 start/end — ISO 8601 с таймзоной {tz_name} (например 2026-10-05T15:00:00+03:00); если конец не указан — start + 1 час. Всё, что владелица не просила менять, оставь как есть.
 Если правка непонятна — верни {{"ok": false}}.
 Ответ — ТОЛЬКО JSON без пояснений: {{"ok": true, "actions": [{{"ref": <номер из плана или null для нового>, "title": "...", "new_title": "...", "start": "...", "end": "...", "location": "..."}}]}} (поля — только те, что нужны для типа)."""
+
+
 def revise_calendar_plan(actions: list[dict], user_text: str) -> list[dict] | None:
- """Применяет правку владелицы (свободный текст) к плану /calendarclickup через
- лёгкую модель. Возвращает новый список действий (в порядке create → rename → delete)
- или None, если правку не удалось понять/ответ модели невалиден. Код сам проверяет
- ответ: типы существующих действий и event_id берутся ТОЛЬКО из исходного плана,
- модель их изменить не может; новые действия — только "create" с валидными ISO-датами
- и end > start."""
- from claude_client import client # локальный импорт: тесты подменяют модуль
- tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
- now = datetime.now(tz)
- listing = []
- for i, a in enumerate(actions, start=1):
- item = {"n": i, "type": a["type"]}
- if a["type"] == "create":
- item.update(title=a["title"], start=a["start"], end=a["end"], location=a.get("location"))
- elif a["type"] == "rename":
- item.update(old_title=a["old_title"], new_title=a["new_title"], when=a.get("when"))
- else:
- item.update(title=a["title"], when=a.get("when"))
- listing.append(item)
- system_prompt = _REVISE_SYSTEM_PROMPT.format(today=now.strftime("%Y-%m-%d %H:%M, %A"), tz_name=config.MARINATWIN_TIMEZONE)
- response = client.messages.create(
- model=config.LIGHT_MODEL_NAME,
- max_tokens=2048,
- system=system_prompt,
- messages=[
- {
- "role": "user",
- "content": "ПЛАН:\n" + json.dumps(listing, ensure_ascii=False) + "\n\nПРАВКА ВЛАДЕЛИЦЫ:\n" + user_text,
- }
- ],
- )
- raw = "\n".join(block.text for block in response.content if block.type == "text").strip()
- if raw.startswith("```"):
- raw = raw.strip("`")
- if raw.lower().startswith("json"):
- raw = raw[4:]
- raw = raw.strip()
- try:
- parsed = json.loads(raw)
- except json.JSONDecodeError:
- logger.warning("revise_calendar_plan: невалидный JSON от модели: %s", raw[:500])
- return None
- if not isinstance(parsed, dict) or not parsed.get("ok") or not isinstance(parsed.get("actions"), list):
- return None
- revised: list[dict] = []
- used_refs: set[int] = set()
- for item in parsed["actions"]:
- if not isinstance(item, dict):
- return None
- ref = item.get("ref")
- if ref is None:
- title = (item.get("title") or "").strip()
- try:
- new_start = datetime.fromisoformat(item.get("start") or "")
- new_end = datetime.fromisoformat(item.get("end") or "")
- except ValueError:
- return None
- if not title or new_start.tzinfo is None or new_end.tzinfo is None or new_end <= new_start:
- return None
- revised.append(
- {
- "type": "create", "title": title, "start": new_start.isoformat(), "end": new_end.isoformat(),
- "location": (item.get("location") or None), "description": "Добавлено вручную через /calendarclickup",
- "task_id": None, "ambiguous_count": None,
- }
- )
- continue
- if not isinstance(ref, int) or not (1 <= ref <= len(actions)) or ref in used_refs:
- return None
- used_refs.add(ref)
- original = dict(actions[ref - 1])
- if original["type"] == "create":
- title = (item.get("title") or original["title"]).strip()
- start_iso = item.get("start") or original["start"]
- end_iso = item.get("end") or original["end"]
- try:
- new_start = datetime.fromisoformat(start_iso)
- new_end = datetime.fromisoformat(end_iso)
- except ValueError:
- return None
- if not title or new_start.tzinfo is None or new_end.tzinfo is None or new_end <= new_start:
- return None
- original.update(
- title=title, start=new_start.isoformat(), end=new_end.isoformat(),
- location=(item.get("location") if "location" in item else original.get("location")) or None,
- )
- elif original["type"] == "rename":
- new_title = (item.get("new_title") or original["new_title"]).strip()
- if not new_title:
- return None
- original["new_title"] = new_title
- revised.append(original)
- order = {"create": 0, "rename": 1, "delete": 2}
- revised.sort(key=lambda a: order[a["type"]])
- return revised
+    """Применяет правку владелицы (свободный текст) к плану /calendarclickup через
+    лёгкую модель. Возвращает новый список действий (в порядке create → rename → delete)
+    или None, если правку не удалось понять/ответ модели невалиден. Код сам проверяет
+    ответ: типы существующих действий и event_id берутся ТОЛЬКО из исходного плана,
+    модель их изменить не может; новые действия — только "create" с валидными ISO-датами
+    и end > start."""
+    from claude_client import client  # локальный импорт: тесты подменяют модуль
+    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+    now = datetime.now(tz)
+    listing = []
+    for i, a in enumerate(actions, start=1):
+        item = {"n": i, "type": a["type"]}
+        if a["type"] == "create":
+            item.update(title=a["title"], start=a["start"], end=a["end"], location=a.get("location"))
+        elif a["type"] == "rename":
+            item.update(old_title=a["old_title"], new_title=a["new_title"], when=a.get("when"))
+        else:
+            item.update(title=a["title"], when=a.get("when"))
+        listing.append(item)
+    system_prompt = _REVISE_SYSTEM_PROMPT.format(today=now.strftime("%Y-%m-%d %H:%M, %A"), tz_name=config.MARINATWIN_TIMEZONE)
+    response = client.messages.create(
+        model=config.LIGHT_MODEL_NAME,
+        max_tokens=2048,
+        system=system_prompt,
+        messages=[
+            {
+                "role": "user",
+                "content": "ПЛАН:\n" + json.dumps(listing, ensure_ascii=False) + "\n\nПРАВКА ВЛАДЕЛИЦЫ:\n" + user_text,
+            }
+        ],
+    )
+    raw = "\n".join(block.text for block in response.content if block.type == "text").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("revise_calendar_plan: невалидный JSON от модели: %s", raw[:500])
+        return None
+    if not isinstance(parsed, dict) or not parsed.get("ok") or not isinstance(parsed.get("actions"), list):
+        return None
+    revised: list[dict] = []
+    used_refs: set[int] = set()
+    for item in parsed["actions"]:
+        if not isinstance(item, dict):
+            return None
+        ref = item.get("ref")
+        if ref is None:
+            title = (item.get("title") or "").strip()
+            try:
+                new_start = datetime.fromisoformat(item.get("start") or "")
+                new_end = datetime.fromisoformat(item.get("end") or "")
+            except ValueError:
+                return None
+            if not title or new_start.tzinfo is None or new_end.tzinfo is None or new_end <= new_start:
+                return None
+            revised.append(
+                {
+                    "type": "create", "title": title, "start": new_start.isoformat(), "end": new_end.isoformat(),
+                    "location": (item.get("location") or None), "description": "Добавлено вручную через /calendarclickup",
+                    "task_id": None, "ambiguous_count": None,
+                }
+            )
+            continue
+        if not isinstance(ref, int) or not (1 <= ref <= len(actions)) or ref in used_refs:
+            return None
+        used_refs.add(ref)
+        original = dict(actions[ref - 1])
+        if original["type"] == "create":
+            title = (item.get("title") or original["title"]).strip()
+            start_iso = item.get("start") or original["start"]
+            end_iso = item.get("end") or original["end"]
+            try:
+                new_start = datetime.fromisoformat(start_iso)
+                new_end = datetime.fromisoformat(end_iso)
+            except ValueError:
+                return None
+            if not title or new_start.tzinfo is None or new_end.tzinfo is None or new_end <= new_start:
+                return None
+            original.update(
+                title=title, start=new_start.isoformat(), end=new_end.isoformat(),
+                location=(item.get("location") if "location" in item else original.get("location")) or None,
+            )
+        elif original["type"] == "rename":
+            new_title = (item.get("new_title") or original["new_title"]).strip()
+            if not new_title:
+                return None
+            original["new_title"] = new_title
+        revised.append(original)
+    order = {"create": 0, "rename": 1, "delete": 2}
+    revised.sort(key=lambda a: order[a["type"]])
+    return revised
