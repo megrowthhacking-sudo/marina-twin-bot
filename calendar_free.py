@@ -2,7 +2,7 @@
 Команда спрашивает период кнопками (сегодня / завтра / текущая неделя / следующая неделя)
 и показывает только СВОБОДНЫЕ окна с 8:00 до 20:00 по каждому дню, считая занятыми все
 события основного календаря (config.GOOGLE_CALENDAR_ID) кроме событий на весь день. Для
-сегодняшнего дня окна считаются от текущего момента. Только владелица и только в личке.
+сегодняшнего дня окна считаются от текущего момента. Доступна всем, кто пишет боту, но только в личке (04.10.2026 по просьбе владелицы); показывает лишь свободные окна, без названий событий.
 Модуль отдельный, потому что bot.py запускается как __main__; bot.py вызывает register(app)."""
 import logging
 from datetime import date, datetime, time, timedelta
@@ -126,8 +126,6 @@ async def handle_calendarfree_command(update: Update, context: ContextTypes.DEFA
     user = update.effective_user
     if chat is None or chat.type != "private" or user is None:
         return
-    if config.OWNER_USER_ID is None or user.id != config.OWNER_USER_ID:
-        return
     if not config.GOOGLE_CALENDAR_ENABLED:
         await update.message.reply_text("Календарь сейчас не подключён.")
         return
@@ -139,8 +137,6 @@ async def handle_calendarfree_callback(update: Update, context: ContextTypes.DEF
     await query.answer()
     chat = update.effective_chat
     if chat is None or chat.type != "private":
-        return
-    if config.OWNER_USER_ID is None or query.from_user.id != config.OWNER_USER_ID:
         return
     _, _, period = (query.data or "").partition(":")
     if period not in PERIOD_LABELS:
