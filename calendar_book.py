@@ -119,3 +119,64 @@ async def _day_busy(start: datetime, tz: ZoneInfo) -> list:
         calendar_client.list_events, day_start.isoformat(), (day_start + timedelta(days=1)).isoformat()
     )
     return calendar_free._parse_busy(events, tz)
+
+
+async def offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Вызывается из calendar_free после показа слотов: задаёт вопрос про встречу."""
+    query = update.callback_query
+    chat = update.effective_chat
+    if query is None or chat is None or not config.GOOGLE_CALENDAR_ENABLED:
+        return
+    uid = query.from_user.id
+    states = _states(context)
+    _purge(states)
+    old = states.pop((chat.id, uid), None)
+    if old and old.get("msg_id"):
+        try:
+            await context.bot.delete_message(chat_id=chat.id, message_id=old["msg_id"])
+        except Exception:
+            pass
+    sent = await query.message.reply_text(QUESTION_TEXT, reply_markup=_yes_no_kb(uid))
+    states[(chat.id, uid)] = {"stage": "offer", "ts": time.time(), "msg_id": sent.message_id}
+
+
+async def handle_book_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    chat = update.effective_chat
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or chat is None or not calendar_free._allowed_chat(chat):
+        await query.answer()
+        return
+    _, action, uid_s = parts
+    user = query.from_user
+    if str(user.id) != uid_s:
+        await query.answer("Эти кнопки для другого участника. Запросите /calendarfree сами.", show_alert=True)
+        return
+    await query.answer()
+    states = _states(context)
+    key = (chat.id, user.id)
+    state = states.get(key)
+    if action in ("no", "cancel"):
+        states.pop(key, None)
+        await query.edit_message_text("Хорошо. Если понадобится, напишите /calendarfree.")
+        return
+    if state is None or time.time() - state["ts"] > STATE_TTL:
+        states.pop(key, None)
+        await query.edit_message_text("Запрос устарел. Напишите /calendarfree и выберите период заново.")
+        return
+    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+    if action in ("yes", "redo"):
+        if action == "yes" and _bookings_left(context, user.id) <= 0:
+            states.pop(key, None)
+            await query.edit_message_text(
+                "За сутки уже забронировано максимум встреч. Если нужно ещё, напишите владелице напрямую."
+            )
+            return
+        state.update(stage="await", ts=time.time(), msg_id=query.message.message_id)
+        await query.edit_message_text(_prompt_html(), parse_mode="HTML", reply_markup=_await_kb(user.id))
+        return
+    if action == "ok" and state.get("stage") == "confirm":
+        await _finish_booking(query, context, chat, user, state, tz)
+        return
+    await query.edit_message_text("Запрос устарел. Напишите /calendarfree и выберите период заново.")
+    states.pop(key, None)
