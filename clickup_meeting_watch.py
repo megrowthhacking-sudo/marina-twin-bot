@@ -18,6 +18,7 @@ check_new_clickup_meetings_job регистрируется в bot.py::build_app
 любое из условий не выполнено — job не регистрируется вовсе (см. bot.py).
 """
 
+import json
 import logging
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
