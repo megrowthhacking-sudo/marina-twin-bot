@@ -214,3 +214,58 @@ async def period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     await query.edit_message_text(f"План за период «{label}» готов — смотри ниже.{extra}")
     await _ccu_send_plan(context, chat.id, plan_id)
+
+
+async def plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопки под планом /calendarclickup: "ccup:pub:<id>" — публикует план в календарь
+    (clickup_meeting_watch.apply_calendar_actions — единственное место записи), "ccup:edit:<id>"
+    — ждёт от владелицы текст правки (см. apply_edit, повторяется бесконечно, пока она
+    не нажмёт Опубликовать или Отмена), "ccup:cancel:<id>" — отменяет команду целиком."""
+    query = update.callback_query
+    await query.answer()
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        return
+    if config.OWNER_USER_ID is None or query.from_user.id != config.OWNER_USER_ID:
+        return
+    _, action, plan_id = (query.data or "").split(":", 2)
+    plans = context.application.bot_data.setdefault(PLANS_KEY, {})
+    plan = plans.get(plan_id)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if not plan:
+        await context.bot.send_message(chat_id=chat.id, text="Этот план уже не актуален — запусти /calendarclickup заново.")
+        return
+    if action == "cancel":
+        plans.pop(plan_id, None)
+        if context.application.bot_data.get(AWAITING_KEY) == plan_id:
+            context.application.bot_data[AWAITING_KEY] = None
+        await context.bot.send_message(chat_id=chat.id, text="Хорошо, отменила. В календаре ничего не менялось.")
+        return
+    if action == "edit":
+        context.application.bot_data[AWAITING_KEY] = plan_id
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                "✏️ Напиши, что изменить в плане (можно по номерам: «убери 2», «в 1 время 15:00», "
+                "«переименуй 3 в ...», «добавь встречу ... завтра в 12:00») — пришлю обновлённый план."
+            ),
+        )
+        return
+    if action == "pub":
+        plans.pop(plan_id, None)
+        if context.application.bot_data.get(AWAITING_KEY) == plan_id:
+            context.application.bot_data[AWAITING_KEY] = None
+        await context.bot.send_message(chat_id=chat.id, text="Публикую в календарь...")
+        res = clickup_meeting_watch.apply_calendar_actions(plan["actions"])
+        report = _ccu_render_result(plan["label"], res)
+        try:
+            events = calendar_client.list_events(plan["start"], plan["end"])
+            listing = _ccu_format_event_lines(plan["label"], events)
+        except Exception:
+            logger.exception("Не удалось получить события календаря после публикации (/calendarclickup)")
+            listing = "Не смогла получить итоговый список календаря."
+        for chunk in _d["split_for_telegram"](f"{report}\n\n{listing}"):
+            await context.bot.send_message(chat_id=chat.id, text=chunk)
