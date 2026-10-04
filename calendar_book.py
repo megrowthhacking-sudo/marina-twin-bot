@@ -180,3 +180,55 @@ async def handle_book_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     await query.edit_message_text("Запрос устарел. Напишите /calendarfree и выберите период заново.")
     states.pop(key, None)
+
+
+async def _finish_booking(query, context, chat, user, state, tz) -> None:
+    states = _states(context)
+    key = (chat.id, user.id)
+    start = datetime.fromisoformat(state["start"])
+    end = start + timedelta(minutes=MEETING_MINUTES)
+    now = datetime.now(tz)
+    try:
+        busy = await _day_busy(start, tz)
+    except Exception:
+        logger.exception("/calendarfree: не удалось перепроверить календарь перед записью")
+        await query.edit_message_text(
+            "Не получилось проверить календарь, попробуйте ещё раз чуть позже.", reply_markup=_confirm_kb(user.id)
+        )
+        return
+    ok, long_slots = check_slot(start, busy, tz, now)
+    if not ok:
+        state.update(stage="await", ts=time.time())
+        extra = f"\nСвободные окна на этот день: {_slots_text(long_slots)}." if long_slots else "\nНа этот день свободных окон на час нет."
+        await query.edit_message_text(
+            "Это время только что заняли или оно уже прошло." + extra + "\n\n" + _prompt_html(),
+            parse_mode="HTML",
+            reply_markup=_await_kb(user.id),
+        )
+        return
+    name = (user.full_name or user.username or str(user.id))[:60]
+    handle = f" (@{user.username})" if user.username else ""
+    where = chat.title or "личная переписка с ботом"
+    description = f"Записался(лась) через бота: {name}{handle}\nЧат: {where}"
+    try:
+        await asyncio.to_thread(
+            calendar_client.create_event, f"Встреча: {name}", start.isoformat(), end.isoformat(), None, description
+        )
+    except Exception:
+        logger.exception("/calendarfree: не удалось создать событие")
+        await query.edit_message_text(
+            "Не получилось записать встречу, попробуйте ещё раз чуть позже.", reply_markup=_confirm_kb(user.id)
+        )
+        return
+    states.pop(key, None)
+    context.application.bot_data.setdefault(COUNT_KEY, {}).setdefault(user.id, []).append(time.time())
+    when = f"{_fmt_day(start.date())}, {start.strftime('%H:%M')}-{end.strftime('%H:%M')}"
+    await query.edit_message_text(f"Готово, встреча забронирована: {when} ({_tz_label()}).")
+    if config.OWNER_USER_ID is not None and user.id != config.OWNER_USER_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=config.OWNER_USER_ID,
+                text=f"Новая запись на встречу через бота: {name}{handle}, {where}. {when}. Событие уже в календаре.",
+            )
+        except Exception:
+            logger.exception("/calendarfree: не удалось уведомить владелицу о записи")
