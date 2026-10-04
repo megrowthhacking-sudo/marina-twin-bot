@@ -228,10 +228,14 @@ async def _finish_booking(query, context, chat, user, state, tz) -> None:
     name = (user.full_name or user.username or str(user.id))[:60]
     handle = f" (@{user.username})" if user.username else ""
     where = chat.title or "личная переписка с ботом"
+    topic = state.get("topic") or ""
+    title = f"Встреча: {topic} ({name})" if topic else f"Встреча: {name}"
     description = f"Записался(лась) через бота: {name}{handle}\nЧат: {where}"
+    if topic:
+        description += f"\nТема: {topic}"
     try:
         await asyncio.to_thread(
-            calendar_client.create_event, f"Встреча: {name}", start.isoformat(), end.isoformat(), None, description
+            calendar_client.create_event, title, start.isoformat(), end.isoformat(), None, description
         )
     except Exception:
         logger.exception("/calendarfree: не удалось создать событие")
@@ -247,7 +251,7 @@ async def _finish_booking(query, context, chat, user, state, tz) -> None:
         try:
             await context.bot.send_message(
                 chat_id=config.OWNER_USER_ID,
-                text=f"Новая запись на встречу через бота: {name}{handle}, {where}. {when}. Событие уже в календаре.",
+                text=f"Новая запись на встречу через бота: {name}{handle}, {where}. {when}.{' Тема: ' + topic + '.' if topic else ''} Событие уже в календаре.",
             )
         except Exception:
             logger.exception("/calendarfree: не удалось уведомить владелицу о записи")
@@ -313,13 +317,11 @@ async def handle_when_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             reply_markup=_await_kb(user.id),
         )
         raise ApplicationHandlerStop
-    end = start + timedelta(minutes=MEETING_MINUTES)
-    when = f"{_fmt_day(start.date())}, {start.strftime('%H:%M')}-{end.strftime('%H:%M')}"
     sent = await msg.reply_text(
-        f"Записать встречу на {when} ({_tz_label()})? Длительность 1 час.",
-        reply_markup=_confirm_kb(user.id),
+        f"Напишите тему встречи одним сообщением (до {TOPIC_MAX} символов) или нажмите «Без темы».",
+        reply_markup=_topic_kb(user.id),
     )
-    state.update(stage="confirm", start=start.isoformat(), ts=time.time(), msg_id=sent.message_id)
+    state.update(stage="topic", start=start.isoformat(), ts=time.time(), msg_id=sent.message_id)
     raise ApplicationHandlerStop
 
 
