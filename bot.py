@@ -32,6 +32,8 @@ import altyn_registry
 import bg_off
 import calendar_client
 import ccu_flow
+import calendar_free
+import chat_digest
 import chat_memory
 import claude_client
 import clickup_client
@@ -729,6 +731,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if ccu_awaiting and update.message.chat.type == "private":
             await ccu_flow.apply_edit(context, user, ccu_awaiting, text)
             return
+        if await chat_digest.maybe_answer(update, context, text):
+            return
         if config.GOOGLE_CALENDAR_ENABLED:
             awaiting_meeting = storage.get_meeting_awaiting_edit(user.id)
             if awaiting_meeting:
@@ -904,6 +908,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         chat.id, chat.title or str(chat.id), user_name, text,
         telegram_username=(user.username if user else None),
     )
+    try:
+        await chat_digest.on_group_message(context, chat.id, chat.title or str(chat.id))
+    except Exception:
+        logger.exception("chat_digest: ошибка обработки сообщения группы %s", chat.id)
     # Раньше новое сообщение просто копилось в буфере до ближайшей периодической
     # выгрузки (см. periodic_flush_job, CLICKUP_FLUSH_INTERVAL_MINUTES) — из-за этого
     # /urgent и живые отчёты могли не видеть только что написанные задачи. Теперь
@@ -3436,6 +3444,9 @@ async def handle_commands_command(update: Update, context: ContextTypes.DEFAULT_
     sections.append(
         "🗓 Календарь и прочее:\n"
         "/calendar — события календаря по периодам (сегодня/завтра/неделя/месяц)\n"
+        "/calendarfree — свободные слоты в календаре с 8:00 до 20:00 (кнопки: сегодня / завтра / текущая неделя / следующая неделя)\n"
+        "/plan — план на сегодня (календарь + WEEKLY TASKS + Trello); сам по утрам больше не приходит\n"
+        "/chat — выбрать группу и спросить по ней что угодно или получить краткую сводку (бот копит переписку с момента добавления, о новой группе сам напишет в личку)\n"
         "/calendarclickup — сверка встреч ClickUp с календарём за выбранный период (сегодня/завтра/неделя/месяц): сначала присылает мне план (что добавить, переименовать, какие точные дубли убрать) с кнопками «Опубликовать / Изменить / Отмена» и только после «Опубликовать» пишет в календарь; «Изменить» — присылаю правку текстом, план обновится, и так сколько нужно\n"
         f"/meetm — все встречи подряд по датам на {_MEETM_HORIZON_DAYS} дней вперёд, "
         "с днём недели и месяцем, из календаря + ClickUp\n"
@@ -3645,6 +3656,8 @@ def build_application() -> Application:
             "CLICKUP_TEAM_ID+CLICKUP_API_TOKEN, GOOGLE_CALENDAR_ENABLED и OWNER_USER_ID)."
         )
 
+    chat_digest.register(app)
+    calendar_free.register(app)
     bg_off.apply(app)
     return app
 
