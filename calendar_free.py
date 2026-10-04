@@ -170,12 +170,12 @@ async def handle_calendarfree_callback(update: Update, context: ContextTypes.DEF
     except BadRequest as e:
         if "not modified" not in str(e).lower():
             raise
-        try:
-            import calendar_book
+    try:
+        import calendar_book
 
-            await calendar_book.offer(update, context)
-        except Exception:
-            logger.exception("/calendarfree: не удалось предложить запись на встречу")
+        await calendar_book.offer(update, context)
+    except Exception:
+        logger.exception("/calendarfree: не удалось предложить запись на встречу")
 
 
 def register(app) -> None:
