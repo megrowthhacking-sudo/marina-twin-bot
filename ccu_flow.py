@@ -109,3 +109,108 @@ def _ccu_render_plan(actions: list[dict], label: str, scanned: int | None = None
             lines.append(f"{n}. «{a['title']}» — {a.get('when', '')} (лишняя копия)")
     lines.append("\nОпубликовать это в календаре?")
     return "\n".join(lines)
+
+
+def _ccu_render_result(label: str, res: dict) -> str:
+    lines = [f"✅ Опубликовано, период «{label}»:"]
+    if res["renamed"]:
+        lines.append(f"\n✏️ Переименовано ({len(res['renamed'])}):")
+        for r in res["renamed"]:
+            lines.append(f"«{r['old_title']}» → «{r['new_title']}» — {r['when']}")
+    if res["created"]:
+        lines.append(f"\n➕ Добавлено ({len(res['created'])}):")
+        for c in res["created"]:
+            lines.append(f"«{c['title']}» — {c['when']}")
+    if res["ambiguous"]:
+        lines.append(f"\n⚠️ Неоднозначно, проверь на дубли ({len(res['ambiguous'])}):")
+        for a in res["ambiguous"]:
+            lines.append(f"«{a['title']}» — {a['when']} (рядом уже {a['count']} событий на это время)")
+    if res["deleted"]:
+        total = sum(d["removed"] for d in res["deleted"])
+        lines.append(f"\n\U0001f5d1 Убрала точных дублей ({total}):")
+        for d in res["deleted"]:
+            lines.append(f"«{d['title']}» — {d['when']} (оставила 1, удалила {d['removed']})")
+    if res["errors"]:
+        lines.append(f"\n❌ Ошибок при обработке: {res['errors']}")
+    if not (res["renamed"] or res["created"] or res["deleted"] or res["errors"]):
+        lines.append("\nНичего не пришлось менять.")
+    text = "\n".join(lines)
+    if len(text) > _d["message_limit"] - 250:
+        text = text[: _d["message_limit"] - 300] + "\n\n...отчёт обрезан."
+    return text
+
+def _ccu_store_plan(context: ContextTypes.DEFAULT_TYPE, plan: dict) -> str:
+    plans = context.application.bot_data.setdefault(PLANS_KEY, {})
+    plan_id = uuid.uuid4().hex[:10]
+    plans[plan_id] = plan
+    while len(plans) > MAX_PLANS:
+        plans.pop(next(iter(plans)))
+    return plan_id
+
+async def _ccu_send_plan(context: ContextTypes.DEFAULT_TYPE, chat_id: int, plan_id: str, editing: bool = False) -> None:
+    plan = context.application.bot_data[PLANS_KEY][plan_id]
+    text = _ccu_render_plan(plan["actions"], plan["label"], plan.get("scanned"), editing=editing)
+    chunks = _d["split_for_telegram"](text)
+    for i, chunk in enumerate(chunks):
+        is_last = i == len(chunks) - 1
+        await context.bot.send_message(
+            chat_id=chat_id, text=chunk, reply_markup=_ccu_plan_keyboard(plan_id) if is_last else None
+        )
+
+async def period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопки периода под /calendarclickup. С 03.10.2026 (по прямой просьбе владелицы)
+    НИЧЕГО не пишет в календарь сразу: только строит план (clickup_meeting_watch.
+    plan_clickup_calendar_sync + plan_calendar_dedupe — оба только читают) и присылает его
+    владелице в личку с кнопками "✅ Опубликовать"/"✏️ Изменить"/"❌ Отмена" (см.
+    plan_callback). Если менять нечего — просто показывает список
+    событий периода."""
+    query = update.callback_query
+    await query.answer()
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        return
+    if config.OWNER_USER_ID is None or query.from_user.id != config.OWNER_USER_ID:
+        return
+    _, _, period = (query.data or "").partition(":")
+    bounds = _d["period_bounds"](period)
+    if not bounds:
+        return
+    start, end = bounds
+    label = _d["period_labels"].get(period, period)
+    context.application.bot_data[AWAITING_KEY] = None
+    await query.edit_message_text(f"Смотрю ClickUp и календарь за период «{label}»... Ничего не публикую, только готовлю план.")
+    try:
+        sync_plan = await clickup_meeting_watch.plan_clickup_calendar_sync(start, end)
+    except Exception:
+        logger.exception("/calendarclickup: не удалось подготовить план сверки за период %s", period)
+        await query.edit_message_text(
+            f"Не смогла подготовить план за период «{label}» — попробуй ещё раз чуть позже.",
+            reply_markup=_d["period_keyboard"](),
+        )
+        return
+    try:
+        dedupe_plan = await clickup_meeting_watch.plan_calendar_dedupe(start, end)
+    except Exception:
+        logger.exception("/calendarclickup: не удалось подготовить план зачистки дублей за период %s", period)
+        dedupe_plan = {"scanned": 0, "actions": [], "errors": 1}
+    actions = sync_plan["actions"] + dedupe_plan["actions"]
+    extra = ""
+    if sync_plan["errors"] or dedupe_plan["errors"]:
+        extra = f"\n\n❌ Ошибок при подготовке плана: {sync_plan['errors'] + dedupe_plan['errors']}"
+    if not actions:
+        try:
+            events = calendar_client.list_events(start.isoformat(), end.isoformat())
+            listing = _ccu_format_event_lines(label, events)
+        except Exception:
+            logger.exception("Не удалось получить события календаря за период %s (/calendarclickup)", period)
+            listing = "Не смогла получить список календаря — попробуй ещё раз."
+        await query.edit_message_text(
+            f"\U0001f4c5 Сверка за период «{label}» (проверено задач: {sync_plan['scanned']}): всё совпадает, менять нечего, дублей нет.{extra}\n\n{listing}",
+            reply_markup=_d["period_keyboard"](),
+        )
+        return
+    plan_id = _ccu_store_plan(
+        context, {"actions": actions, "label": label, "scanned": sync_plan["scanned"], "start": start.isoformat(), "end": end.isoformat()}
+    )
+    await query.edit_message_text(f"План за период «{label}» готов — смотри ниже.{extra}")
+    await _ccu_send_plan(context, chat.id, plan_id)
