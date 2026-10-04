@@ -169,3 +169,61 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         logger.exception("chat_digest: не удалось отправить сводку по чату %s", chat.id)
         storage._conn.execute("UPDATE chat_digest_state SET summarized = 0 WHERE chat_id = ?", (chat.id,))
         storage._conn.commit()
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Бота добавили в группу (или вернули после удаления): запоминаем момент и пишем
+    владелице в личку. Историю до этого момента Telegram боту не отдаёт."""
+    change = update.my_chat_member
+    if change is None or change.chat.type not in ("group", "supergroup"):
+        return
+    if change.new_chat_member.status not in ("member", "administrator"):
+        return
+    if change.old_chat_member.status not in ("left", "kicked"):
+        return
+    chat = change.chat
+    title = chat.title or str(chat.id)
+    storage._conn.execute(
+        "INSERT OR REPLACE INTO chat_digest_state (chat_id, title, joined_at, summarized) VALUES (?, ?, ?, 0)",
+        (chat.id, title, time.time()),
+    )
+    storage._conn.commit()
+    storage.note_group_chat_seen(chat.id, title)
+    if config.OWNER_USER_ID is None:
+        return
+    await context.bot.send_message(
+        chat_id=config.OWNER_USER_ID,
+        text=(
+            f"Меня добавили в группу «{title}». Историю до добавления Telegram боту не показывает, "
+            f"поэтому я копил переписку с этого момента. Когда накопится {SUMMARY_AFTER} сообщений, "
+            "пришлю краткую сводку о чате. Спросить что-то по чату можно командой /chat."
+        ),
+    )
+
+
+async def on_group_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, title: str) -> None:
+    """Вызывается из bot.py после записи сообщения группы в журнал. Для недавно
+    добавленной группы, когда накопилось SUMMARY_AFTER сообщений, один раз присылает
+    владелице сводку. Для остальных групп ничего не делает."""
+    if config.OWNER_USER_ID is None:
+        return
+    row = storage._conn.execute(
+        "SELECT joined_at, summarized FROM chat_digest_state WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    if not row or row[1]:
+        return
+    count = storage._conn.execute(
+        "SELECT COUNT(*) FROM group_messages WHERE chat_id = ? AND ts >= ?", (chat_id, row[0])
+    ).fetchone()[0]
+    if count < SUMMARY_AFTER:
+        return
+    storage._conn.execute("UPDATE chat_digest_state SET summarized = 1 WHERE chat_id = ?", (chat_id,))
+    storage._conn.commit()
+    try:
+        summary = await summarize_chat(chat_id, title)
+    except Exception:
+        logger.exception("Не удалось собрать сводку по новой группе %s", chat_id)
+        storage._conn.execute("UPDATE chat_digest_state SET summarized = 0 WHERE chat_id = ?", (chat_id,))
+        storage._conn.commit()
+        return
+    await _send(context, config.OWNER_USER_ID, f"Коротко о новой группе «{title}»:\n\n{summary}")
