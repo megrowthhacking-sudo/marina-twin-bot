@@ -107,3 +107,65 @@ async def answer_question(chat_id: int, title: str, question: str) -> str:
     header = f"Чат: {title}\nСообщений в журнале: {total}, ниже последних: {used}.\n\n{older}Переписка:\n"
     user_text = f"{header}{body}\n\nВопрос владелицы: {question}"
     return await asyncio.to_thread(_ask_llm, _QA_SYSTEM, user_text, config.MODEL_NAME, 1200)
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Бота добавили в группу: запоминаем момент и сообщаем владелице в личку."""
+    event = update.my_chat_member
+    if event is None or event.chat.type not in ("group", "supergroup"):
+        return
+    was_in = event.old_chat_member.status in ("member", "administrator", "creator")
+    now_in = event.new_chat_member.status in ("member", "administrator", "creator")
+    if was_in or not now_in:
+        return
+    title = event.chat.title or str(event.chat.id)
+    storage._conn.execute(
+        "INSERT INTO chat_digest_state (chat_id, title, joined_at, summarized) VALUES (?, ?, ?, 0) "
+        "ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title, joined_at = excluded.joined_at, summarized = 0",
+        (event.chat.id, title, time.time()),
+    )
+    storage._conn.commit()
+    if config.OWNER_USER_ID is None:
+        return
+    try:
+        await _send(
+            context,
+            config.OWNER_USER_ID,
+            f"Меня добавили в группу «{title}». Читать историю до добавления я не могу, "
+            f"поэтому коплю сообщения сам. Когда наберётся {SUMMARY_AFTER} сообщений, пришлю краткую сводку, "
+            "о чём чат. Спросить о чате можно командой /chat.",
+        )
+    except Exception:
+        logger.exception("chat_digest: не удалось уведомить владелицу о новой группе %s", event.chat.id)
+
+
+async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сообщение в группе: когда после добавления бота накопилось SUMMARY_AFTER сообщений,
+    один раз присылаем владелице краткую сводку чата."""
+    chat = update.effective_chat
+    if chat is None or chat.type not in ("group", "supergroup") or config.OWNER_USER_ID is None:
+        return
+    state = storage._conn.execute(
+        "SELECT title, joined_at, summarized FROM chat_digest_state WHERE chat_id = ?", (chat.id,)
+    ).fetchone()
+    if state is None or state[2]:
+        return
+    title, joined_at = state[0] or chat.title or str(chat.id), state[1]
+    count = storage._conn.execute(
+        "SELECT COUNT(*) FROM group_messages WHERE chat_id = ? AND ts >= ?", (chat.id, joined_at)
+    ).fetchone()[0]
+    if count < SUMMARY_AFTER:
+        return
+    claimed = storage._conn.execute(
+        "UPDATE chat_digest_state SET summarized = 1 WHERE chat_id = ? AND summarized = 0", (chat.id,)
+    )
+    storage._conn.commit()
+    if claimed.rowcount == 0:
+        return
+    try:
+        summary = await summarize_chat(chat.id, title)
+        await _send(context, config.OWNER_USER_ID, f"Сводка по чату «{title}» (набралось {count} сообщений):\n\n{summary}")
+    except Exception:
+        logger.exception("chat_digest: не удалось отправить сводку по чату %s", chat.id)
+        storage._conn.execute("UPDATE chat_digest_state SET summarized = 0 WHERE chat_id = ?", (chat.id,))
+        storage._conn.commit()
