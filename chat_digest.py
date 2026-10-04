@@ -88,3 +88,22 @@ def _ask_llm(system: str, user_text: str, model: str, max_tokens: int) -> str:
         messages=[{"role": "user", "content": user_text}],
     )
     return "\n".join(b.text for b in response.content if b.type == "text").strip()
+
+
+async def summarize_chat(chat_id: int, title: str) -> str:
+    body, used, total = _load_messages(chat_id)
+    if not body:
+        return "В этом чате у меня пока нет сообщений."
+    header = f"Чат: {title}\nСообщений в журнале: {total}, в сводку вошло последних: {used}.\n\n"
+    return await asyncio.to_thread(_ask_llm, _SUMMARY_SYSTEM, header + body, config.LIGHT_MODEL_NAME, 700)
+async def answer_question(chat_id: int, title: str, question: str) -> str:
+    body, used, total = _load_messages(chat_id)
+    if not body:
+        return "В этом чате у меня пока нет сообщений, отвечать не по чему."
+    older = ""
+    memory = storage.get_chat_memory(chat_id)
+    if memory and memory.get("summary"):
+        older = f"Краткая сводка более старой части чата:\n{memory['summary']}\n\n"
+    header = f"Чат: {title}\nСообщений в журнале: {total}, ниже последних: {used}.\n\n{older}Переписка:\n"
+    user_text = f"{header}{body}\n\nВопрос владелицы: {question}"
+    return await asyncio.to_thread(_ask_llm, _QA_SYSTEM, user_text, config.MODEL_NAME, 1200)
