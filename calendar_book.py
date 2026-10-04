@@ -232,3 +232,68 @@ async def _finish_booking(query, context, chat, user, state, tz) -> None:
             )
         except Exception:
             logger.exception("/calendarfree: не удалось уведомить владелицу о записи")
+
+
+async def handle_when_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ловит ответ с датой и временем от того, кто нажал «Да». Остальные сообщения пропускает."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if msg is None or chat is None or user is None or not msg.text:
+        return
+    states = _states(context)
+    key = (chat.id, user.id)
+    state = states.get(key)
+    if state is None or state.get("stage") != "await":
+        return
+    if time.time() - state["ts"] > STATE_TTL:
+        states.pop(key, None)
+        await msg.reply_text("Запрос устарел. Напишите /calendarfree и выберите период заново.")
+        raise ApplicationHandlerStop
+    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+    now = datetime.now(tz)
+    try:
+        start = parse_when(msg.text, tz, now)
+    except ValueError as exc:
+        await msg.reply_text(f"{exc}\n\n" + _prompt_html(), parse_mode="HTML", reply_markup=_await_kb(user.id))
+        raise ApplicationHandlerStop
+    try:
+        busy = await _day_busy(start, tz)
+    except Exception:
+        logger.exception("/calendarfree: не удалось проверить календарь для записи")
+        await msg.reply_text(
+            "Не получилось проверить календарь, попробуйте ещё раз чуть позже.", reply_markup=_await_kb(user.id)
+        )
+        raise ApplicationHandlerStop
+    ok, long_slots = check_slot(start, busy, tz, now)
+    if not ok:
+        extra = (
+            f"Свободные окна на {_fmt_day(start.date())}: {_slots_text(long_slots)}."
+            if long_slots
+            else f"На {_fmt_day(start.date())} свободных окон на час нет."
+        )
+        await msg.reply_text(
+            "Это время занято или не входит в рабочие часы 8:00-20:00.\n" + extra + "\n\n" + _prompt_html(),
+            parse_mode="HTML",
+            reply_markup=_await_kb(user.id),
+        )
+        raise ApplicationHandlerStop
+    end = start + timedelta(minutes=MEETING_MINUTES)
+    when = f"{_fmt_day(start.date())}, {start.strftime('%H:%M')}-{end.strftime('%H:%M')}"
+    sent = await msg.reply_text(
+        f"Записать встречу на {when} ({_tz_label()})? Длительность 1 час.",
+        reply_markup=_confirm_kb(user.id),
+    )
+    state.update(stage="confirm", start=start.isoformat(), ts=time.time(), msg_id=sent.message_id)
+    raise ApplicationHandlerStop
+
+
+def register(app) -> None:
+    """Регистрирует обработчики записи на встречу.
+
+    Ответ с датой ловится в group=-1, раньше обычной обработки сообщений, чтобы текст
+    с датой не уходил в основной диалог бота: после успеха и ошибок поднимается
+    ApplicationHandlerStop.
+    """
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_when_reply), group=-1)
+    app.add_handler(CallbackQueryHandler(handle_book_callback, pattern="^cfbk:"))
