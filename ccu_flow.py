@@ -269,3 +269,35 @@ async def plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             listing = "Не смогла получить итоговый список календаря."
         for chunk in _d["split_for_telegram"](f"{report}\n\n{listing}"):
             await context.bot.send_message(chat_id=chat.id, text=chunk)
+
+
+async def apply_edit(context: ContextTypes.DEFAULT_TYPE, user, plan_id: str, text: str) -> None:
+    """Владелица нажала "✏️ Изменить" под планом /calendarclickup и прислала правку —
+    перехватывается в handle_message. Применяет правку (clickup_meeting_watch.
+    revise_calendar_plan) и снова показывает план с теми же тремя кнопками — до
+    бесконечности, пока она не нажмёт "Опубликовать" или "Отмена". Если правку не поняла —
+    режим ожидания правки не снимается, можно написать ещё раз."""
+    plans = context.application.bot_data.setdefault(PLANS_KEY, {})
+    plan = plans.get(plan_id)
+    if not plan:
+        context.application.bot_data[AWAITING_KEY] = None
+        await context.bot.send_message(chat_id=user.id, text="Этот план уже не актуален — запусти /calendarclickup заново.")
+        return
+    try:
+        revised = clickup_meeting_watch.revise_calendar_plan(plan["actions"], text)
+    except Exception:
+        logger.exception("Ошибка при разборе правки плана /calendarclickup")
+        revised = None
+    if revised is None:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text="Не поняла правку — напиши ещё раз, по номерам из плана (например «убери 2» или «в 1 время 15:00»).",
+        )
+        return
+    context.application.bot_data[AWAITING_KEY] = None
+    if not revised:
+        plans.pop(plan_id, None)
+        await context.bot.send_message(chat_id=user.id, text="В плане ничего не осталось — публиковать нечего, команда завершена.")
+        return
+    plan["actions"] = revised
+    await _ccu_send_plan(context, user.id, plan_id, editing=True)
