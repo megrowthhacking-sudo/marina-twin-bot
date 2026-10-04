@@ -78,3 +78,44 @@ def _prompt_html() -> str:
         f"Встреча длится 1 час, {_tz_label()}, рабочие часы 8:00-20:00. "
         "Потом останется нажать «Подтвердить»."
     )
+
+
+def _kb(uid: int, *pairs) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f"cfbk:{action}:{uid}") for label, action in pairs]])
+
+
+def _yes_no_kb(uid: int) -> InlineKeyboardMarkup:
+    return _kb(uid, ("Да", "yes"), ("Нет", "no"))
+
+
+def _await_kb(uid: int) -> InlineKeyboardMarkup:
+    return _kb(uid, ("Отмена", "cancel"))
+
+
+def _confirm_kb(uid: int) -> InlineKeyboardMarkup:
+    return _kb(uid, ("Подтвердить", "ok"), ("Другое время", "redo"), ("Отмена", "cancel"))
+
+
+def _states(context) -> dict:
+    return context.application.bot_data.setdefault(STATE_KEY, {})
+
+
+def _purge(states: dict) -> None:
+    now = time.time()
+    for key in [k for k, v in states.items() if now - v["ts"] > STATE_TTL]:
+        states.pop(key, None)
+
+
+def _bookings_left(context, uid: int) -> int:
+    counts = context.application.bot_data.setdefault(COUNT_KEY, {})
+    recent = [t for t in counts.get(uid, []) if time.time() - t < 86400]
+    counts[uid] = recent
+    return MAX_BOOKINGS_PER_DAY - len(recent)
+
+
+async def _day_busy(start: datetime, tz: ZoneInfo) -> list:
+    day_start = datetime.combine(start.date(), datetime.min.time(), tz)
+    events = await asyncio.to_thread(
+        calendar_client.list_events, day_start.isoformat(), (day_start + timedelta(days=1)).isoformat()
+    )
+    return calendar_free._parse_busy(events, tz)
