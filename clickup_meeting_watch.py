@@ -633,3 +633,129 @@ async def dedupe_calendar_events(start: datetime, end: datetime) -> dict:
             stats["deleted"].append({"title": display_title, "when": when, "removed": removed})
 
     return stats
+
+
+def _fmt_when(iso: str, tz: ZoneInfo) -> str:
+    try:
+        return datetime.fromisoformat(iso).astimezone(tz).strftime("%d.%m %H:%M")
+    except (ValueError, TypeError):
+        return iso or ""
+
+
+async def plan_clickup_calendar_sync(start: datetime, end: datetime) -> dict:
+    """ТОЛЬКО ЧИТАЕТ (ничего не пишет ни в календарь, ни в storage): готовит план сверки
+    ClickUp-встреч за период [start, end) с личным календарём (m@altyn.one) для команды
+    /calendarclickup (03.10.2026, по прямой просьбе владелицы: бот сначала присылает план
+    в личку с кнопками "Опубликовать/Изменить/Отмена" и пишет в календарь только после
+    "Опубликовать" — см. bot.py и apply_calendar_actions ниже).
+    Логика сопоставления та же, что была у прямой сверки: по ВРЕМЕНИ, а не по названию
+    (окно ±30 минут вокруг встречи). Ни одного события рядом — действие "create"; ровно
+    одно с другим названием — "rename"; несколько — "create" с ambiguous_count (событие
+    добавляется, старые не трогаем, владелица видит предупреждение). Уже запланированные
+    "create" этого же плана на ТО ЖЕ САМОЕ время учитываются как виртуальные события — иначе две задачи
+    ClickUp на одно время дали бы два одинаковых create.
+    Возвращает {"scanned", "actions": [...], "unchanged", "ambiguous_skipped": [...],
+    "errors"}. Действия — JSON-совместимые dict:
+    {"type": "create", "title", "start", "end", "location", "description", "task_id",
+    "ambiguous_count"}; {"type": "rename", "event_id", "old_title", "new_title", "when"}."""
+    plan: dict = {"scanned": 0, "actions": [], "unchanged": 0, "ambiguous_skipped": [], "errors": 0}
+    tz = ZoneInfo(config.MARINATWIN_TIMEZONE)
+    now = datetime.now(tz)
+    tasks, weekly_target_date_by_task_id = _collect_period_meeting_candidates(start, end, now)
+    virtual: list[dict] = []
+    for task in tasks:
+        task_id = task.get("id")
+        if not task_id:
+            continue
+        plan["scanned"] += 1
+        try:
+            full_task = clickup_client.get_task(task_id)
+        except Exception:
+            logger.exception("Не удалось прочитать задачу ClickUp %s для /calendarclickup", task_id)
+            plan["errors"] += 1
+            continue
+        if not full_task:
+            continue
+        description = full_task.get("description") or ""
+        due_iso = _iso_or_none(task.get("due_date"), tz)
+        created_iso = _iso_or_none(task.get("date_created"), tz)
+        weekday_target_date = weekly_target_date_by_task_id.get(task_id)
+        weekday_hint_date_iso = f"{weekday_target_date.isoformat()}T00:00:00" if weekday_target_date else None
+        try:
+            meeting = meeting_extractor.extract_meeting_from_task(
+                title=task.get("name") or full_task.get("name") or "(без названия)",
+                description=description,
+                due_date_iso=due_iso,
+                created_iso=created_iso,
+                tz_name=config.MARINATWIN_TIMEZONE,
+                weekday_hint_date_iso=weekday_hint_date_iso,
+            )
+        except Exception:
+            logger.exception("Ошибка разбора задачи ClickUp %s для /calendarclickup", task_id)
+            plan["errors"] += 1
+            continue
+        if not meeting:
+            continue
+        try:
+            meeting_start = datetime.fromisoformat(meeting["start"]).astimezone(tz)
+            meeting_end = datetime.fromisoformat(meeting["end"]).astimezone(tz)
+        except (ValueError, KeyError, TypeError):
+            continue
+        if not (start <= meeting_start < end):
+            continue
+        win_start = meeting_start - timedelta(minutes=30)
+        win_end = meeting_end + timedelta(minutes=30)
+        try:
+            nearby = calendar_client.list_events(win_start.isoformat(), win_end.isoformat())
+        except Exception:
+            logger.exception("Не удалось прочитать календарь рядом с %s для /calendarclickup", meeting_start)
+            plan["errors"] += 1
+            continue
+        nearby = [e for e in nearby if not e.get("all_day")]
+        for v in virtual:
+            try:
+                v_start = datetime.fromisoformat(v["start"])
+                v_end = datetime.fromisoformat(v["end"])
+            except ValueError:
+                continue
+            if v_start == meeting_start and v_end == meeting_end:
+                nearby.append({"id": None, "title": v["title"], "start": v["start"], "end": v["end"]})
+        when = meeting_start.strftime("%d.%m %H:%M")
+        task_url = task.get("url") or task_id
+        create_action = {
+            "type": "create",
+            "title": meeting["title"],
+            "start": meeting["start"],
+            "end": meeting["end"],
+            "location": meeting.get("location") or None,
+            "description": f"Авто-поставлено из ClickUp-задачи: {task_url}",
+            "task_id": task_id,
+            "ambiguous_count": None,
+        }
+        if not nearby:
+            plan["actions"].append(create_action)
+            virtual.append({"title": meeting["title"], "start": meeting["start"], "end": meeting["end"]})
+            continue
+        if len(nearby) > 1:
+            create_action["ambiguous_count"] = len(nearby)
+            plan["actions"].append(create_action)
+            virtual.append({"title": meeting["title"], "start": meeting["start"], "end": meeting["end"]})
+            continue
+        existing = nearby[0]
+        if existing.get("title", "").strip().lower() == meeting["title"].strip().lower():
+            plan["unchanged"] += 1
+            continue
+        event_id = existing.get("id")
+        if not event_id:
+            plan["ambiguous_skipped"].append({"title": meeting["title"], "when": when, "count": 1})
+            continue
+        plan["actions"].append(
+            {
+                "type": "rename",
+                "event_id": event_id,
+                "old_title": existing.get("title", ""),
+                "new_title": meeting["title"],
+                "when": when,
+            }
+        )
+    return plan
