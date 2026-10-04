@@ -29,6 +29,7 @@ from telegram.ext import (
 )
 
 import altyn_registry
+import bg_off
 import calendar_client
 import chat_memory
 import claude_client
@@ -803,6 +804,11 @@ async def _handle_group_message_edited(chat, msg, text: str) -> None:
     )
 
 
+# 03.10.2026, по прямой просьбе владелицы: бот больше НЕ предлагает ответы в группах —
+# обращения к Марине не пересылаются ей в личку с черновиком, группа только читается.
+GROUP_REPLY_DRAFTS_ENABLED = False
+
+
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """В групповых чатах Marina Twin по умолчанию молча слушает и копит переписку —
     не отвечает, не участвует в разговоре. Три исключения:
@@ -842,7 +848,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         storage.set_chat_project(chat.id, bound_project)
         return
 
-    if await _is_addressed_to_marina(update, context, text):
+    if GROUP_REPLY_DRAFTS_ENABLED and await _is_addressed_to_marina(update, context, text):
         if config.OWNER_USER_ID is not None:
             # Раньше здесь был плейсхолдер в саму группу ("Секунду, уточню и вернусь") —
             # убрали: коллег раздражало, что бот вообще что-то говорит в чате прежде,
@@ -3623,6 +3629,7 @@ def build_application() -> Application:
             "CLICKUP_TEAM_ID+CLICKUP_API_TOKEN, GOOGLE_CALENDAR_ENABLED и OWNER_USER_ID)."
         )
 
+    bg_off.apply(app)
     return app
 
 
