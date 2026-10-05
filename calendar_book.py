@@ -3,7 +3,7 @@
 встречу?» (Да / Нет). По «Да» просит написать дату и время в формате «ДД.ММ.ГГ в ЧЧ:ММ»
 (пример: 9.10.26 в 14:00), проверяет, что час свободен в основном календаре владелицы
 (config.GOOGLE_CALENDAR_ID) и укладывается в 8:00-20:00, показывает итог с кнопкой
-«Подтвердить» и только после неё создаёт событие на 1 час. Событие создаётся приватным
+«Подтвердить» и только после неё создаёт событие на 30 минут. Событие создаётся приватным
 (calendar_client.create_event), владелице приходит уведомление в личку.
 Работает в личке и в трёх рабочих группах из config.CALENDAR_VIEWER_ALLOWED_CHAT_IDS;
 кнопки и ответ датой принимаются только от того, кто запросил слоты.
@@ -31,7 +31,7 @@ logger = logging.getLogger("marina_twin_bot")
 STATE_KEY = "cfree_book"
 COUNT_KEY = "cfree_book_count"
 STATE_TTL = 900
-MEETING_MINUTES = 60
+MEETING_MINUTES = 30
 MAX_DAYS_AHEAD = 60
 MAX_BOOKINGS_PER_DAY = 5
 QUESTION_TEXT = "Вы бы хотели запланировать встречу?"
@@ -388,7 +388,7 @@ def _prompt_html() -> str:
         "Напишите удобные дату и время, а также тему встречи одним сообщением в формате:\n"
         "<b>ДД.ММ.ГГ в ЧЧ:ММ Тема</b>\n"
         "Например: <code>9.10.26 в 14:00 Зум с банком X</code>\n\n"
-        f"Встреча длится 1 час, {_tz_label()}, рабочие часы 8:00-20:00. "
+        f"Встреча длится 30 минут, {_tz_label()}, рабочие часы 8:00-20:00. "
         "Потом останется нажать «Подтвердить».\n\n"
         "Можно добавить несколько встреч подряд, например:\n"
         "<code>9.10.26 в 14:00 Зум с банком X\n10.10.26 в 11:00 Зум с банком Y</code>"
@@ -401,12 +401,12 @@ def _confirm_text(state: dict) -> str:
     if len(items) == 1:
         start = datetime.fromisoformat(items[0]["start"])
         topic = items[0].get("topic") or "без темы"
-        return f"Записать встречу ({_tz_label()}, 1 час)?\n{_item_when(start)}\nТема: {topic}"
+        return f"Записать встречу ({_tz_label()}, 30 минут)?\n{_item_when(start)}\nТема: {topic}"
     lines = []
     for n, it in enumerate(items, 1):
         start = datetime.fromisoformat(it["start"])
         lines.append(f"{n}) {_item_when(start)}, тема: {it.get('topic') or 'без темы'}")
-    return f"Записать встречи ({_tz_label()}, по 1 часу)?\n" + "\n".join(lines)
+    return f"Записать встречи ({_tz_label()}, по 30 минут)?\n" + "\n".join(lines)
 async def _check_entries(items: list, tz: ZoneInfo, now: datetime) -> str | None:
     """items: [(начало, тема)]. Текст ошибки для человека или None, если все часы свободны."""
     busy_by_day = {}
@@ -422,7 +422,7 @@ async def _check_entries(items: list, tz: ZoneInfo, now: datetime) -> str | None
             extra = (
                 f"Свободные окна на {_fmt_day(day)}: {_slots_text(long_slots)}."
                 if long_slots
-                else f"На {_fmt_day(day)} свободных окон на час нет."
+                else f"На {_fmt_day(day)} свободных окон на 30 минут нет."
             )
             return f"{label}это время занято или не входит в рабочие часы 8:00-20:00. {extra}"
         taken.append((start, start + timedelta(minutes=MEETING_MINUTES)))
