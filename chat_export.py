@@ -58,3 +58,56 @@ def build_export(chat_id: int, title: str) -> tuple[str, bytes, int]:
         lines.extend(" " + part for part in body[1:])
     stamp = datetime.now(tz).strftime("%Y%m%d")
     return f"{slug}_{stamp}.txt", "\n".join(lines).encode("utf-8"), len(rows)
+
+
+async def handle_chatexport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None or chat.type != "private" or not _is_owner(update.effective_user):
+        return
+    groups = storage.get_known_group_chats(limit=30)
+    if not groups:
+        await update.message.reply_text("Я пока не видела ни одной группы.")
+        return
+    counts = dict(storage._conn.execute("SELECT chat_id, COUNT(*) FROM group_messages GROUP BY chat_id").fetchall())
+    rows = [
+        [InlineKeyboardButton(f"{title[:40]} ({counts.get(cid, 0)})", callback_data=f"chx:{cid}")]
+        for cid, title in groups
+    ]
+    await update.message.reply_text(
+        "Из какого чата выгрузить переписку файлом? В скобках число сохранённых сообщений.",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def handle_chatexport_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat = update.effective_chat
+    if chat is None or chat.type != "private" or not _is_owner(query.from_user):
+        return
+    try:
+        chat_id = int((query.data or "").split(":", 1)[1])
+    except (IndexError, ValueError):
+        return
+    title = dict(storage.get_known_group_chats(limit=100)).get(chat_id, str(chat_id))
+    try:
+        filename, data, count = build_export(chat_id, title)
+    except Exception:
+        logger.exception("chat_export: не удалось собрать файл чата %s", chat_id)
+        await context.bot.send_message(chat_id=chat.id, text="Не получилось собрать файл, попробуй ещё раз чуть позже.")
+        return
+    if count == 0:
+        await context.bot.send_message(chat_id=chat.id, text="В этом чате у меня пока нет сохранённых сообщений.")
+        return
+    await context.bot.send_document(
+        chat_id=chat.id,
+        document=io.BytesIO(data),
+        filename=filename,
+        caption=f"Переписка «{title}», сообщений: {count}",
+    )
+
+
+def register(app) -> None:
+    """Регистрирует /chatexport и кнопки выбора чата."""
+    app.add_handler(CommandHandler("chatexport", handle_chatexport_command))
+    app.add_handler(CallbackQueryHandler(handle_chatexport_callback, pattern=r"^chx:"))
