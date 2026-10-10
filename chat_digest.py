@@ -318,3 +318,6 @@ def register(app) -> None:
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CommandHandler("chat", handle_chat_command))
     app.add_handler(CallbackQueryHandler(handle_chat_callback, pattern=r"^chd:"))
+
+    import chat_export
+    chat_export.register(app)
