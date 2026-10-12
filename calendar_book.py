@@ -36,7 +36,7 @@ MAX_DAYS_AHEAD = 60
 MAX_BOOKINGS_PER_DAY = 5
 QUESTION_TEXT = "Вы бы хотели запланировать встречу?"
 _WHEN_RE = re.compile(
-    r"^\s*(\d{1,2})[./](\d{1,2})[./](\d{4}|\d{2})\s*(?:в|,)?\s*(\d{1,2})[:.](\d{2})\s*(?:мск|msk)?\s*$",
+    r"^\s*(\d{1,2})\s*[./]\s*(\d{1,2})\s*[./]\s*(\d{4}|\d{2})\s*(?:в|,)?\s*(\d{1,2})[:.](\d{2})\s*(?:мск|msk)?\s*$",
     re.IGNORECASE,
 )
 def parse_when(text: str, tz: ZoneInfo, now: datetime) -> datetime:
@@ -169,6 +169,18 @@ async def handle_book_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     _, action, uid_s = parts
     user = query.from_user
     if str(user.id) != uid_s:
+        is_owner = config.OWNER_USER_ID is not None and user.id == config.OWNER_USER_ID
+        if is_owner and action in ("no", "cancel", "stop"):
+            await query.answer()
+            try:
+                _states(context).pop((chat.id, int(uid_s)), None)
+            except ValueError:
+                pass
+            try:
+                await query.edit_message_text("Запрос отменён. Если понадобится, напишите /calendarfree.")
+            except Exception:
+                logger.exception("calendar_book: не удалось отредактировать сообщение при отмене владелицей")
+            return
         await query.answer("Эти кнопки для другого участника. Запросите /calendarfree сами.", show_alert=True)
         return
     await query.answer()
@@ -369,7 +381,7 @@ def register(app) -> None:
 # сообщением" и "Записать ещё" больше не используются.
 MEETINGS_MAX = 5
 _ENTRY_RE = re.compile(
-    r"^\s*(\d{1,2})[./](\d{1,2})[./](\d{4}|\d{2})\s*(?:в|,)?\s*(\d{1,2})[:.](\d{2})(?!\d)\s*(?:(?:мск|msk)\b)?\s*(.*?)\s*$",
+    r"^\s*(\d{1,2})\s*[./]\s*(\d{1,2})\s*[./]\s*(\d{4}|\d{2})\s*(?:в|,)?\s*(\d{1,2})[:.](\d{2})(?!\d)\s*(?:(?:мск|msk)\b)?\s*(.*?)\s*$",
     re.IGNORECASE,
 )
 def parse_entry(line: str, tz: ZoneInfo, now: datetime) -> tuple[datetime, str]:
