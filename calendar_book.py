@@ -36,7 +36,7 @@ MAX_DAYS_AHEAD = 60
 MAX_BOOKINGS_PER_DAY = 5
 QUESTION_TEXT = "Вы бы хотели запланировать встречу?"
 _WHEN_RE = re.compile(
-    r"^\s*(\d{1,2})\s*[./]\s*(\d{1,2})\s*[./]\s*(\d{4}|\d{2})\s*(?:в|,)?\s*(\d{1,2})[:.](\d{2})\s*(?:мск|msk)?\s*$",
+    r"^\s*(\d{1,2})\s*[./]\s*(\d{1,2})\s*[./]\s*(\d{4}|\d{2})\s*(?:в|с|c|на|,|-|–)?\s*(\d{1,2})[:.](\d{2})\s*(?:мск|msk)?\s*$",
     re.IGNORECASE,
 )
 def parse_when(text: str, tz: ZoneInfo, now: datetime) -> datetime:
@@ -381,7 +381,7 @@ def register(app) -> None:
 # сообщением" и "Записать ещё" больше не используются.
 MEETINGS_MAX = 5
 _ENTRY_RE = re.compile(
-    r"^\s*(\d{1,2})\s*[./]\s*(\d{1,2})\s*[./]\s*(\d{4}|\d{2})\s*(?:в|,)?\s*(\d{1,2})[:.](\d{2})(?!\d)\s*(?:(?:мск|msk)\b)?\s*(.*?)\s*$",
+    r"^\s*(\d{1,2})\s*[./]\s*(\d{1,2})\s*[./]\s*(\d{4}|\d{2})\s*(?:в|с|c|на|,|-|–)?\s*(\d{1,2})[:.](\d{2})(?!\d)\s*(?:(?:мск|msk)\b)?\s*(.*?)\s*$",
     re.IGNORECASE,
 )
 def parse_entry(line: str, tz: ZoneInfo, now: datetime) -> tuple[datetime, str]:
